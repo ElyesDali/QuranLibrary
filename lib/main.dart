@@ -2,10 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'dart:io';
 import 'package:just_audio/just_audio.dart';
-import 'package:file_selector/file_selector.dart';
-import 'package:file_picker/file_picker.dart';
-import 'dart:io'; // Pour savoir si on est sur iOS ou Windows
+import 'package:file_selector/file_selector.dart'; // Pour Windows
+import 'package:file_picker/file_picker.dart';    // Pour iOS
+import 'package:sqflite/sqflite.dart';            // Base de données locale
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 
 void main() => runApp(const LuhaidanApp());
 
@@ -74,11 +77,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
   double volume = 0.8;
   LoopModeState loopMode = LoopModeState.off;
   int? selectedYearFilter;
+  Database? _db;
 
   @override
   void initState() {
     super.initState();
-    _fetch();
+    _initApp();
     _player.setVolume(volume);
     _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
@@ -87,17 +91,40 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
+  Future<void> _initApp() async {
+    if (Platform.isIOS || Platform.isAndroid) {
+      final dbPath = await getDatabasesPath();
+      final path = p.join(dbPath, 'luhaidan.db');
+      _db = await openDatabase(
+        path,
+        version: 1,
+        onCreate: (db, version) => db.execute(
+          'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, fichier TEXT, versets TEXT, annee_g INTEGER)'
+        ),
+      );
+    }
+    _fetch();
+  }
+
   Future<void> _fetch() async {
-    try {
-      final res = await http.get(Uri.parse('http://127.0.0.1:8000/recitations'));
-      if (res.statusCode == 200) {
-        setState(() {
-          allRecitations = json.decode(res.body);
-          _applyFilters();
-        });
+    if (Platform.isIOS || Platform.isAndroid) {
+      final res = await _db?.query('recitations', orderBy: 'sourate_num ASC');
+      setState(() {
+        allRecitations = res ?? [];
+        _applyFilters();
+      });
+    } else {
+      try {
+        final res = await http.get(Uri.parse('http://127.0.0.1:8000/recitations'));
+        if (res.statusCode == 200) {
+          setState(() {
+            allRecitations = json.decode(res.body);
+            _applyFilters();
+          });
+        }
+      } catch (e) {
+        debugPrint("Erreur API: $e");
       }
-    } catch (e) {
-      debugPrint("Erreur API: $e");
     }
   }
 
@@ -117,7 +144,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
     setState(() => currentRecitation = rec);
     if (rec['fichier'] != null) {
       try {
-        await _player.setUrl('http://127.0.0.1:8000/stream_file?path=${Uri.encodeComponent(rec['fichier'])}');
+        if (Platform.isIOS || Platform.isAndroid) {
+           if (rec['fichier'].startsWith('http')) {
+             await _player.setUrl(rec['fichier']);
+           } else {
+             final dir = await getApplicationDocumentsDirectory();
+             final file = File(p.join(dir.path, rec['fichier']));
+             if (await file.exists()) await _player.setFilePath(file.path);
+           }
+        } else {
+          await _player.setUrl('http://127.0.0.1:8000/stream_file?path=${Uri.encodeComponent(rec['fichier'])}');
+        }
         _player.play();
       } catch (e) {
         debugPrint("Erreur lecture: $e");
@@ -209,13 +246,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 Positioned(
                   bottom: 16,
                   right: 24,
-                  child: MouseRegion(
-                    cursor: SystemMouseCursors.click,
-                    child: FloatingActionButton(
-                      onPressed: () => _showForm(),
-                      backgroundColor: const Color(0xFF4A8FA3),
-                      child: const Icon(Icons.add, color: Colors.white, size: 30),
-                    ),
+                  child: FloatingActionButton(
+                    onPressed: () => _showForm(),
+                    backgroundColor: const Color(Colors.red),
+                    child: const Icon(Icons.add, color: Colors.white, size: 30),
                   ),
                 ),
               ],
@@ -296,7 +330,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
           Stack(
             alignment: Alignment.center,
             children: [
-              // GAUCHE : Informations de la sourate (Style Windows)
               Align(
                 alignment: Alignment.centerLeft,
                 child: Column(
@@ -314,11 +347,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   ],
                 ),
               ),
-              // CENTRE : Boutons de lecture symétriques
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // INVERSEMENT : Stop d'abord pour la symétrie
                   IconButton(icon: const Icon(Icons.stop, size: 30), onPressed: () => _player.seek(Duration.zero)),
                   IconButton(icon: const Icon(Icons.skip_previous, size: 30), onPressed: _playPrevious),
                   StreamBuilder<bool>(
@@ -340,7 +371,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   ),
                 ],
               ),
-              // DROITE : Volume
               Align(
                 alignment: Alignment.centerRight,
                 child: Row(
@@ -381,7 +411,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
             leading: const Icon(Icons.delete, color: Colors.red),
             title: const Text("Supprimer", style: TextStyle(color: Colors.red)),
             onTap: () async {
-              await http.delete(Uri.parse('http://127.0.0.1:8000/recitations/${rec['id']}'));
+              if (Platform.isIOS || Platform.isAndroid) {
+                await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
+              } else {
+                await http.delete(Uri.parse('http://127.0.0.1:8000/recitations/${rec['id']}'));
+              }
               _fetch();
               Navigator.pop(context);
             },
@@ -392,14 +426,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   void _showForm({Map<String, dynamic>? rec}) {
-    showDialog(context: context, builder: (context) => FormDialog(rec: rec, onSave: _fetch));
+    showDialog(context: context, builder: (context) => FormDialog(rec: rec, onSave: _fetch, db: _db));
   }
 }
 
 class FormDialog extends StatefulWidget {
   final Map<String, dynamic>? rec;
   final VoidCallback onSave;
-  const FormDialog({super.key, this.rec, required this.onSave});
+  final Database? db;
+  const FormDialog({super.key, this.rec, required this.onSave, this.db});
   @override
   State<FormDialog> createState() => _FormDialogState();
 }
@@ -483,9 +518,19 @@ class _FormDialogState extends State<FormDialog> {
                 children: [
                   Expanded(child: TextField(controller: _file, decoration: const InputDecoration(labelText: "Fichier"))),
                   IconButton(icon: const Icon(Icons.folder), onPressed: () async {
-                    const XTypeGroup typeGroup = XTypeGroup(label: 'Audio', extensions: ['mp3', 'm4a', 'wav']);
-                    final file = await openFile(acceptedTypeGroups: [typeGroup]);
-                    if (file != null) setState(() => _file.text = file.path);
+                    if (Platform.isIOS || Platform.isAndroid) {
+                      FilePickerResult? result = await FilePicker.platform.pickFiles(type: FileType.audio);
+                      if (result != null) {
+                        final file = result.files.single;
+                        final dir = await getApplicationDocumentsDirectory();
+                        final newFile = await File(file.path!).copy(p.join(dir.path, file.name));
+                        setState(() => _file.text = file.name);
+                      }
+                    } else {
+                      const XTypeGroup typeGroup = XTypeGroup(label: 'Audio', extensions: ['mp3', 'm4a', 'wav']);
+                      final file = await openFile(acceptedTypeGroups: [typeGroup]);
+                      if (file != null) setState(() => _file.text = file.path);
+                    }
                   }),
                 ],
               )
@@ -508,10 +553,18 @@ class _FormDialogState extends State<FormDialog> {
               "fichier": isLocal ? _file.text : _ytUrl.text,
               "versets": versets,
             };
-            if (widget.rec == null) {
-              await http.post(Uri.parse('http://127.0.0.1:8000/recitations'), body: jsonEncode(data), headers: {"Content-Type": "application/json"});
+            if (Platform.isIOS || Platform.isAndroid) {
+              if (widget.rec == null) {
+                await widget.db?.insert('recitations', data);
+              } else {
+                await widget.db?.update('recitations', data, where: 'id = ?', whereArgs: [widget.rec!['id']]);
+              }
             } else {
-              await http.put(Uri.parse('http://127.0.0.1:8000/recitations/${widget.rec!['id']}'), body: jsonEncode(data), headers: {"Content-Type": "application/json"});
+              if (widget.rec == null) {
+                await http.post(Uri.parse('http://127.0.0.1:8000/recitations'), body: jsonEncode(data), headers: {"Content-Type": "application/json"});
+              } else {
+                await http.put(Uri.parse('http://127.0.0.1:8000/recitations/${widget.rec!['id']}'), body: jsonEncode(data), headers: {"Content-Type": "application/json"});
+              }
             }
             widget.onSave();
             Navigator.pop(context);

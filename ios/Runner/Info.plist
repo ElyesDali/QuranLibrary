@@ -67,15 +67,15 @@
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UIBackgroundModes</key>
-    <array>
-        <string>audio</string>
-    </array>
-    <key>NSAppTransportSecurity</key>
-    <dict>
-        <key>NSAllowsArbitraryLoads</key>
-        <true/>
-    </dict>
-    <key>UISupportsDocumentBrowser</key>
-    <true/>
+	<array>
+		<string>audio</string>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>UISupportsDocumentBrowser</key>
+	<true/>
 </dict>
 </plist>

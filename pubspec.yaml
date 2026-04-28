@@ -38,8 +38,9 @@ dependencies:
   just_audio: ^0.10.5
   just_audio_windows: ^0.2.3
   file_selector: ^1.1.0
-  file_picker: ^8.0.0  # Ajoute cette ligne
-  path_provider: ^2.1.0 # Ajoute cette ligne
+  file_picker: ^11.0.2
+  sqflite: ^2.3.3
+  path_provider: ^2.1.2
 
 dev_dependencies:
   flutter_test:
