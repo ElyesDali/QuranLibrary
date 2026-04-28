@@ -4,6 +4,8 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:just_audio/just_audio.dart';
 import 'package:file_selector/file_selector.dart';
+import 'package:file_picker/file_picker.dart';
+import 'dart:io'; // Pour savoir si on est sur iOS ou Windows
 
 void main() => runApp(const LuhaidanApp());
 
