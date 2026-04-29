@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'package:flutter_media_metadata/flutter_media_metadata.dart';
+import 'package:dio/dio.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -96,7 +97,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
     
-    // Gère la fin de lecture et le mode boucle automatique
     _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
         if (loopMode == LoopModeState.autoplay) {
@@ -105,7 +105,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
     });
 
-    // Capture les événements Play externes (ex: AirPlay)
     _player.playingStream.listen((playing) {
       if (playing && _player.processingState == ProcessingState.completed) {
         _player.seek(Duration.zero);
@@ -154,6 +153,32 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
+  // --- NOUVELLE FONCTION DE TÉLÉCHARGEMENT INVISIBLE EN ARRIÈRE-PLAN ---
+  void _downloadYoutubeInBackground(String cleanUrl, File localFile) async {
+    var yt = YoutubeExplode();
+    try {
+      var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
+      var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+      var stream = yt.videos.streamsClient.get(audioStream);
+      
+      // On sauvegarde dans un fichier ".tmp" pour ne pas corrompre le fichier final
+      final tempFile = File("${localFile.path}.tmp");
+      var fileStream = tempFile.openWrite();
+      await stream.pipe(fileStream);
+      await fileStream.flush();
+      await fileStream.close();
+      
+      // Une fois fini avec succès, on le renomme en .mp4 officiel
+      if (await tempFile.length() > 0) {
+        await tempFile.rename(localFile.path);
+      }
+    } catch (e) {
+      debugPrint("Erreur background download: $e");
+    } finally {
+      yt.close();
+    }
+  }
+
   Future<void> _play(Map<String, dynamic> rec) async {
     setState(() => currentRecitation = rec);
     if (rec['fichier'] == null) return;
@@ -186,7 +211,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     AudioSource buildSource(Uri uri) {
       final base = AudioSource.uri(uri, tag: mediaItem);
       if (exactDuration != null && exactDuration.inSeconds > 0) {
-        // LE CORRECTIF EST ICI : On ajoute le "tag: mediaItem" au ClippingAudioSource
         return ClippingAudioSource(child: base, end: exactDuration, tag: mediaItem);
       }
       return base;
@@ -200,24 +224,23 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final localFile = File(p.join(dir.path, fileName));
 
         if (await localFile.exists()) {
+          // Si le fichier existe en local (téléchargement arrière-plan terminé), on le lit
           await _player.setAudioSource(buildSource(Uri.file(localFile.path)));
         } else {
-          setState(() => _isDownloading = true);
+          // LECTURE INSTANTANÉE DEPUIS LE FLUX YOUTUBE !
+          setState(() => _isDownloading = true); // Affichage flash de l'indicateur
           var yt = YoutubeExplode();
-          var video = await yt.videos.get(cleanUrl);
-          var manifest = await yt.videos.streamsClient.getManifest(video.id);
+          var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
           var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
           
-          var stream = yt.videos.streamsClient.get(audioStream);
-          var fileStream = localFile.openWrite();
-          await stream.pipe(fileStream);
-          await fileStream.flush();
-          await fileStream.close();
+          await _player.setAudioSource(buildSource(audioStream.url));
+          
+          // On lance le téléchargement local sans bloquer la lecture
+          _downloadYoutubeInBackground(cleanUrl, localFile);
           
           await _db?.update('recitations', {'fichier': fileName}, where: 'id = ?', whereArgs: [rec['id']]);
           yt.close();
           setState(() => _isDownloading = false);
-          await _player.setAudioSource(buildSource(Uri.file(localFile.path)));
         }
       } else {
         final dir = await getApplicationDocumentsDirectory();
@@ -619,8 +642,23 @@ class _FormDialogState extends State<FormDialog> {
                 var yt = YoutubeExplode();
                 try {
                   var video = await yt.videos.get(_ytUrl.text.split('?').first);
-                  thumb = video.thumbnails.standardResUrl;
+                  String remoteThumb = video.thumbnails.highResUrl;
+                  if (remoteThumb.isEmpty) {
+                    remoteThumb = video.thumbnails.standardResUrl;
+                  }
+                  
                   dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
+                  
+                  // --- FIX OFFLINE THUMBNAIL : On la télécharge tout de suite en local ! ---
+                  try {
+                    final dir = await getApplicationDocumentsDirectory();
+                    final thumbFile = File(p.join(dir.path, "thumb_yt_${video.id}.jpg"));
+                    await Dio().download(remoteThumb, thumbFile.path);
+                    thumb = thumbFile.path; // On enregistre le chemin local
+                  } catch (e) {
+                    thumb = remoteThumb; // Si le téléchargement échoue, on garde l'URL internet par défaut
+                  }
+                  
                 } catch (e) {
                   debugPrint("Erreur YouTube: $e");
                 } finally {
