@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter_media_metadata/flutter_media_metadata.dart'; // Pour la miniature locale
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -88,6 +89,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   int? selectedYearFilter;
   Database? _db;
   bool _isDownloading = false;
+  double? _dragValue;
 
   @override
   void initState() {
@@ -112,7 +114,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ),
       onUpgrade: (db, oldV, newV) {
         if (oldV < 2) {
-          // On ajoute les colonnes si elles n'existent pas encore
           db.execute('ALTER TABLE recitations ADD COLUMN thumbnail TEXT');
           db.execute('ALTER TABLE recitations ADD COLUMN duration TEXT');
         }
@@ -131,13 +132,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   void _applyFilters() {
     setState(() {
-      if (selectedYearFilter == null) {
-        displayedRecitations = allRecitations;
-      } else if (selectedYearFilter == -1) {
-        displayedRecitations = allRecitations.where((r) => r['annee'] == null).toList();
-      } else {
-        displayedRecitations = allRecitations.where((r) => r['annee'] == selectedYearFilter).toList();
-      }
+      if (selectedYearFilter == null) displayedRecitations = allRecitations;
+      else if (selectedYearFilter == -1) displayedRecitations = allRecitations.where((r) => r['annee'] == null).toList();
+      else displayedRecitations = allRecitations.where((r) => r['annee'] == selectedYearFilter).toList();
     });
   }
 
@@ -146,18 +143,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (rec['fichier'] == null) return;
     
     String path = rec['fichier'];
-    
-    // 1. On récupère la vraie durée exacte depuis la base de données
     Duration? exactDuration;
     if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
       final parts = rec['duration'].toString().split(':');
-      try {
-        if (parts.length == 2) {
-          exactDuration = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
-        } else if (parts.length == 3) {
-          exactDuration = Duration(hours: int.parse(parts[0]), minutes: int.parse(parts[1]), seconds: int.parse(parts[2]));
-        }
-      } catch (_) {} // Si la durée est mal formatée, on ignore
+      if (parts.length == 2) exactDuration = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+    }
+
+    Uri? artUri;
+    if (rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty) {
+      if (rec['thumbnail'].toString().startsWith('http')) {
+        artUri = Uri.parse(rec['thumbnail']);
+      } else {
+        artUri = Uri.file(rec['thumbnail']);
+      }
     }
 
     final mediaItem = MediaItem(
@@ -165,16 +163,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
       album: "Muhammad",
       title: "${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}",
       artist: "Muhammad Al-Luhaidan",
-      artUri: rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty ? Uri.parse(rec['thumbnail']) : null,
-      duration: exactDuration, // En bonus : la barre de l'écran de verrouillage iOS sera exacte !
+      artUri: artUri,
+      duration: exactDuration,
     );
 
-    // 2. Le "coupe-circuit" : force la lecture à s'arrêter à la vraie durée
     AudioSource buildSource(Uri uri) {
-      if (exactDuration != null && exactDuration!.inSeconds > 0) {
-        return ClippingAudioSource(child: AudioSource.uri(uri), end: exactDuration!, tag: mediaItem);
+      if (exactDuration != null && exactDuration.inSeconds > 0) {
+        return ClippingAudioSource(child: AudioSource.uri(uri), end: exactDuration, tag: mediaItem);
       }
-      return AudioSource.uri(uri, tag: mediaItem); // Pour les fichiers locaux normaux
+      return AudioSource.uri(uri, tag: mediaItem);
     }
 
     try {
@@ -185,7 +182,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final localFile = File(p.join(dir.path, fileName));
 
         if (await localFile.exists()) {
-          // On passe par le coupe-circuit
           await _player.setAudioSource(buildSource(Uri.file(localFile.path)));
         } else {
           setState(() => _isDownloading = true);
@@ -193,47 +189,33 @@ class _LibraryScreenState extends State<LibraryScreen> {
           var video = await yt.videos.get(cleanUrl);
           var manifest = await yt.videos.streamsClient.getManifest(video.id);
           var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-          
           await Dio().download(audioStream.url.toString(), localFile.path);
           await _db?.update('recitations', {'fichier': fileName}, where: 'id = ?', whereArgs: [rec['id']]);
           yt.close();
-          
           setState(() => _isDownloading = false);
-          // On passe par le coupe-circuit
           await _player.setAudioSource(buildSource(Uri.file(localFile.path)));
         }
       } else {
         final dir = await getApplicationDocumentsDirectory();
         final file = File(p.join(dir.path, path));
-        if (await file.exists()) {
-          await _player.setAudioSource(buildSource(Uri.file(file.path)));
-        } else {
-          throw Exception("Fichier local introuvable");
-        }
+        if (await file.exists()) await _player.setAudioSource(buildSource(Uri.file(file.path)));
+        else throw Exception("Fichier introuvable");
       }
       _player.play();
     } catch (e) {
       setState(() => _isDownloading = false);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
-      }
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
     }
   }
 
   void _playNext() {
-    if (displayedRecitations.isEmpty || currentRecitation == null) return;
-    int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation!['id']);
-    if (index != -1 && index < displayedRecitations.length - 1) {
-      _play(displayedRecitations[index + 1]);
-    }
+    int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
+    if (index != -1 && index < displayedRecitations.length - 1) _play(displayedRecitations[index + 1]);
   }
 
   void _playPrevious() {
-    if (displayedRecitations.isEmpty || currentRecitation == null) return;
-    int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation!['id']);
-    if (index > 0) {
-      _play(displayedRecitations[index - 1]);
-    }
+    int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
+    if (index > 0) _play(displayedRecitations[index - 1]);
   }
 
   void _toggleLoop() {
@@ -256,27 +238,24 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return "${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
   }
 
+  Widget _buildThumbnail(String? thumbPath) {
+    if (thumbPath == null || thumbPath.isEmpty) {
+      return Container(width: 50, height: 50, color: Colors.grey[900], child: const Icon(Icons.mic, size: 30, color: Color(0xFF7EB8C9)));
+    }
+    if (thumbPath.startsWith('http')) {
+      return Image.network(thumbPath, width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
+    } else {
+      return Image.file(File(thumbPath), width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text("مكتبة محمد اللحيدان", style: TextStyle(color: Color(0xFF7EB8C9))),
-        backgroundColor: const Color(0xFF111111),
-      ),
+      appBar: AppBar(title: const Text("مكتبة محمد اللحيدان", style: TextStyle(color: Color(0xFF7EB8C9)))),
       drawer: _buildDrawer(),
       body: Column(
         children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text("${displayedRecitations.length} récitations", style: const TextStyle(color: Color(0xFF6A7A82), fontSize: 13)),
-                if (selectedYearFilter != null)
-                  Text(selectedYearFilter == -1 ? "Année inconnue" : "$selectedYearFilter H", style: const TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold)),
-              ],
-            ),
-          ),
           Expanded(
             child: Stack(
               children: [
@@ -284,34 +263,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   itemCount: displayedRecitations.length,
                   itemBuilder: (context, i) {
                     final rec = displayedRecitations[i];
-                    final yearH = rec['annee']?.toString() ?? "??";
-                    final yearG = rec['annee_g']?.toString() ?? "??";
-                    
                     return ListTile(
                       selected: currentRecitation?['id'] == rec['id'],
                       leading: ClipRRect(
                         borderRadius: BorderRadius.circular(6),
-                        child: (rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty)
-                          ? Image.network(rec['thumbnail'], width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40))
-                          : Container(width: 50, height: 50, color: Colors.grey[900], child: const Icon(Icons.mic, size: 30, color: Color(0xFF7EB8C9))),
+                        child: _buildThumbnail(rec['thumbnail']),
                       ),
                       title: Text("${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}"),
-                      subtitle: Text("$yearH H | $yearG G • Versets: ${rec['versets']}"),
+                      subtitle: Text("${rec['annee'] ?? '??'} H • Versets: ${rec['versets']}"),
                       trailing: Text(rec['duration'] ?? "--:--", style: const TextStyle(color: Colors.grey, fontSize: 12)),
                       onTap: () => _play(rec),
                       onLongPress: () => _showOptions(rec),
                     );
                   },
                 ),
-                Positioned(
-                  bottom: 16,
-                  right: 24,
-                  child: FloatingActionButton(
-                    onPressed: () => _showForm(),
-                    backgroundColor: const Color(0xFF4A8FA3),
-                    child: const Icon(Icons.add, color: Colors.white, size: 30),
-                  ),
-                ),
+                Positioned(bottom: 20, right: 20, child: FloatingActionButton(onPressed: () => _showForm(), backgroundColor: const Color(0xFF4A8FA3), child: const Icon(Icons.add))),
               ],
             ),
           ),
@@ -324,92 +290,52 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Widget _buildPlayerUI() {
     return Container(
       color: const Color(0xFF0D0D0D),
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+      padding: const EdgeInsets.fromLTRB(20, 10, 20, 30),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (_isDownloading) 
-            const Padding(padding: EdgeInsets.only(bottom: 8.0), child: LinearProgressIndicator(color: Color(0xFF7EB8C9))),
-            
-          Text(
-            "${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}",
-            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white),
-            textAlign: TextAlign.center,
-          ),
-          Text(
-            "${currentRecitation!['annee'] ?? '??'} H | ${currentRecitation!['annee_g'] ?? '??'} G • Versets: ${currentRecitation!['versets']}",
-            style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82)),
-          ),
+          if (_isDownloading) const Padding(padding: EdgeInsets.only(bottom: 8.0), child: LinearProgressIndicator(color: Color(0xFF7EB8C9))),
+          Text("${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          Text("${currentRecitation!['annee'] ?? '??'} H • Versets: ${currentRecitation!['versets']}", style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82))),
           const SizedBox(height: 8),
-
           StreamBuilder<Duration>(
             stream: _player.positionStream,
             builder: (context, snapshot) {
               final pos = snapshot.data ?? Duration.zero;
               final dur = _player.duration ?? Duration.zero;
+              double sliderVal = _dragValue ?? pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0);
               return Column(
                 children: [
-                  SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0),
-                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 14.0),
-                    ),
-                    child: Slider(
-                      activeColor: const Color(0xFF7EB8C9),
-                      inactiveColor: Colors.white24,
-                      value: pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0),
-                      max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
-                      onChanged: (v) => _player.seek(Duration(seconds: v.toInt())),
-                    ),
+                  Slider(
+                    activeColor: const Color(0xFF7EB8C9),
+                    inactiveColor: Colors.white24,
+                    value: sliderVal,
+                    max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
+                    onChanged: (v) => setState(() => _dragValue = v),
+                    onChangeEnd: (v) {
+                      _player.seek(Duration(seconds: v.toInt()));
+                      setState(() => _dragValue = null);
+                    },
                   ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8.0),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(_formatDuration(pos), style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                        Text(_formatDuration(dur), style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                      ],
-                    ),
-                  ),
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [Text(_formatDuration(pos), style: const TextStyle(fontSize: 11, color: Colors.grey)), Text(_formatDuration(dur), style: const TextStyle(fontSize: 11, color: Colors.grey))]),
                 ],
               );
             },
           ),
-
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              IconButton(
-                icon: Icon(
-                  loopMode == LoopModeState.off ? Icons.repeat : 
-                  loopMode == LoopModeState.autoplay ? Icons.repeat_on : Icons.repeat_one_on,
-                  color: loopMode == LoopModeState.off ? Colors.grey : const Color(0xFF7EB8C9),
-                ),
-                onPressed: _toggleLoop,
-              ),
+              IconButton(icon: Icon(loopMode == LoopModeState.off ? Icons.repeat : (loopMode == LoopModeState.autoplay ? Icons.repeat_on : Icons.repeat_one_on), color: loopMode == LoopModeState.off ? Colors.grey : const Color(0xFF7EB8C9)), onPressed: _toggleLoop),
               IconButton(icon: const Icon(Icons.skip_previous, size: 32), onPressed: _playPrevious),
               StreamBuilder<PlayerState>(
                 stream: _player.playerStateStream,
-                builder: (context, snap) {
-                  final playerState = snap.data;
-                  final processingState = playerState?.processingState;
-                  final playing = playerState?.playing ?? false;
-
-                  if (processingState == ProcessingState.loading || processingState == ProcessingState.buffering) {
-                    return Container(
-                      margin: const EdgeInsets.symmetric(horizontal: 16.0),
-                      width: 48,
-                      height: 48,
-                      child: const CircularProgressIndicator(color: Color(0xFF7EB8C9)),
-                    );
-                  } else {
-                    return IconButton(
-                      iconSize: 64,
-                      icon: Icon(playing ? Icons.pause_circle : Icons.play_circle, color: const Color(0xFF7EB8C9)),
-                      onPressed: () => playing ? _player.pause() : _player.play(),
-                    );
+                builder: (context, snapshot) {
+                  final state = snapshot.data;
+                  if (state?.processingState == ProcessingState.loading || state?.processingState == ProcessingState.buffering) {
+                    return Container(margin: const EdgeInsets.symmetric(horizontal: 16), width: 48, height: 48, child: const CircularProgressIndicator(color: Color(0xFF7EB8C9)));
                   }
+                  final playing = state?.playing ?? false;
+                  return IconButton(iconSize: 64, icon: Icon(playing ? Icons.pause_circle : Icons.play_circle, color: const Color(0xFF7EB8C9)), onPressed: () => playing ? _player.pause() : _player.play());
                 },
               ),
               IconButton(icon: const Icon(Icons.skip_next, size: 32), onPressed: _playNext),
@@ -422,70 +348,32 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Widget _buildDrawer() {
-    final Map<int, int?> yearMap = {};
-    for (var r in allRecitations) {
-      if (r['annee'] != null) yearMap[r['annee'] as int] = r['annee_g'] as int?;
-    }
-    final years = yearMap.keys.toList()..sort((a, b) => b.compareTo(a));
-
+    final years = allRecitations.map((r) => r['annee']).whereType<int>().toSet().toList()..sort((a, b) => b.compareTo(a));
     return Drawer(
       backgroundColor: const Color(0xFF0A0A0A),
       child: ListView(
         children: [
-          const DrawerHeader(child: Center(child: Text("FILTRER PAR ANNÉE", style: TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold)))),
-          ListTile(
-            title: const Text("Toutes les récitations"),
-            selected: selectedYearFilter == null,
-            onTap: () { setState(() => selectedYearFilter = null); _applyFilters(); Navigator.pop(context); },
-          ),
-          ListTile(
-            title: const Text("Année inconnue"),
-            selected: selectedYearFilter == -1,
-            onTap: () { setState(() => selectedYearFilter = -1); _applyFilters(); Navigator.pop(context); },
-          ),
+          const DrawerHeader(child: Center(child: Text("FILTRES", style: TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold)))),
+          ListTile(title: const Text("Toutes"), onTap: () { setState(() => selectedYearFilter = null); _applyFilters(); Navigator.pop(context); }),
+          ListTile(title: const Text("Année inconnue"), onTap: () { setState(() => selectedYearFilter = -1); _applyFilters(); Navigator.pop(context); }),
           const Divider(color: Colors.white24),
-          ...years.map((y) {
-            final yg = yearMap[y];
-            return ListTile(
-              title: Text("$y H  |  ${yg ?? '??'} G"),
-              selected: selectedYearFilter == y,
-              onTap: () { setState(() => selectedYearFilter = y); _applyFilters(); Navigator.pop(context); },
-            );
-          }),
+          ...years.map((y) => ListTile(title: Text("$y H"), onTap: () { setState(() => selectedYearFilter = y); _applyFilters(); Navigator.pop(context); })),
         ],
       ),
     );
   }
 
   void _showOptions(Map<String, dynamic> rec) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF111111),
-      builder: (context) => Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          ListTile(
-            leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)),
-            title: const Text("Modifier"),
-            onTap: () { Navigator.pop(context); _showForm(rec: rec); },
-          ),
-          ListTile(
-            leading: const Icon(Icons.delete, color: Colors.red),
-            title: const Text("Supprimer", style: TextStyle(color: Colors.red)),
-            onTap: () async {
-              await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
-              _fetch();
-              Navigator.pop(context);
-            },
-          ),
-        ],
-      ),
-    );
+    showModalBottomSheet(context: context, backgroundColor: const Color(0xFF111111), builder: (context) => Wrap(children: [
+      ListTile(leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)), title: const Text("Modifier"), onTap: () { Navigator.pop(context); _showForm(rec: rec); }),
+      ListTile(leading: const Icon(Icons.delete, color: Colors.red), title: const Text("Supprimer", style: TextStyle(color: Colors.red)), onTap: () async {
+        await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
+        _fetch(); Navigator.pop(context);
+      }),
+    ]));
   }
 
-  void _showForm({Map<String, dynamic>? rec}) {
-    showDialog(context: context, builder: (context) => FormDialog(rec: rec, onSave: _fetch, db: _db));
-  }
+  void _showForm({Map<String, dynamic>? rec}) => showDialog(context: context, builder: (context) => FormDialog(rec: rec, onSave: _fetch, db: _db));
 }
 
 class FormDialog extends StatefulWidget {
@@ -493,8 +381,7 @@ class FormDialog extends StatefulWidget {
   final VoidCallback onSave;
   final Database? db;
   const FormDialog({super.key, this.rec, required this.onSave, this.db});
-  @override
-  State<FormDialog> createState() => _FormDialogState();
+  @override State<FormDialog> createState() => _FormDialogState();
 }
 
 class _FormDialogState extends State<FormDialog> {
@@ -511,7 +398,6 @@ class _FormDialogState extends State<FormDialog> {
       selectedNum = widget.rec!['sourate_num'];
       selectedName = widget.rec!['sourate_name'];
       isFull = widget.rec!['versets'] == "complet";
-      // Détermine si le fichier enregistré est une URL youtube ou un fichier local
       isLocal = !(widget.rec!['fichier']?.toString().contains('youtu') ?? false);
     }
     
@@ -538,81 +424,51 @@ class _FormDialogState extends State<FormDialog> {
           children: [
             DropdownMenu<Map<String, dynamic>>(
               initialSelection: widget.rec != null ? ALL_SURAHS.firstWhere((s) => s['num'] == widget.rec!['sourate_num']) : ALL_SURAHS[0],
-              width: 280,
-              label: const Text("Sourate"),
-              enableSearch: true,
+              width: 280, label: const Text("Sourate"), enableSearch: true,
               dropdownMenuEntries: ALL_SURAHS.map((s) => DropdownMenuEntry(value: s, label: "${s['num']} - ${s['name']}")).toList(),
               onSelected: (s) { selectedNum = s?['num']; selectedName = s?['name']; },
             ),
             const SizedBox(height: 15),
-            TextField(
-              controller: _year,
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(4)],
-              decoration: const InputDecoration(labelText: "Année (H ou G)", hintText: "Sécurité : Max 4 chiffres"),
-            ),
+            TextField(controller: _year, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Année (H ou G)")),
             const SizedBox(height: 15),
             const Text("Étendue :"),
-            Row(
-              children: [
-                Radio(value: true, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Complet"),
-                Radio(value: false, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Partiel"),
-              ],
-            ),
-            if (!isFull)
-              Row(
-                children: [
-                  Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
-                  const SizedBox(width: 10),
-                  Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
-                ],
-              ),
+            Row(children: [
+              Radio(value: true, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Complet"),
+              Radio(value: false, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Partiel"),
+            ]),
+            if (!isFull) Row(children: [
+              Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
+              const SizedBox(width: 10),
+              Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
+            ]),
             const SizedBox(height: 15),
             const Text("Source :"),
-            Row(
-              children: [
-                Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("Local"),
-                Radio(value: false, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("YouTube"),
-              ],
-            ),
-            if (isLocal)
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const SizedBox(height: 10),
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.grey[800],
-                      foregroundColor: Colors.white,
-                      minimumSize: const Size(double.infinity, 45)
-                    ),
-                    icon: const Icon(Icons.folder_open),
-                    label: const Text("Parcourir l'iPhone..."),
-                    onPressed: () async {
-                      try {
-                        FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any); 
-                        if (result != null) {
-                          final file = result.files.single;
-                          final dir = await getApplicationDocumentsDirectory();
-                          await File(file.path!).copy(p.join(dir.path, file.name));
-                          setState(() => _file.text = file.name);
-                        }
-                      } catch (e) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text("❌ Erreur accès fichiers : $e"), backgroundColor: Colors.red)
-                        );
-                      }
+            Row(children: [
+              Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("Local"),
+              Radio(value: false, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("YouTube"),
+            ]),
+            if (isLocal) Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const SizedBox(height: 10),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[800], foregroundColor: Colors.white, minimumSize: const Size(double.infinity, 45)),
+                icon: const Icon(Icons.folder_open), label: const Text("Parcourir l'iPhone..."),
+                onPressed: () async {
+                  try {
+                    FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any); 
+                    if (result != null) {
+                      final file = result.files.single;
+                      final dir = await getApplicationDocumentsDirectory();
+                      await File(file.path!).copy(p.join(dir.path, file.name));
+                      setState(() => _file.text = file.name);
                     }
-                  ),
-                  if (_file.text.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 8.0),
-                      child: Text("🎵 Fichier sélectionné : \n${_file.text}", style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 13)),
-                    ),
-                ],
-              )
-            else
-              TextField(controller: _ytUrl, decoration: const InputDecoration(labelText: "Lien YouTube ou Shorts")),
+                  } catch (e) {
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur fichiers : $e"), backgroundColor: Colors.red));
+                  }
+                }
+              ),
+              if (_file.text.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8.0), child: Text("🎵 Fichier sélectionné : \n${_file.text}", style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 13))),
+            ])
+            else TextField(controller: _ytUrl, decoration: const InputDecoration(labelText: "Lien YouTube ou Shorts")),
           ],
         ),
       ),
@@ -622,16 +478,14 @@ class _FormDialogState extends State<FormDialog> {
           style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
           onPressed: () async {
             if (selectedNum == null) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text("⚠️ Vous devez sélectionner une sourate"), backgroundColor: Colors.red)
-              );
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("⚠️ Vous devez sélectionner une sourate"), backgroundColor: Colors.red));
               return;
             }
 
             String thumb = widget.rec?['thumbnail'] ?? "";
             String dur = widget.rec?['duration'] ?? "";
 
-            // On récupère la miniature uniquement si c'est un nouveau lien YouTube
+            // 1. YouTube metadata extraction
             if (!isLocal && _ytUrl.text.isNotEmpty && (widget.rec == null || _ytUrl.text != widget.rec?['fichier'])) {
               var yt = YoutubeExplode();
               try {
@@ -639,9 +493,32 @@ class _FormDialogState extends State<FormDialog> {
                 thumb = video.thumbnails.standardResUrl;
                 dur = "${video.duration?.inMinutes}:${(video.duration?.inSeconds ?? 0).toString().padLeft(2, '0')}";
               } catch (e) {
-                debugPrint("Erreur récupération infos YouTube: $e");
+                debugPrint("Erreur YouTube: $e");
               } finally {
                 yt.close();
+              }
+            } 
+            // 2. Fichiers locaux : extraction de durée + image embarquée (ID3 tag)
+            else if (isLocal && _file.text.isNotEmpty && (widget.rec == null || _file.text != widget.rec?['fichier'])) {
+              final dir = await getApplicationDocumentsDirectory();
+              final localFilePath = p.join(dir.path, _file.text);
+              
+              // Durée
+              final player = AudioPlayer();
+              final d = await player.setFilePath(localFilePath);
+              if (d != null) dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+              await player.dispose();
+
+              // Miniature (Album Art)
+              try {
+                final metadata = await MetadataRetriever.fromFile(File(localFilePath));
+                if (metadata.albumArt != null) {
+                  final artFile = File(p.join(dir.path, "thumb_${_file.text}.jpg"));
+                  await artFile.writeAsBytes(metadata.albumArt!);
+                  thumb = artFile.path;
+                }
+              } catch (e) {
+                debugPrint("Pas d'image trouvée dans le fichier: $e");
               }
             }
 

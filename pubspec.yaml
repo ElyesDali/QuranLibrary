@@ -44,6 +44,7 @@ dependencies:
   path_provider: ^2.1.2
   youtube_explode_dart: ^2.2.2
   dio: ^5.4.0
+  flutter_media_metadata:
 
 dev_dependencies:
   flutter_test:
