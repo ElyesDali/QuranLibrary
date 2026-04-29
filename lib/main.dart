@@ -5,11 +5,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:just_audio/just_audio.dart';
 import 'package:file_selector/file_selector.dart'; // Pour Windows
-import 'package:file_picker/file_picker.dart';    // Pour iOS
+import 'package:file_picker/file_picker.dart';    // Pour iOS/Android
 import 'package:sqflite/sqflite.dart';            // Base de données locale
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
-import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart'; // Pour YouTube
 
 void main() => runApp(const LuhaidanApp());
 
@@ -148,24 +148,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
         String urlOrPath = rec['fichier'];
 
         if (Platform.isIOS || Platform.isAndroid) {
-          // --- NOUVELLE LOGIQUE YOUTUBE ---
-          if (urlOrPath.contains('youtube.com') || urlOrPath.contains('youtu.be')) {
+          if (urlOrPath.contains('youtube.com') || urlOrPath.contains('youtu.be') || urlOrPath.contains('shorts')) {
             var yt = YoutubeExplode();
             try {
-              // Récupère les infos de la vidéo
               var video = await yt.videos.get(urlOrPath);
-              // Récupère les différents flux disponibles (vidéo, audio...)
               var manifest = await yt.videos.streamsClient.getManifest(video.id);
-              // Isole le meilleur flux uniquement audio
-              var audioStream = manifest.audioOnly.withHighestBitrate();
               
-              // Envoie le lien direct du mp3 au lecteur
+              // Forcer MP4/AAC pour compatibilité iPhone
+              var audioStreams = manifest.audioOnly.where((s) => s.container.name == 'mp4');
+              var audioStream = audioStreams.isNotEmpty ? audioStreams.withHighestBitrate() : manifest.audioOnly.withHighestBitrate();
+              
               await _player.setUrl(audioStream.url.toString());
             } finally {
-              yt.close(); // Ferme le processus d'extraction pour libérer la mémoire
+              yt.close();
             }
           } 
-          // --- LOGIQUE CLASSIQUE POUR LE RESTE ---
           else if (urlOrPath.startsWith('http')) {
             await _player.setUrl(urlOrPath);
           } else {
@@ -180,18 +177,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
         } else {
           await _player.setUrl('http://127.0.0.1:8000/stream_file?path=${Uri.encodeComponent(urlOrPath)}');
         }
-        
         _player.play();
-        
       } catch (e) {
         debugPrint("Erreur lecture: $e");
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text("❌ Erreur de lecture : $e"), 
-              backgroundColor: Colors.red,
-              duration: const Duration(seconds: 4),
-            )
+            SnackBar(content: Text("❌ Erreur de lecture : $e"), backgroundColor: Colors.red)
           );
         }
       }
@@ -268,12 +259,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   itemCount: displayedRecitations.length,
                   itemBuilder: (context, i) {
                     final rec = displayedRecitations[i];
-                    final yearH = rec['annee']?.toString() ?? "??";
-                    final yearG = rec['annee_g']?.toString() ?? "??";
                     return ListTile(
                       selected: currentRecitation?['id'] == rec['id'],
                       title: Text("${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}"),
-                      subtitle: Text("$yearH H | $yearG G • Versets: ${rec['versets']}"),
+                      subtitle: Text("${rec['annee'] ?? '??'} H | ${rec['annee_g'] ?? '??'} G • Versets: ${rec['versets']}"),
                       onTap: () => _play(rec),
                       onLongPress: () => _showOptions(rec),
                     );
@@ -284,7 +273,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   right: 24,
                   child: FloatingActionButton(
                     onPressed: () => _showForm(),
-                    backgroundColor: const Color(0xFF4A8FA3), // Remis en bleu
+                    backgroundColor: const Color(0xFF4A8FA3),
                     child: const Icon(Icons.add, color: Colors.white, size: 30),
                   ),
                 ),
@@ -320,14 +309,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
             onTap: () { setState(() => selectedYearFilter = -1); _applyFilters(); Navigator.pop(context); },
           ),
           const Divider(color: Colors.white24),
-          ...years.map((y) {
-            final yg = yearMap[y];
-            return ListTile(
-              title: Text("$y H  |  ${yg ?? '??'} G"),
-              selected: selectedYearFilter == y,
-              onTap: () { setState(() => selectedYearFilter = y); _applyFilters(); Navigator.pop(context); },
-            );
-          }),
+          ...years.map((y) => ListTile(
+            title: Text("$y H  |  ${yearMap[y] ?? '??'} G"),
+            selected: selectedYearFilter == y,
+            onTap: () { setState(() => selectedYearFilter = y); _applyFilters(); Navigator.pop(context); },
+          )),
         ],
       ),
     );
@@ -336,23 +322,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Widget _buildPlayer() {
     return Container(
       color: const Color(0xFF0D0D0D),
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32), // Espace ajouté en bas pour la barre iPhone
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // 1. Informations sur la récitation
           Text(
             "${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}",
             style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white),
-            textAlign: TextAlign.center,
           ),
           Text(
             "${currentRecitation!['annee'] ?? '??'} H | ${currentRecitation!['annee_g'] ?? '??'} G • Versets: ${currentRecitation!['versets']}",
             style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82)),
           ),
           const SizedBox(height: 8),
-
-          // 2. Barre de progression et temps
           StreamBuilder<Duration>(
             stream: _player.positionStream,
             builder: (context, snapshot) {
@@ -360,18 +342,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
               final dur = _player.duration ?? Duration.zero;
               return Column(
                 children: [
-                  SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0),
-                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 14.0),
-                    ),
-                    child: Slider(
-                      activeColor: const Color(0xFF7EB8C9),
-                      inactiveColor: Colors.white24,
-                      value: pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0),
-                      max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
-                      onChanged: (v) => _player.seek(Duration(seconds: v.toInt())),
-                    ),
+                  Slider(
+                    activeColor: const Color(0xFF7EB8C9),
+                    value: pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0),
+                    max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
+                    onChanged: (v) => _player.seek(Duration(seconds: v.toInt())),
                   ),
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 8.0),
@@ -387,8 +362,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
               );
             },
           ),
-
-          // 3. Contrôles alignés
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
@@ -401,13 +374,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 onPressed: _toggleLoop,
               ),
               IconButton(icon: const Icon(Icons.skip_previous, size: 32), onPressed: _playPrevious),
-              StreamBuilder<bool>(
-                stream: _player.playingStream,
-                builder: (context, snap) => IconButton(
-                  iconSize: 64,
-                  icon: Icon(snap.data == true ? Icons.pause_circle : Icons.play_circle, color: const Color(0xFF7EB8C9)),
-                  onPressed: () => snap.data == true ? _player.pause() : _player.play(),
-                ),
+              StreamBuilder<PlayerState>(
+                stream: _player.playerStateStream,
+                builder: (context, snap) {
+                  final state = snap.data;
+                  if (state?.processingState == ProcessingState.loading || state?.processingState == ProcessingState.buffering) {
+                    return const SizedBox(width: 64, height: 64, child: Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator(color: Color(0xFF7EB8C9))));
+                  }
+                  final playing = state?.playing ?? false;
+                  return IconButton(iconSize: 64, icon: Icon(playing ? Icons.pause_circle : Icons.play_circle, color: const Color(0xFF7EB8C9)), onPressed: () => playing ? _player.pause() : _player.play());
+                },
               ),
               IconButton(icon: const Icon(Icons.skip_next, size: 32), onPressed: _playNext),
               IconButton(icon: const Icon(Icons.stop, size: 28, color: Colors.grey), onPressed: () => _player.seek(Duration.zero)),
@@ -425,24 +401,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
       builder: (context) => Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          ListTile(
-            leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)),
-            title: const Text("Modifier"),
-            onTap: () { Navigator.pop(context); _showForm(rec: rec); },
-          ),
-          ListTile(
-            leading: const Icon(Icons.delete, color: Colors.red),
-            title: const Text("Supprimer", style: TextStyle(color: Colors.red)),
-            onTap: () async {
-              if (Platform.isIOS || Platform.isAndroid) {
-                await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
-              } else {
-                await http.delete(Uri.parse('http://127.0.0.1:8000/recitations/${rec['id']}'));
-              }
-              _fetch();
-              Navigator.pop(context);
-            },
-          ),
+          ListTile(leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)), title: const Text("Modifier"), onTap: () { Navigator.pop(context); _showForm(rec: rec); }),
+          ListTile(leading: const Icon(Icons.delete, color: Colors.red), title: const Text("Supprimer", style: TextStyle(color: Colors.red)), onTap: () async {
+            if (Platform.isIOS || Platform.isAndroid) await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
+            else await http.delete(Uri.parse('http://127.0.0.1:8000/recitations/${rec['id']}'));
+            _fetch(); Navigator.pop(context);
+          }),
         ],
       ),
     );
@@ -463,8 +427,8 @@ class FormDialog extends StatefulWidget {
 }
 
 class _FormDialogState extends State<FormDialog> {
-  int? selectedNum;
-  String? selectedName;
+  int? selectedNum = 1;
+  String? selectedName = "Al-Fatiha";
   late TextEditingController _year, _file, _ytUrl, _vStart, _vEnd;
   bool isLocal = true;
   bool isFull = true;
@@ -498,67 +462,52 @@ class _FormDialogState extends State<FormDialog> {
           mainAxisSize: MainAxisSize.min,
           children: [
             DropdownMenu<Map<String, dynamic>>(
-              initialSelection: widget.rec != null ? ALL_SURAHS.firstWhere((s) => s['num'] == widget.rec!['sourate_num']) : null,
-              width: 280,
-              label: const Text("Sourate"),
-              enableSearch: true,
+              initialSelection: widget.rec != null ? ALL_SURAHS.firstWhere((s) => s['num'] == widget.rec!['sourate_num']) : ALL_SURAHS[0],
+              width: 280, label: const Text("Sourate"), enableSearch: true,
               dropdownMenuEntries: ALL_SURAHS.map((s) => DropdownMenuEntry(value: s, label: "${s['num']} - ${s['name']}")).toList(),
               onSelected: (s) { selectedNum = s?['num']; selectedName = s?['name']; },
             ),
             const SizedBox(height: 15),
-            TextField(
-              controller: _year,
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(4)],
-              decoration: const InputDecoration(labelText: "Année (H ou G)", hintText: "Sécurité : Max 4 chiffres"),
-            ),
+            TextField(controller: _year, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Année (H ou G)")),
             const SizedBox(height: 15),
             const Text("Étendue :"),
-            Row(
-              children: [
-                Radio(value: true, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Complet"),
-                Radio(value: false, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Partiel"),
-              ],
-            ),
-            if (!isFull)
-              Row(
-                children: [
-                  Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
-                  const SizedBox(width: 10),
-                  Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
-                ],
-              ),
+            Row(children: [
+              Radio(value: true, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Complet"),
+              Radio(value: false, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Partiel"),
+            ]),
+            if (!isFull) Row(children: [
+              Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
+              const SizedBox(width: 10),
+              Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
+            ]),
             const SizedBox(height: 15),
             const Text("Source :"),
-            Row(
-              children: [
-                Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("Local"),
-                Radio(value: false, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("YouTube"),
-              ],
-            ),
-            if (isLocal)
-              Row(
-                children: [
-                  Expanded(child: TextField(controller: _file, decoration: const InputDecoration(labelText: "Fichier"))),
-                  IconButton(icon: const Icon(Icons.folder), onPressed: () async {
-                    if (Platform.isIOS || Platform.isAndroid) {
-                      FilePickerResult? result = await FilePicker.pickFiles(type: FileType.audio); // CORRECTION ICI !
-                      if (result != null) {
-                        final file = result.files.single;
-                        final dir = await getApplicationDocumentsDirectory();
-                        final newFile = await File(file.path!).copy(p.join(dir.path, file.name));
-                        setState(() => _file.text = file.name);
-                      }
-                    } else {
-                      const XTypeGroup typeGroup = XTypeGroup(label: 'Audio', extensions: ['mp3', 'm4a', 'wav']);
-                      final file = await openFile(acceptedTypeGroups: [typeGroup]);
-                      if (file != null) setState(() => _file.text = file.path);
+            Row(children: [
+              Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("Local"),
+              Radio(value: false, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("YouTube"),
+            ]),
+            if (isLocal) Column(children: [
+              const SizedBox(height: 10),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[800], foregroundColor: Colors.white, minimumSize: const Size(double.infinity, 45)),
+                icon: const Icon(Icons.folder_open), label: const Text("Parcourir l'iPhone..."),
+                onPressed: () async {
+                  try {
+                    FilePickerResult? result = await FilePicker.platform.pickFiles(type: FileType.any);
+                    if (result != null) {
+                      final file = result.files.single;
+                      final dir = await getApplicationDocumentsDirectory();
+                      await File(file.path!).copy(p.join(dir.path, file.name));
+                      setState(() => _file.text = file.name);
                     }
-                  }),
-                ],
-              )
-            else
-              TextField(controller: _ytUrl, decoration: const InputDecoration(labelText: "Lien YouTube")),
+                  } catch (e) {
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
+                  }
+                },
+              ),
+              if (_file.text.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8.0), child: Text("🎵 Fichier : ${_file.text}", style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 12))),
+            ])
+            else TextField(controller: _ytUrl, decoration: const InputDecoration(labelText: "Lien YouTube ou Shorts")),
           ],
         ),
       ),
@@ -567,40 +516,20 @@ class _FormDialogState extends State<FormDialog> {
         ElevatedButton(
           style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
           onPressed: () async {
-            // --- AJOUT DE L'ALERTE ICI ---
             if (selectedNum == null) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text("⚠️ Vous devez sélectionner une sourate", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                  backgroundColor: Colors.red,
-                  duration: Duration(seconds: 3),
-                ),
-              );
-              return; // On bloque l'enregistrement et on garde la fenêtre ouverte
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("⚠️ Veuillez sélectionner une sourate"), backgroundColor: Colors.red));
+              return;
             }
-            String versets = isFull ? "complet" : "${_vStart.text}-${_vEnd.text}";
             final data = {
-              "sourate_num": selectedNum,
-              "sourate_name": selectedName,
-              "annee": int.tryParse(_year.text),
-              "fichier": isLocal ? _file.text : _ytUrl.text,
-              "versets": versets,
+              "sourate_num": selectedNum, "sourate_name": selectedName,
+              "annee": int.tryParse(_year.text), "fichier": isLocal ? _file.text : _ytUrl.text,
+              "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
             };
             if (Platform.isIOS || Platform.isAndroid) {
-              if (widget.rec == null) {
-                await widget.db?.insert('recitations', data);
-              } else {
-                await widget.db?.update('recitations', data, where: 'id = ?', whereArgs: [widget.rec!['id']]);
-              }
-            } else {
-              if (widget.rec == null) {
-                await http.post(Uri.parse('http://127.0.0.1:8000/recitations'), body: jsonEncode(data), headers: {"Content-Type": "application/json"});
-              } else {
-                await http.put(Uri.parse('http://127.0.0.1:8000/recitations/${widget.rec!['id']}'), body: jsonEncode(data), headers: {"Content-Type": "application/json"});
-              }
+              if (widget.rec == null) await widget.db?.insert('recitations', data);
+              else await widget.db?.update('recitations', data, where: 'id = ?', whereArgs: [widget.rec!['id']]);
             }
-            widget.onSave();
-            Navigator.pop(context);
+            widget.onSave(); Navigator.pop(context);
           },
           child: const Text("Enregistrer", style: TextStyle(color: Colors.white)),
         ),
