@@ -99,7 +99,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    // ÉCOUTE DES BOUTONS AIRPLAY / VERROUILLAGE
     _player.currentIndexStream.listen((index) {
       if (_isSwitchingTrack) return; 
       if (index == 0) {
@@ -164,7 +163,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  // Permet de mettre à jour les vieilles miniatures internet vers du hors-ligne
   void _downloadThumbnailOffline(Map<String, dynamic> rec) async {
     try {
       final dir = await getApplicationDocumentsDirectory();
@@ -177,7 +175,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     } catch (_) {}
   }
 
-  // Le vrai téléchargement silencieux pour la prochaine fois
   void _downloadYoutubeInBackground(String cleanUrl, File localFile) async {
     var yt = YoutubeExplode();
     try {
@@ -231,13 +228,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Future<void> _play(Map<String, dynamic> rec) async {
     _isSwitchingTrack = true;
-    setState(() => currentRecitation = rec);
+    
+    // ARRÊT IMMÉDIAT de la piste précédente
+    await _player.stop();
+    
+    setState(() {
+      currentRecitation = rec;
+      _isDownloading = true; // Affichage immédiat du chargement
+    });
+
     if (rec['fichier'] == null) {
       _isSwitchingTrack = false;
+      setState(() => _isDownloading = false);
       return;
     }
     
-    // Fix miniature hors-ligne rétroactif
     if (rec['thumbnail'] != null && rec['thumbnail'].toString().startsWith('http')) {
       _downloadThumbnailOffline(rec);
     }
@@ -258,12 +263,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
           realUri = Uri.file(localFile.path);
           currentAudioSource = _buildSource(realUri, currentMediaItem);
         } else {
-          // LECTURE INSTANTANÉE (Fix Erreur -1 + Vitesse)
-          setState(() => _isDownloading = true); 
           var yt = YoutubeExplode();
           var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
           
-          // Muxed stream est le plus apprécié par AVPlayer iOS
           var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
           var streamInfo = mp4Muxed.isNotEmpty ? mp4Muxed.withHighestBitrate() : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
           
@@ -271,10 +273,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
           currentAudioSource = _buildSource(realUri, currentMediaItem);
           
           _downloadYoutubeInBackground(cleanUrl, localFile);
-          
-          await _db?.update('recitations', {'fichier': fileName}, where: 'id = ?', whereArgs: [rec['id']]);
           yt.close();
-          setState(() => _isDownloading = false);
         }
       } else {
         final dir = await getApplicationDocumentsDirectory();
@@ -287,24 +286,23 @@ class _LibraryScreenState extends State<LibraryScreen> {
         }
       }
 
-      // TRICK AIRPLAY : Construction de la fausse file d'attente à 3 pistes pour illuminer les boutons iOS !
       int currIdx = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
       int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
       int nextIdx = (currIdx + 1) % displayedRecitations.length;
 
       var playlist = ConcatenatingAudioSource(children: [
-         _buildSource(realUri, _createMediaItem(displayedRecitations[prevIdx])), // Dummy 0
-         currentAudioSource,                                                     // La Vraie 1
-         _buildSource(realUri, _createMediaItem(displayedRecitations[nextIdx])), // Dummy 2
+         _buildSource(realUri, _createMediaItem(displayedRecitations[prevIdx])),
+         currentAudioSource,                                                     
+         _buildSource(realUri, _createMediaItem(displayedRecitations[nextIdx])),
       ]);
 
       await _player.setAudioSource(playlist, initialIndex: 1);
       _player.play();
 
     } catch (e) {
-      setState(() => _isDownloading = false);
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
     } finally {
+      setState(() => _isDownloading = false);
       Future.delayed(const Duration(milliseconds: 300), () => _isSwitchingTrack = false);
     }
   }
@@ -335,7 +333,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
         _player.setLoopMode(LoopMode.off);
       }
       
-      // On remet la boucle de la track à Off si on passe en mode "Autoplay / Off"
       if (loopMode != LoopModeState.one) _player.setLoopMode(LoopMode.off);
     });
   }
@@ -500,7 +497,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     onPressed: () async {
                       if (showPlayIcon) {
                         if (processingState == ProcessingState.completed) {
-                          await _player.seek(Duration.zero, index: 1); // Reste à l'index actuel
+                          await _player.seek(Duration.zero, index: 1); 
                         }
                         _player.play();
                       } else {
@@ -565,9 +562,34 @@ class _LibraryScreenState extends State<LibraryScreen> {
             leading: const Icon(Icons.delete, color: Colors.red),
             title: const Text("Supprimer", style: TextStyle(color: Colors.red)),
             onTap: () async {
+              // SUPPRESSION RADICALE (Arrête la lecture + Supprime les fichiers locaux)
+              if (currentRecitation?['id'] == rec['id']) {
+                await _player.stop();
+                setState(() => currentRecitation = null);
+              }
+              
               await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
+              
+              try {
+                final dir = await getApplicationDocumentsDirectory();
+                if (rec['thumbnail'] != null && !rec['thumbnail'].toString().startsWith('http')) {
+                  final t = File(rec['thumbnail']);
+                  if (await t.exists()) await t.delete();
+                }
+                String path = rec['fichier'] ?? "";
+                if (path.contains('youtube') || path.contains('youtu.be') || path.contains('shorts')) {
+                  final f = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
+                  if (await f.exists()) await f.delete();
+                } else {
+                  final f = File(p.join(dir.path, path));
+                  if (await f.exists()) await f.delete();
+                }
+              } catch (e) {
+                debugPrint("Erreur suppression fichiers: $e");
+              }
+              
               _fetch();
-              Navigator.pop(context);
+              if (mounted) Navigator.pop(context);
             },
           ),
         ],
