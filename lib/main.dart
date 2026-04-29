@@ -9,6 +9,7 @@ import 'package:file_picker/file_picker.dart';    // Pour iOS
 import 'package:sqflite/sqflite.dart';            // Base de données locale
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 void main() => runApp(const LuhaidanApp());
 
@@ -144,20 +145,55 @@ class _LibraryScreenState extends State<LibraryScreen> {
     setState(() => currentRecitation = rec);
     if (rec['fichier'] != null) {
       try {
+        String urlOrPath = rec['fichier'];
+
         if (Platform.isIOS || Platform.isAndroid) {
-           if (rec['fichier'].startsWith('http')) {
-             await _player.setUrl(rec['fichier']);
-           } else {
-             final dir = await getApplicationDocumentsDirectory();
-             final file = File(p.join(dir.path, rec['fichier']));
-             if (await file.exists()) await _player.setFilePath(file.path);
-           }
+          // --- NOUVELLE LOGIQUE YOUTUBE ---
+          if (urlOrPath.contains('youtube.com') || urlOrPath.contains('youtu.be')) {
+            var yt = YoutubeExplode();
+            try {
+              // Récupère les infos de la vidéo
+              var video = await yt.videos.get(urlOrPath);
+              // Récupère les différents flux disponibles (vidéo, audio...)
+              var manifest = await yt.videos.streamsClient.getManifest(video.id);
+              // Isole le meilleur flux uniquement audio
+              var audioStream = manifest.audioOnly.withHighestBitrate();
+              
+              // Envoie le lien direct du mp3 au lecteur
+              await _player.setUrl(audioStream.url.toString());
+            } finally {
+              yt.close(); // Ferme le processus d'extraction pour libérer la mémoire
+            }
+          } 
+          // --- LOGIQUE CLASSIQUE POUR LE RESTE ---
+          else if (urlOrPath.startsWith('http')) {
+            await _player.setUrl(urlOrPath);
+          } else {
+            final dir = await getApplicationDocumentsDirectory();
+            final file = File(p.join(dir.path, urlOrPath));
+            if (await file.exists()) {
+              await _player.setFilePath(file.path);
+            } else {
+              throw Exception("Fichier local introuvable");
+            }
+          }
         } else {
-          await _player.setUrl('http://127.0.0.1:8000/stream_file?path=${Uri.encodeComponent(rec['fichier'])}');
+          await _player.setUrl('http://127.0.0.1:8000/stream_file?path=${Uri.encodeComponent(urlOrPath)}');
         }
+        
         _player.play();
+        
       } catch (e) {
         debugPrint("Erreur lecture: $e");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text("❌ Erreur de lecture : $e"), 
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 4),
+            )
+          );
+        }
       }
     }
   }
@@ -300,9 +336,23 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Widget _buildPlayer() {
     return Container(
       color: const Color(0xFF0D0D0D),
-      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 24),
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32), // Espace ajouté en bas pour la barre iPhone
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
+          // 1. Informations sur la récitation
+          Text(
+            "${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}",
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white),
+            textAlign: TextAlign.center,
+          ),
+          Text(
+            "${currentRecitation!['annee'] ?? '??'} H | ${currentRecitation!['annee_g'] ?? '??'} G • Versets: ${currentRecitation!['versets']}",
+            style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82)),
+          ),
+          const SizedBox(height: 8),
+
+          // 2. Barre de progression et temps
           StreamBuilder<Duration>(
             stream: _player.positionStream,
             builder: (context, snapshot) {
@@ -310,84 +360,57 @@ class _LibraryScreenState extends State<LibraryScreen> {
               final dur = _player.duration ?? Duration.zero;
               return Column(
                 children: [
-                  Slider(
-                    activeColor: const Color(0xFF7EB8C9),
-                    value: pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0),
-                    max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
-                    onChanged: (v) => _player.seek(Duration(seconds: v.toInt())),
+                  SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0),
+                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 14.0),
+                    ),
+                    child: Slider(
+                      activeColor: const Color(0xFF7EB8C9),
+                      inactiveColor: Colors.white24,
+                      value: pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0),
+                      max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
+                      onChanged: (v) => _player.seek(Duration(seconds: v.toInt())),
+                    ),
                   ),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(_formatDuration(pos), style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                      Text(_formatDuration(dur), style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                    ],
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(_formatDuration(pos), style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                        Text(_formatDuration(dur), style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                      ],
+                    ),
                   ),
                 ],
               );
             },
           ),
-          Stack(
-            alignment: Alignment.center,
+
+          // 3. Contrôles alignés
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              Align(
-                alignment: Alignment.centerLeft,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      "${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}",
-                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white),
-                    ),
-                    Text(
-                      "${currentRecitation!['annee'] ?? '??'} H | ${currentRecitation!['annee_g'] ?? '??'} G • Versets: ${currentRecitation!['versets']}",
-                      style: const TextStyle(fontSize: 11, color: Color(0xFF6A7A82)),
-                    ),
-                  ],
+              IconButton(
+                icon: Icon(
+                  loopMode == LoopModeState.off ? Icons.repeat : 
+                  loopMode == LoopModeState.autoplay ? Icons.repeat_on : Icons.repeat_one_on,
+                  color: loopMode == LoopModeState.off ? Colors.grey : const Color(0xFF7EB8C9),
+                ),
+                onPressed: _toggleLoop,
+              ),
+              IconButton(icon: const Icon(Icons.skip_previous, size: 32), onPressed: _playPrevious),
+              StreamBuilder<bool>(
+                stream: _player.playingStream,
+                builder: (context, snap) => IconButton(
+                  iconSize: 64,
+                  icon: Icon(snap.data == true ? Icons.pause_circle : Icons.play_circle, color: const Color(0xFF7EB8C9)),
+                  onPressed: () => snap.data == true ? _player.pause() : _player.play(),
                 ),
               ),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(icon: const Icon(Icons.stop, size: 30), onPressed: () => _player.seek(Duration.zero)),
-                  IconButton(icon: const Icon(Icons.skip_previous, size: 30), onPressed: _playPrevious),
-                  StreamBuilder<bool>(
-                    stream: _player.playingStream,
-                    builder: (context, snap) => IconButton(
-                      iconSize: 52,
-                      icon: Icon(snap.data == true ? Icons.pause_circle : Icons.play_circle),
-                      onPressed: () => snap.data == true ? _player.pause() : _player.play(),
-                    ),
-                  ),
-                  IconButton(icon: const Icon(Icons.skip_next, size: 30), onPressed: _playNext),
-                  IconButton(
-                    icon: Icon(
-                      loopMode == LoopModeState.off ? Icons.repeat : 
-                      loopMode == LoopModeState.autoplay ? Icons.repeat_on : Icons.repeat_one_on,
-                      color: loopMode == LoopModeState.off ? Colors.grey : const Color(0xFF7EB8C9),
-                    ),
-                    onPressed: _toggleLoop,
-                  ),
-                ],
-              ),
-              Align(
-                alignment: Alignment.centerRight,
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(volume == 0 ? Icons.volume_off : Icons.volume_up, size: 22, color: Colors.grey),
-                    SizedBox(
-                      width: 110,
-                      child: Slider(
-                        activeColor: const Color(0xFF7EB8C9),
-                        value: volume,
-                        onChanged: (v) { setState(() => volume = v); _player.setVolume(v); },
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+              IconButton(icon: const Icon(Icons.skip_next, size: 32), onPressed: _playNext),
+              IconButton(icon: const Icon(Icons.stop, size: 28, color: Colors.grey), onPressed: () => _player.seek(Duration.zero)),
             ],
           ),
         ],
@@ -544,7 +567,17 @@ class _FormDialogState extends State<FormDialog> {
         ElevatedButton(
           style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
           onPressed: () async {
-            if (selectedNum == null) return;
+            // --- AJOUT DE L'ALERTE ICI ---
+            if (selectedNum == null) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text("⚠️ Vous devez sélectionner une sourate", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  backgroundColor: Colors.red,
+                  duration: Duration(seconds: 3),
+                ),
+              );
+              return; // On bloque l'enregistrement et on garde la fenêtre ouverte
+            }
             String versets = isFull ? "complet" : "${_vStart.text}-${_vEnd.text}";
             final data = {
               "sourate_num": selectedNum,
