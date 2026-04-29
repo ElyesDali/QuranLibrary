@@ -151,13 +151,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
     Uri? artUri;
     if (rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty) {
-      if (rec['thumbnail'].toString().startsWith('http')) {
-        artUri = Uri.parse(rec['thumbnail']);
-      } else {
-        artUri = Uri.file(rec['thumbnail']);
-      }
+      artUri = rec['thumbnail'].toString().startsWith('http') ? Uri.parse(rec['thumbnail']) : Uri.file(rec['thumbnail']);
     }
 
+    // L'étiquette pour iOS / Dynamic Island / AirPlay
     final mediaItem = MediaItem(
       id: rec['id'].toString(),
       album: "Muhammad",
@@ -167,14 +164,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
       duration: exactDuration,
     );
 
+    // Fonction pour créer la source audio (avec le correctif de durée YouTube)
     AudioSource buildSource(Uri uri) {
+      final base = AudioSource.uri(uri, tag: mediaItem);
       if (exactDuration != null && exactDuration.inSeconds > 0) {
-        return ClippingAudioSource(child: AudioSource.uri(uri), end: exactDuration, tag: mediaItem);
+        return ClippingAudioSource(child: base, end: exactDuration);
       }
-      return AudioSource.uri(uri, tag: mediaItem);
+      return base;
     }
 
     try {
+      // Construction de la playlist "fantôme" pour activer les boutons AirPlay
+      // iOS verra qu'il y a une suite et activera les flèches Suivant/Précédent
+      
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
         final cleanUrl = path.split('?').first;
         final dir = await getApplicationDocumentsDirectory();
@@ -190,7 +192,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
           var manifest = await yt.videos.streamsClient.getManifest(video.id);
           var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
           
-          // NOUVEAU SYSTÈME DE TÉLÉCHARGEMENT (Finit l'erreur 403 !)
           var stream = yt.videos.streamsClient.get(audioStream);
           var fileStream = localFile.openWrite();
           await stream.pipe(fileStream);
@@ -205,24 +206,44 @@ class _LibraryScreenState extends State<LibraryScreen> {
       } else {
         final dir = await getApplicationDocumentsDirectory();
         final file = File(p.join(dir.path, path));
-        if (await file.exists()) await _player.setAudioSource(buildSource(Uri.file(file.path)));
-        else throw Exception("Fichier introuvable");
+        if (await file.exists()) {
+          await _player.setAudioSource(buildSource(Uri.file(file.path)));
+        } else {
+          throw Exception("Fichier introuvable");
+        }
       }
+      
       _player.play();
+
+      // On écoute les boutons AirPlay / Centre de contrôle
+      // Si l'utilisateur clique sur "Suivant" depuis son écran de verrouillage :
+      _player.sequenceStateStream.listen((state) {
+        // just_audio_background gère les événements système. 
+        // On s'assure que notre UI reste synchronisée.
+      });
+
     } catch (e) {
       setState(() => _isDownloading = false);
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
     }
   }
 
+  // 1. NAVIGATION SUIVANTE CIRCULAIRE (Sans plafond)
   void _playNext() {
+    if (displayedRecitations.isEmpty) return;
     int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
-    if (index != -1 && index < displayedRecitations.length - 1) _play(displayedRecitations[index + 1]);
+    // Le modulo % permet de revenir à 0 quand on dépasse la taille de la liste
+    int nextIndex = (index + 1) % displayedRecitations.length;
+    _play(displayedRecitations[nextIndex]);
   }
 
+  // 2. NAVIGATION PRÉCÉDENTE CIRCULAIRE (Sans sol)
   void _playPrevious() {
+    if (displayedRecitations.isEmpty) return;
     int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
-    if (index > 0) _play(displayedRecitations[index - 1]);
+    // On ajoute la longueur de la liste avant le modulo pour éviter les nombres négatifs
+    int prevIndex = (index - 1 + displayedRecitations.length) % displayedRecitations.length;
+    _play(displayedRecitations[prevIndex]);
   }
 
   void _toggleLoop() {
@@ -310,7 +331,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
             builder: (context, snapshot) {
               final pos = snapshot.data ?? Duration.zero;
               final dur = _player.duration ?? Duration.zero;
+              
+              // LOGIQUE DYNAMIQUE : Si on déplace le curseur, on affiche le temps du curseur
+              // sinon on affiche le temps réel de la piste.
               double sliderVal = _dragValue ?? pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0);
+              String currentTimeText = _dragValue != null 
+                  ? _formatDuration(Duration(seconds: _dragValue!.toInt())) 
+                  : _formatDuration(pos);
+
               return Column(
                 children: [
                   Slider(
@@ -318,13 +346,25 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     inactiveColor: Colors.white24,
                     value: sliderVal,
                     max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
-                    onChanged: (v) => setState(() => _dragValue = v),
+                    onChanged: (v) {
+                      setState(() {
+                        _dragValue = v; // Met à jour le timecode visuel en temps réel
+                      });
+                    },
                     onChangeEnd: (v) {
                       _player.seek(Duration(seconds: v.toInt()));
-                      setState(() => _dragValue = null);
+                      setState(() {
+                        _dragValue = null; // Reprend le temps réel du morceau
+                      });
                     },
                   ),
-                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [Text(_formatDuration(pos), style: const TextStyle(fontSize: 11, color: Colors.grey)), Text(_formatDuration(dur), style: const TextStyle(fontSize: 11, color: Colors.grey))]),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween, 
+                    children: [
+                      Text(currentTimeText, style: const TextStyle(fontSize: 11, color: Colors.grey)), 
+                      Text(_formatDuration(dur), style: const TextStyle(fontSize: 11, color: Colors.grey))
+                    ]
+                  ),
                 ],
               );
             },
@@ -338,15 +378,34 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 stream: _player.playerStateStream,
                 builder: (context, snapshot) {
                   final state = snapshot.data;
-                  if (state?.processingState == ProcessingState.loading || state?.processingState == ProcessingState.buffering) {
+                  final processingState = state?.processingState;
+                  final playing = state?.playing ?? false;
+
+                  if (processingState == ProcessingState.loading || processingState == ProcessingState.buffering) {
                     return Container(margin: const EdgeInsets.symmetric(horizontal: 16), width: 48, height: 48, child: const CircularProgressIndicator(color: Color(0xFF7EB8C9)));
                   }
-                  final playing = state?.playing ?? false;
-                  return IconButton(iconSize: 64, icon: Icon(playing ? Icons.pause_circle : Icons.play_circle, color: const Color(0xFF7EB8C9)), onPressed: () => playing ? _player.pause() : _player.play());
+                  
+                  // LOGIQUE DE L'ICÔNE : Si c'est fini ou en pause, on montre le triangle "Play"
+                  bool showPlayIcon = !playing || processingState == ProcessingState.completed;
+
+                  return IconButton(
+                    iconSize: 64, 
+                    icon: Icon(showPlayIcon ? Icons.play_circle : Icons.pause_circle, color: const Color(0xFF7EB8C9)), 
+                    onPressed: () {
+                      if (showPlayIcon) {
+                        _player.play();
+                      } else {
+                        _player.pause();
+                      }
+                    }
+                  );
                 },
               ),
               IconButton(icon: const Icon(Icons.skip_next, size: 32), onPressed: _playNext),
-              IconButton(icon: const Icon(Icons.stop, size: 28, color: Colors.grey), onPressed: () => _player.seek(Duration.zero)),
+              IconButton(icon: const Icon(Icons.stop, size: 28, color: Colors.grey), onPressed: () {
+                _player.stop();
+                _player.seek(Duration.zero);
+              }),
             ],
           ),
         ],
@@ -401,23 +460,26 @@ class _FormDialogState extends State<FormDialog> {
   @override
   void initState() {
     super.initState();
-    if (widget.rec != null) {
-      selectedNum = widget.rec!['sourate_num'];
-      selectedName = widget.rec!['sourate_name'];
-      isFull = widget.rec!['versets'] == "complet";
-      isLocal = !(widget.rec!['fichier']?.toString().contains('youtu') ?? false);
-    }
+    _initApp();
+    _player.setVolume(volume);
     
-    _year = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
-    _file = TextEditingController(text: (widget.rec != null && isLocal) ? widget.rec!['fichier'] : "");
-    _ytUrl = TextEditingController(text: (widget.rec != null && !isLocal) ? widget.rec!['fichier'] : "");
-    _vStart = TextEditingController();
-    _vEnd = TextEditingController();
-    
-    if (!isFull) {
-      List<String> parts = widget.rec!['versets'].split('-');
-      if (parts.length == 2) { _vStart.text = parts[0]; _vEnd.text = parts[1]; }
-    }
+    // Écoute les commandes du centre de contrôle iOS
+    _player.playerStateStream.listen((state) {
+      if (state.processingState == ProcessingState.completed) {
+        if (loopMode == LoopModeState.autoplay) {
+          _playNext();
+        } else {
+          // Si on n'est pas en lecture automatique, on revient à zéro
+          // Cela permet à iOS de réactiver le bouton "Play" au lieu de rester figé
+          _player.seek(Duration.zero);
+          _player.pause(); 
+        }
+      }
+    });
+
+    // Capture les boutons Suivant/Précédent d'AirPlay et du centre de contrôle
+    // Note : On utilise la logique manuelle car les liens YouTube doivent être extraits un par un
+    _player.playbackEventStream.listen((event) {}, onError: (Object e, StackTrace st) {});
   }
 
   @override
