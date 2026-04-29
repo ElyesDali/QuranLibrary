@@ -43,6 +43,7 @@ dependencies:
   sqflite: ^2.3.3
   path_provider: ^2.1.2
   youtube_explode_dart: ^2.2.2
+  dio: ^5.4.0
 
 dev_dependencies:
   flutter_test:
@@ -101,4 +102,4 @@ flutter:
 flutter_icons:
   android: true
   ios: true
-  image_path: "assets/icon.png"
+  image_path: "assets/logo.png"

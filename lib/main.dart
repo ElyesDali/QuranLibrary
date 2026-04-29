@@ -1,22 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:io';
 import 'package:just_audio/just_audio.dart';
-import 'package:file_selector/file_selector.dart'; // Pour Windows
-import 'package:file_picker/file_picker.dart';    // Pour iOS/Android
-import 'package:sqflite/sqflite.dart';            // Base de données locale
+import 'package:just_audio_background/just_audio_background.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
-import 'package:youtube_explode_dart/youtube_explode_dart.dart'; // Pour YouTube
-import 'package:just_audio_background/just_audio_background.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+import 'package:dio/dio.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.ryanheise.bg_demo.channel.audio',
-    androidNotificationChannelName: 'Lecture audio',
+    androidNotificationChannelId: 'com.muhammad.luhaidan.app',
+    androidNotificationChannelName: 'Bibliothèque Luhaidan',
     androidNotificationOngoing: true,
   );
   runApp(const LuhaidanApp());
@@ -88,6 +87,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   LoopModeState loopMode = LoopModeState.off;
   int? selectedYearFilter;
   Database? _db;
+  bool _isDownloading = false;
 
   @override
   void initState() {
@@ -102,40 +102,31 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _initApp() async {
-    if (Platform.isIOS || Platform.isAndroid) {
-      final dbPath = await getDatabasesPath();
-      final path = p.join(dbPath, 'luhaidan.db');
-      _db = await openDatabase(
-        path,
-        version: 1,
-        onCreate: (db, version) => db.execute(
-          'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, fichier TEXT, versets TEXT, annee_g INTEGER)'
-        ),
-      );
-    }
+    final dbPath = await getDatabasesPath();
+    final path = p.join(dbPath, 'luhaidan.db');
+    _db = await openDatabase(
+      path,
+      version: 2,
+      onCreate: (db, version) => db.execute(
+        'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, fichier TEXT, versets TEXT, annee_g INTEGER, thumbnail TEXT, duration TEXT)'
+      ),
+      onUpgrade: (db, oldV, newV) {
+        if (oldV < 2) {
+          // On ajoute les colonnes si elles n'existent pas encore
+          db.execute('ALTER TABLE recitations ADD COLUMN thumbnail TEXT');
+          db.execute('ALTER TABLE recitations ADD COLUMN duration TEXT');
+        }
+      }
+    );
     _fetch();
   }
 
   Future<void> _fetch() async {
-    if (Platform.isIOS || Platform.isAndroid) {
-      final res = await _db?.query('recitations', orderBy: 'sourate_num ASC');
-      setState(() {
-        allRecitations = res ?? [];
-        _applyFilters();
-      });
-    } else {
-      try {
-        final res = await http.get(Uri.parse('http://127.0.0.1:8000/recitations'));
-        if (res.statusCode == 200) {
-          setState(() {
-            allRecitations = json.decode(res.body);
-            _applyFilters();
-          });
-        }
-      } catch (e) {
-        debugPrint("Erreur API: $e");
-      }
-    }
+    final res = await _db?.query('recitations', orderBy: 'sourate_num ASC');
+    setState(() {
+      allRecitations = res ?? [];
+      _applyFilters();
+    });
   }
 
   void _applyFilters() {
@@ -150,65 +141,59 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  void _play(Map<String, dynamic> rec) async {
+  Future<void> _play(Map<String, dynamic> rec) async {
     setState(() => currentRecitation = rec);
-    if (rec['fichier'] != null) {
-      try {
-        String urlOrPath = rec['fichier'];
-        
-        // 1. Préparation des métadonnées pour AirPlay et la Dynamic Island
-        final mediaItem = MediaItem(
-          id: rec['id'].toString(),
-          album: "Muhammad",
-          title: "${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}",
-          artist: "Muhammad Al-Luhaidan",
-        );
+    if (rec['fichier'] == null) return;
+    
+    String path = rec['fichier'];
+    final mediaItem = MediaItem(
+      id: rec['id'].toString(),
+      album: "Muhammad",
+      title: "${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}",
+      artist: "Muhammad Al-Luhaidan",
+      artUri: rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty ? Uri.parse(rec['thumbnail']) : null,
+    );
 
-        if (Platform.isIOS || Platform.isAndroid) {
-          
-          // 2. CORRECTION YOUTUBE : On coupe les paramètres parasites (?is=...)
-          String cleanUrl = urlOrPath.split('?').first;
-          
-          if (cleanUrl.contains('youtube.com') || cleanUrl.contains('youtu.be') || cleanUrl.contains('shorts')) {
-            var yt = YoutubeExplode();
-            try {
-              var video = await yt.videos.get(cleanUrl);
-              var manifest = await yt.videos.streamsClient.getManifest(video.id);
-              
-              var audioStreams = manifest.audioOnly.where((s) => s.container.name == 'mp4');
-              var audioStream = audioStreams.isNotEmpty ? audioStreams.withHighestBitrate() : manifest.audioOnly.withHighestBitrate();
-              
-              // On utilise setAudioSource avec le tag MediaItem pour iOS
-              await _player.setAudioSource(AudioSource.uri(
-                Uri.parse(audioStream.url.toString()),
-                tag: mediaItem,
-              ));
-            } finally {
-              yt.close();
-            }
-          } 
-          else if (urlOrPath.startsWith('http')) {
-            await _player.setAudioSource(AudioSource.uri(Uri.parse(urlOrPath), tag: mediaItem));
-          } else {
-            final dir = await getApplicationDocumentsDirectory();
-            final file = File(p.join(dir.path, urlOrPath));
-            if (await file.exists()) {
-              await _player.setAudioSource(AudioSource.uri(Uri.file(file.path), tag: mediaItem));
-            } else {
-              throw Exception("Fichier local introuvable");
-            }
-          }
+    try {
+      if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
+        final cleanUrl = path.split('?').first;
+        final dir = await getApplicationDocumentsDirectory();
+        final fileName = "yt_${rec['id']}.mp4";
+        final localFile = File(p.join(dir.path, fileName));
+
+        if (await localFile.exists()) {
+          // Joue le fichier téléchargé
+          await _player.setAudioSource(AudioSource.uri(Uri.file(localFile.path), tag: mediaItem));
         } else {
-          await _player.setUrl('http://127.0.0.1:8000/stream_file?path=${Uri.encodeComponent(urlOrPath)}');
+          // Télécharge la piste en arrière-plan
+          setState(() => _isDownloading = true);
+          var yt = YoutubeExplode();
+          var video = await yt.videos.get(cleanUrl);
+          var manifest = await yt.videos.streamsClient.getManifest(video.id);
+          var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+          
+          await Dio().download(audioStream.url.toString(), localFile.path);
+          await _db?.update('recitations', {'fichier': fileName}, where: 'id = ?', whereArgs: [rec['id']]);
+          yt.close();
+          
+          setState(() => _isDownloading = false);
+          await _player.setAudioSource(AudioSource.uri(Uri.file(localFile.path), tag: mediaItem));
         }
-        _player.play();
-      } catch (e) {
-        debugPrint("Erreur lecture: $e");
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("❌ Erreur de lecture : $e"), backgroundColor: Colors.red)
-          );
+      } else {
+        // Fichier local classique
+        final dir = await getApplicationDocumentsDirectory();
+        final file = File(p.join(dir.path, path));
+        if (await file.exists()) {
+          await _player.setAudioSource(AudioSource.uri(Uri.file(file.path), tag: mediaItem));
+        } else {
+          throw Exception("Fichier local introuvable");
         }
+      }
+      _player.play();
+    } catch (e) {
+      setState(() => _isDownloading = false);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
       }
     }
   }
@@ -264,15 +249,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(
-                  "${displayedRecitations.length} récitations",
-                  style: const TextStyle(color: Color(0xFF6A7A82), fontSize: 13),
-                ),
+                Text("${displayedRecitations.length} récitations", style: const TextStyle(color: Color(0xFF6A7A82), fontSize: 13)),
                 if (selectedYearFilter != null)
-                  Text(
-                    selectedYearFilter == -1 ? "Année inconnue" : "$selectedYearFilter H",
-                    style: const TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold),
-                  ),
+                  Text(selectedYearFilter == -1 ? "Année inconnue" : "$selectedYearFilter H", style: const TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold)),
               ],
             ),
           ),
@@ -283,10 +262,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   itemCount: displayedRecitations.length,
                   itemBuilder: (context, i) {
                     final rec = displayedRecitations[i];
+                    final yearH = rec['annee']?.toString() ?? "??";
+                    final yearG = rec['annee_g']?.toString() ?? "??";
+                    
                     return ListTile(
                       selected: currentRecitation?['id'] == rec['id'],
+                      leading: ClipRRect(
+                        borderRadius: BorderRadius.circular(6),
+                        child: (rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty)
+                          ? Image.network(rec['thumbnail'], width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40))
+                          : Container(width: 50, height: 50, color: Colors.grey[900], child: const Icon(Icons.mic, size: 30, color: Color(0xFF7EB8C9))),
+                      ),
                       title: Text("${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}"),
-                      subtitle: Text("${rec['annee'] ?? '??'} H | ${rec['annee_g'] ?? '??'} G • Versets: ${rec['versets']}"),
+                      subtitle: Text("$yearH H | $yearG G • Versets: ${rec['versets']}"),
+                      trailing: Text(rec['duration'] ?? "--:--", style: const TextStyle(color: Colors.grey, fontSize: 12)),
                       onTap: () => _play(rec),
                       onLongPress: () => _showOptions(rec),
                     );
@@ -304,7 +293,107 @@ class _LibraryScreenState extends State<LibraryScreen> {
               ],
             ),
           ),
-          if (currentRecitation != null) _buildPlayer(),
+          if (currentRecitation != null) _buildPlayerUI(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPlayerUI() {
+    return Container(
+      color: const Color(0xFF0D0D0D),
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (_isDownloading) 
+            const Padding(padding: EdgeInsets.only(bottom: 8.0), child: LinearProgressIndicator(color: Color(0xFF7EB8C9))),
+            
+          Text(
+            "${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}",
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white),
+            textAlign: TextAlign.center,
+          ),
+          Text(
+            "${currentRecitation!['annee'] ?? '??'} H | ${currentRecitation!['annee_g'] ?? '??'} G • Versets: ${currentRecitation!['versets']}",
+            style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82)),
+          ),
+          const SizedBox(height: 8),
+
+          StreamBuilder<Duration>(
+            stream: _player.positionStream,
+            builder: (context, snapshot) {
+              final pos = snapshot.data ?? Duration.zero;
+              final dur = _player.duration ?? Duration.zero;
+              return Column(
+                children: [
+                  SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0),
+                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 14.0),
+                    ),
+                    child: Slider(
+                      activeColor: const Color(0xFF7EB8C9),
+                      inactiveColor: Colors.white24,
+                      value: pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0),
+                      max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
+                      onChanged: (v) => _player.seek(Duration(seconds: v.toInt())),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(_formatDuration(pos), style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                        Text(_formatDuration(dur), style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              IconButton(
+                icon: Icon(
+                  loopMode == LoopModeState.off ? Icons.repeat : 
+                  loopMode == LoopModeState.autoplay ? Icons.repeat_on : Icons.repeat_one_on,
+                  color: loopMode == LoopModeState.off ? Colors.grey : const Color(0xFF7EB8C9),
+                ),
+                onPressed: _toggleLoop,
+              ),
+              IconButton(icon: const Icon(Icons.skip_previous, size: 32), onPressed: _playPrevious),
+              StreamBuilder<PlayerState>(
+                stream: _player.playerStateStream,
+                builder: (context, snap) {
+                  final playerState = snap.data;
+                  final processingState = playerState?.processingState;
+                  final playing = playerState?.playing ?? false;
+
+                  if (processingState == ProcessingState.loading || processingState == ProcessingState.buffering) {
+                    return Container(
+                      margin: const EdgeInsets.symmetric(horizontal: 16.0),
+                      width: 48,
+                      height: 48,
+                      child: const CircularProgressIndicator(color: Color(0xFF7EB8C9)),
+                    );
+                  } else {
+                    return IconButton(
+                      iconSize: 64,
+                      icon: Icon(playing ? Icons.pause_circle : Icons.play_circle, color: const Color(0xFF7EB8C9)),
+                      onPressed: () => playing ? _player.pause() : _player.play(),
+                    );
+                  }
+                },
+              ),
+              IconButton(icon: const Icon(Icons.skip_next, size: 32), onPressed: _playNext),
+              IconButton(icon: const Icon(Icons.stop, size: 28, color: Colors.grey), onPressed: () => _player.seek(Duration.zero)),
+            ],
+          ),
         ],
       ),
     );
@@ -333,86 +422,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
             onTap: () { setState(() => selectedYearFilter = -1); _applyFilters(); Navigator.pop(context); },
           ),
           const Divider(color: Colors.white24),
-          ...years.map((y) => ListTile(
-            title: Text("$y H  |  ${yearMap[y] ?? '??'} G"),
-            selected: selectedYearFilter == y,
-            onTap: () { setState(() => selectedYearFilter = y); _applyFilters(); Navigator.pop(context); },
-          )),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildPlayer() {
-    return Container(
-      color: const Color(0xFF0D0D0D),
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            "${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}",
-            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white),
-          ),
-          Text(
-            "${currentRecitation!['annee'] ?? '??'} H | ${currentRecitation!['annee_g'] ?? '??'} G • Versets: ${currentRecitation!['versets']}",
-            style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82)),
-          ),
-          const SizedBox(height: 8),
-          StreamBuilder<Duration>(
-            stream: _player.positionStream,
-            builder: (context, snapshot) {
-              final pos = snapshot.data ?? Duration.zero;
-              final dur = _player.duration ?? Duration.zero;
-              return Column(
-                children: [
-                  Slider(
-                    activeColor: const Color(0xFF7EB8C9),
-                    value: pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0),
-                    max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
-                    onChanged: (v) => _player.seek(Duration(seconds: v.toInt())),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8.0),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(_formatDuration(pos), style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                        Text(_formatDuration(dur), style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                      ],
-                    ),
-                  ),
-                ],
-              );
-            },
-          ),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              IconButton(
-                icon: Icon(
-                  loopMode == LoopModeState.off ? Icons.repeat : 
-                  loopMode == LoopModeState.autoplay ? Icons.repeat_on : Icons.repeat_one_on,
-                  color: loopMode == LoopModeState.off ? Colors.grey : const Color(0xFF7EB8C9),
-                ),
-                onPressed: _toggleLoop,
-              ),
-              IconButton(icon: const Icon(Icons.skip_previous, size: 32), onPressed: _playPrevious),
-              StreamBuilder<PlayerState>(
-                stream: _player.playerStateStream,
-                builder: (context, snap) {
-                  final state = snap.data;
-                  if (state?.processingState == ProcessingState.loading || state?.processingState == ProcessingState.buffering) {
-                    return const SizedBox(width: 64, height: 64, child: Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator(color: Color(0xFF7EB8C9))));
-                  }
-                  final playing = state?.playing ?? false;
-                  return IconButton(iconSize: 64, icon: Icon(playing ? Icons.pause_circle : Icons.play_circle, color: const Color(0xFF7EB8C9)), onPressed: () => playing ? _player.pause() : _player.play());
-                },
-              ),
-              IconButton(icon: const Icon(Icons.skip_next, size: 32), onPressed: _playNext),
-              IconButton(icon: const Icon(Icons.stop, size: 28, color: Colors.grey), onPressed: () => _player.seek(Duration.zero)),
-            ],
-          ),
+          ...years.map((y) {
+            final yg = yearMap[y];
+            return ListTile(
+              title: Text("$y H  |  ${yg ?? '??'} G"),
+              selected: selectedYearFilter == y,
+              onTap: () { setState(() => selectedYearFilter = y); _applyFilters(); Navigator.pop(context); },
+            );
+          }),
         ],
       ),
     );
@@ -425,12 +442,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
       builder: (context) => Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          ListTile(leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)), title: const Text("Modifier"), onTap: () { Navigator.pop(context); _showForm(rec: rec); }),
-          ListTile(leading: const Icon(Icons.delete, color: Colors.red), title: const Text("Supprimer", style: TextStyle(color: Colors.red)), onTap: () async {
-            if (Platform.isIOS || Platform.isAndroid) await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
-            else await http.delete(Uri.parse('http://127.0.0.1:8000/recitations/${rec['id']}'));
-            _fetch(); Navigator.pop(context);
-          }),
+          ListTile(
+            leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)),
+            title: const Text("Modifier"),
+            onTap: () { Navigator.pop(context); _showForm(rec: rec); },
+          ),
+          ListTile(
+            leading: const Icon(Icons.delete, color: Colors.red),
+            title: const Text("Supprimer", style: TextStyle(color: Colors.red)),
+            onTap: () async {
+              await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
+              _fetch();
+              Navigator.pop(context);
+            },
+          ),
         ],
       ),
     );
@@ -464,12 +489,16 @@ class _FormDialogState extends State<FormDialog> {
       selectedNum = widget.rec!['sourate_num'];
       selectedName = widget.rec!['sourate_name'];
       isFull = widget.rec!['versets'] == "complet";
+      // Détermine si le fichier enregistré est une URL youtube ou un fichier local
+      isLocal = !(widget.rec!['fichier']?.toString().contains('youtu') ?? false);
     }
+    
     _year = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
-    _file = TextEditingController(text: widget.rec?['fichier'] ?? "");
-    _ytUrl = TextEditingController();
+    _file = TextEditingController(text: (widget.rec != null && isLocal) ? widget.rec!['fichier'] : "");
+    _ytUrl = TextEditingController(text: (widget.rec != null && !isLocal) ? widget.rec!['fichier'] : "");
     _vStart = TextEditingController();
     _vEnd = TextEditingController();
+    
     if (!isFull) {
       List<String> parts = widget.rec!['versets'].split('-');
       if (parts.length == 2) { _vStart.text = parts[0]; _vEnd.text = parts[1]; }
@@ -487,51 +516,81 @@ class _FormDialogState extends State<FormDialog> {
           children: [
             DropdownMenu<Map<String, dynamic>>(
               initialSelection: widget.rec != null ? ALL_SURAHS.firstWhere((s) => s['num'] == widget.rec!['sourate_num']) : ALL_SURAHS[0],
-              width: 280, label: const Text("Sourate"), enableSearch: true,
+              width: 280,
+              label: const Text("Sourate"),
+              enableSearch: true,
               dropdownMenuEntries: ALL_SURAHS.map((s) => DropdownMenuEntry(value: s, label: "${s['num']} - ${s['name']}")).toList(),
               onSelected: (s) { selectedNum = s?['num']; selectedName = s?['name']; },
             ),
             const SizedBox(height: 15),
-            TextField(controller: _year, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Année (H ou G)")),
+            TextField(
+              controller: _year,
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(4)],
+              decoration: const InputDecoration(labelText: "Année (H ou G)", hintText: "Sécurité : Max 4 chiffres"),
+            ),
             const SizedBox(height: 15),
             const Text("Étendue :"),
-            Row(children: [
-              Radio(value: true, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Complet"),
-              Radio(value: false, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Partiel"),
-            ]),
-            if (!isFull) Row(children: [
-              Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
-              const SizedBox(width: 10),
-              Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
-            ]),
+            Row(
+              children: [
+                Radio(value: true, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Complet"),
+                Radio(value: false, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Partiel"),
+              ],
+            ),
+            if (!isFull)
+              Row(
+                children: [
+                  Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
+                  const SizedBox(width: 10),
+                  Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
+                ],
+              ),
             const SizedBox(height: 15),
             const Text("Source :"),
-            Row(children: [
-              Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("Local"),
-              Radio(value: false, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("YouTube"),
-            ]),
-            if (isLocal) Column(children: [
-              const SizedBox(height: 10),
-              ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[800], foregroundColor: Colors.white, minimumSize: const Size(double.infinity, 45)),
-                icon: const Icon(Icons.folder_open), label: const Text("Parcourir l'iPhone..."),
-                onPressed: () async {
-                  try {
-                    FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any);
-                    if (result != null) {
-                      final file = result.files.single;
-                      final dir = await getApplicationDocumentsDirectory();
-                      await File(file.path!).copy(p.join(dir.path, file.name));
-                      setState(() => _file.text = file.name);
+            Row(
+              children: [
+                Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("Local"),
+                Radio(value: false, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("YouTube"),
+              ],
+            ),
+            if (isLocal)
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 10),
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.grey[800],
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size(double.infinity, 45)
+                    ),
+                    icon: const Icon(Icons.folder_open),
+                    label: const Text("Parcourir l'iPhone..."),
+                    onPressed: () async {
+                      try {
+                        FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any); 
+                        if (result != null) {
+                          final file = result.files.single;
+                          final dir = await getApplicationDocumentsDirectory();
+                          await File(file.path!).copy(p.join(dir.path, file.name));
+                          setState(() => _file.text = file.name);
+                        }
+                      } catch (e) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text("❌ Erreur accès fichiers : $e"), backgroundColor: Colors.red)
+                        );
+                      }
                     }
-                  } catch (e) {
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
-                  }
-                },
-              ),
-              if (_file.text.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8.0), child: Text("🎵 Fichier : ${_file.text}", style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 12))),
-            ])
-            else TextField(controller: _ytUrl, decoration: const InputDecoration(labelText: "Lien YouTube ou Shorts")),
+                  ),
+                  if (_file.text.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8.0),
+                      child: Text("🎵 Fichier sélectionné : \n${_file.text}", style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 13)),
+                    ),
+                ],
+              )
+            else
+              TextField(controller: _ytUrl, decoration: const InputDecoration(labelText: "Lien YouTube ou Shorts")),
           ],
         ),
       ),
@@ -541,19 +600,48 @@ class _FormDialogState extends State<FormDialog> {
           style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
           onPressed: () async {
             if (selectedNum == null) {
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("⚠️ Veuillez sélectionner une sourate"), backgroundColor: Colors.red));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("⚠️ Vous devez sélectionner une sourate"), backgroundColor: Colors.red)
+              );
               return;
             }
-            final data = {
-              "sourate_num": selectedNum, "sourate_name": selectedName,
-              "annee": int.tryParse(_year.text), "fichier": isLocal ? _file.text : _ytUrl.text,
-              "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
-            };
-            if (Platform.isIOS || Platform.isAndroid) {
-              if (widget.rec == null) await widget.db?.insert('recitations', data);
-              else await widget.db?.update('recitations', data, where: 'id = ?', whereArgs: [widget.rec!['id']]);
+
+            String thumb = widget.rec?['thumbnail'] ?? "";
+            String dur = widget.rec?['duration'] ?? "";
+
+            // On récupère la miniature uniquement si c'est un nouveau lien YouTube
+            if (!isLocal && _ytUrl.text.isNotEmpty && (widget.rec == null || _ytUrl.text != widget.rec?['fichier'])) {
+              var yt = YoutubeExplode();
+              try {
+                var video = await yt.videos.get(_ytUrl.text.split('?').first);
+                thumb = video.thumbnails.standardResUrl;
+                dur = "${video.duration?.inMinutes}:${(video.duration?.inSeconds ?? 0).toString().padLeft(2, '0')}";
+              } catch (e) {
+                debugPrint("Erreur récupération infos YouTube: $e");
+              } finally {
+                yt.close();
+              }
             }
-            widget.onSave(); Navigator.pop(context);
+
+            String versets = isFull ? "complet" : "${_vStart.text}-${_vEnd.text}";
+            final data = {
+              "sourate_num": selectedNum,
+              "sourate_name": selectedName,
+              "annee": int.tryParse(_year.text),
+              "fichier": isLocal ? _file.text : _ytUrl.text,
+              "versets": versets,
+              "thumbnail": thumb,
+              "duration": dur,
+            };
+
+            if (widget.rec == null) {
+              await widget.db?.insert('recitations', data);
+            } else {
+              await widget.db?.update('recitations', data, where: 'id = ?', whereArgs: [widget.rec!['id']]);
+            }
+            
+            widget.onSave();
+            Navigator.pop(context);
           },
           child: const Text("Enregistrer", style: TextStyle(color: Colors.white)),
         ),
