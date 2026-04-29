@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:async'; // Ajouté pour le TimeoutException
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:file_picker/file_picker.dart';
@@ -20,6 +21,30 @@ Future<void> main() async {
     androidNotificationOngoing: true,
   );
   runApp(const LuhaidanApp());
+}
+
+// Fonction globale de téléchargement silencieux
+Future<void> downloadYoutubeInBackground(String cleanUrl, File localFile) async {
+  var yt = YoutubeExplode();
+  try {
+    var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
+    var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+    var stream = yt.videos.streamsClient.get(audioStream);
+    
+    final tempFile = File("${localFile.path}.tmp");
+    var fileStream = tempFile.openWrite();
+    await stream.pipe(fileStream);
+    await fileStream.flush();
+    await fileStream.close();
+    
+    if (await tempFile.length() > 0) {
+      await tempFile.rename(localFile.path); // Validation finale du fichier
+    }
+  } catch (e) {
+    debugPrint("Erreur background download: $e");
+  } finally {
+    yt.close();
+  }
 }
 
 const List<Map<String, dynamic>> ALL_SURAHS = [
@@ -92,6 +117,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   bool _isDownloading = false;
   double? _dragValue;
   bool _isSwitchingTrack = false;
+  String? _appDirPath; // Stockage de l'adresse racine du téléphone
 
   @override
   void initState() {
@@ -125,8 +151,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _initApp() async {
-    final dbPath = await getDatabasesPath();
-    final path = p.join(dbPath, 'luhaidan.db');
+    final dir = await getApplicationDocumentsDirectory();
+    _appDirPath = dir.path; // Sécurise l'adresse racine actuelle de l'appli sur iOS
+
+    final path = p.join(dir.path, 'luhaidan.db');
     _db = await openDatabase(
       path,
       version: 2,
@@ -163,39 +191,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  void _downloadThumbnailOffline(Map<String, dynamic> rec) async {
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final thumbFile = File(p.join(dir.path, "thumb_${rec['id']}.jpg"));
-      if (!await thumbFile.exists()) {
-         await Dio().download(rec['thumbnail'], thumbFile.path);
-      }
-      await _db?.update('recitations', {'thumbnail': thumbFile.path}, where: 'id = ?', whereArgs: [rec['id']]);
-      if (mounted) setState(() => rec['thumbnail'] = thumbFile.path);
-    } catch (_) {}
-  }
-
-  void _downloadYoutubeInBackground(String cleanUrl, File localFile) async {
-    var yt = YoutubeExplode();
-    try {
-      var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-      var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-      var stream = yt.videos.streamsClient.get(audioStream);
-      
-      final tempFile = File("${localFile.path}.tmp");
-      var fileStream = tempFile.openWrite();
-      await stream.pipe(fileStream);
-      await fileStream.flush();
-      await fileStream.close();
-      
-      if (await tempFile.length() > 0) {
-        await tempFile.rename(localFile.path);
-      }
-    } catch (e) {
-      debugPrint("Erreur background: $e");
-    } finally {
-      yt.close();
-    }
+  // Permet de reconstruire l'adresse d'une miniature même si Apple change le nom du dossier
+  String _resolvePath(String pathStr) {
+    if (pathStr.startsWith('http')) return pathStr;
+    if (pathStr.startsWith('/')) return pathStr; // Ancien chemin absolu sauvegardé avant cette mise à jour
+    return _appDirPath != null ? p.join(_appDirPath!, pathStr) : pathStr;
   }
 
   MediaItem _createMediaItem(Map<String, dynamic> r) {
@@ -206,7 +206,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
     Uri? artUri;
     if (r['thumbnail'] != null && r['thumbnail'].toString().isNotEmpty) {
-      artUri = r['thumbnail'].toString().startsWith('http') ? Uri.parse(r['thumbnail']) : Uri.file(r['thumbnail']);
+      String resolved = _resolvePath(r['thumbnail'].toString());
+      artUri = resolved.startsWith('http') ? Uri.parse(resolved) : Uri.file(resolved);
     }
     return MediaItem(
       id: r['id'].toString(),
@@ -229,22 +230,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Future<void> _play(Map<String, dynamic> rec) async {
     _isSwitchingTrack = true;
     
-    // ARRÊT IMMÉDIAT de la piste précédente
-    await _player.stop();
+    await _player.stop(); // Arrêt immédiat de la piste précédente
     
     setState(() {
       currentRecitation = rec;
-      _isDownloading = true; // Affichage immédiat du chargement
+      _isDownloading = true; 
     });
 
     if (rec['fichier'] == null) {
       _isSwitchingTrack = false;
       setState(() => _isDownloading = false);
       return;
-    }
-    
-    if (rec['thumbnail'] != null && rec['thumbnail'].toString().startsWith('http')) {
-      _downloadThumbnailOffline(rec);
     }
 
     String path = rec['fichier'];
@@ -256,24 +252,29 @@ class _LibraryScreenState extends State<LibraryScreen> {
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
         final cleanUrl = path.split('?').first;
         final dir = await getApplicationDocumentsDirectory();
-        final fileName = "yt_${rec['id']}.mp4";
-        final localFile = File(p.join(dir.path, fileName));
+        final localFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
 
         if (await localFile.exists() && await localFile.length() > 0) {
+          // Lecture depuis la mémoire interne : Succès hors ligne garanti
           realUri = Uri.file(localFile.path);
           currentAudioSource = _buildSource(realUri, currentMediaItem);
         } else {
+          // Streaming direct + Timeout de sécurité
           var yt = YoutubeExplode();
-          var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-          
-          var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
-          var streamInfo = mp4Muxed.isNotEmpty ? mp4Muxed.withHighestBitrate() : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-          
-          realUri = streamInfo.url;
-          currentAudioSource = _buildSource(realUri, currentMediaItem);
-          
-          _downloadYoutubeInBackground(cleanUrl, localFile);
-          yt.close();
+          try {
+            var manifest = await yt.videos.streamsClient.getManifest(cleanUrl).timeout(const Duration(seconds: 7));
+            var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
+            var streamInfo = mp4Muxed.isNotEmpty ? mp4Muxed.withHighestBitrate() : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+            
+            realUri = streamInfo.url;
+            currentAudioSource = _buildSource(realUri, currentMediaItem);
+            
+            downloadYoutubeInBackground(cleanUrl, localFile); // Lancement du backup en sourdine
+          } on TimeoutException {
+            throw Exception("Le fichier n'est pas encore téléchargé et le téléphone est hors-ligne.");
+          } finally {
+            yt.close();
+          }
         }
       } else {
         final dir = await getApplicationDocumentsDirectory();
@@ -282,7 +283,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
           realUri = Uri.file(file.path);
           currentAudioSource = _buildSource(realUri, currentMediaItem);
         } else {
-          throw Exception("Fichier introuvable");
+          throw Exception("Fichier local introuvable");
         }
       }
 
@@ -332,7 +333,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
         loopMode = LoopModeState.off;
         _player.setLoopMode(LoopMode.off);
       }
-      
       if (loopMode != LoopModeState.one) _player.setLoopMode(LoopMode.off);
     });
   }
@@ -346,10 +346,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (thumbPath == null || thumbPath.isEmpty) {
       return Image.asset('assets/logo.jpg', width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
     }
-    if (thumbPath.startsWith('http')) {
-      return Image.network(thumbPath, width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
+    String resolvedPath = _resolvePath(thumbPath);
+    if (resolvedPath.startsWith('http')) {
+      return Image.network(resolvedPath, width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
     } else {
-      return Image.file(File(thumbPath), width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
+      return Image.file(File(resolvedPath), width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
     }
   }
 
@@ -562,7 +563,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
             leading: const Icon(Icons.delete, color: Colors.red),
             title: const Text("Supprimer", style: TextStyle(color: Colors.red)),
             onTap: () async {
-              // SUPPRESSION RADICALE (Arrête la lecture + Supprime les fichiers locaux)
               if (currentRecitation?['id'] == rec['id']) {
                 await _player.stop();
                 setState(() => currentRecitation = null);
@@ -573,7 +573,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               try {
                 final dir = await getApplicationDocumentsDirectory();
                 if (rec['thumbnail'] != null && !rec['thumbnail'].toString().startsWith('http')) {
-                  final t = File(rec['thumbnail']);
+                  final t = File(_resolvePath(rec['thumbnail']));
                   if (await t.exists()) await t.delete();
                 }
                 String path = rec['fichier'] ?? "";
@@ -716,23 +716,21 @@ class _FormDialogState extends State<FormDialog> {
               if (!isLocal && _ytUrl.text.isNotEmpty && (widget.rec == null || _ytUrl.text != widget.rec?['fichier'])) {
                 var yt = YoutubeExplode();
                 try {
-                  var video = await yt.videos.get(_ytUrl.text.split('?').first);
+                  var video = await yt.videos.get(_ytUrl.text.split('?').first).timeout(const Duration(seconds: 10));
                   String remoteThumb = video.thumbnails.highResUrl;
-                  if (remoteThumb.isEmpty) {
-                    remoteThumb = video.thumbnails.standardResUrl;
-                  }
+                  if (remoteThumb.isEmpty) remoteThumb = video.thumbnails.standardResUrl;
                   
                   dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
                   
                   try {
                     final dir = await getApplicationDocumentsDirectory();
-                    final thumbFile = File(p.join(dir.path, "thumb_yt_${video.id}.jpg"));
+                    final thumbName = "thumb_yt_${video.id}.jpg";
+                    final thumbFile = File(p.join(dir.path, thumbName));
                     await Dio().download(remoteThumb, thumbFile.path);
-                    thumb = thumbFile.path; 
+                    thumb = thumbName; // STOCKAGE RELATIF DE LA MINIATURE !
                   } catch (e) {
                     thumb = remoteThumb; 
                   }
-                  
                 } catch (e) {
                   debugPrint("Erreur YouTube: $e");
                 } finally {
@@ -755,9 +753,10 @@ class _FormDialogState extends State<FormDialog> {
                 try {
                   final metadata = await MetadataRetriever.fromFile(File(localFilePath));
                   if (metadata.albumArt != null) {
-                    final artFile = File(p.join(dir.path, "thumb_${_file.text}.jpg"));
+                    final thumbName = "thumb_${_file.text}.jpg";
+                    final artFile = File(p.join(dir.path, thumbName));
                     await artFile.writeAsBytes(metadata.albumArt!);
-                    thumb = artFile.path;
+                    thumb = thumbName; // STOCKAGE RELATIF DE LA MINIATURE !
                   }
                 } catch (e) {
                   debugPrint("Pas d'image trouvée: $e");
@@ -775,10 +774,22 @@ class _FormDialogState extends State<FormDialog> {
                 "duration": dur,
               };
 
+              int recordId;
               if (widget.rec == null) {
-                await widget.db?.insert('recitations', data);
+                recordId = await widget.db!.insert('recitations', data);
               } else {
-                await widget.db?.update('recitations', data, where: 'id = ?', whereArgs: [widget.rec!['id']]);
+                recordId = widget.rec!['id'];
+                await widget.db!.update('recitations', data, where: 'id = ?', whereArgs: [recordId]);
+              }
+
+              // DECLENCHE LE TÉLÉCHARGEMENT DIRECTEMENT !
+              if (!isLocal && _ytUrl.text.isNotEmpty) {
+                final cleanUrl = _ytUrl.text.split('?').first;
+                final dir = await getApplicationDocumentsDirectory();
+                final localAudioFile = File(p.join(dir.path, "yt_$recordId.mp4"));
+                if (!await localAudioFile.exists()) {
+                  downloadYoutubeInBackground(cleanUrl, localAudioFile);
+                }
               }
               
               widget.onSave();
