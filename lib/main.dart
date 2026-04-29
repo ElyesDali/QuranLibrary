@@ -96,19 +96,24 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
     
-    // Gère la fin de lecture et le mode boucle
+    // Gère la fin de lecture et le mode boucle automatique
     _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
         if (loopMode == LoopModeState.autoplay) {
           _playNext();
-        } else {
-          _player.seek(Duration.zero);
-          _player.pause(); 
         }
+        // On ne force plus la pause ici. On laisse iOS comprendre que c'est fini "naturellement".
       }
     });
 
-    // Capture les événements AirPlay
+    // Capture les événements Play externes (ex: AirPlay, Centre de contrôle)
+    // Si on demande de jouer alors que c'est fini, on repart à zéro
+    _player.playingStream.listen((playing) {
+      if (playing && _player.processingState == ProcessingState.completed) {
+        _player.seek(Duration.zero);
+      }
+    });
+
     _player.playbackEventStream.listen((event) {}, onError: (Object e, StackTrace st) {});
   }
 
@@ -353,10 +358,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
               final pos = snapshot.data ?? Duration.zero;
               final dur = _player.duration ?? Duration.zero;
               
-              double sliderVal = _dragValue ?? pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0);
-              String currentTimeText = _dragValue != null 
-                  ? _formatDuration(Duration(seconds: _dragValue!.toInt())) 
-                  : _formatDuration(pos);
+              // 1. Calcul exact de la valeur du Slider (bloquée entre 0 et max)
+              double maxDur = dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0;
+              double sliderVal = _dragValue ?? pos.inSeconds.toDouble();
+              if (sliderVal < 0) sliderVal = 0;
+              if (sliderVal > maxDur) sliderVal = maxDur;
+
+              // 2. Le texte du timecode suit strictement la valeur du Slider
+              String currentTimeText = _formatDuration(Duration(seconds: sliderVal.toInt()));
 
               return Column(
                 children: [
@@ -369,7 +378,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       activeColor: const Color(0xFF7EB8C9),
                       inactiveColor: Colors.white24,
                       value: sliderVal,
-                      max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
+                      max: maxDur,
                       onChanged: (v) {
                         setState(() {
                           _dragValue = v;
@@ -410,13 +419,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     return Container(margin: const EdgeInsets.symmetric(horizontal: 16), width: 48, height: 48, child: const CircularProgressIndicator(color: Color(0xFF7EB8C9)));
                   }
                   
+                  // L'icône devient un triangle si la musique est en pause OU si elle a touché la fin
                   bool showPlayIcon = !playing || processingState == ProcessingState.completed;
 
                   return IconButton(
                     iconSize: 64, 
                     icon: Icon(showPlayIcon ? Icons.play_circle : Icons.pause_circle, color: const Color(0xFF7EB8C9)), 
-                    onPressed: () {
+                    onPressed: () async {
                       if (showPlayIcon) {
+                        // REPLAY AUTOMATIQUE : Si c'est à la fin, on remet à 0 avant de relancer
+                        if (processingState == ProcessingState.completed) {
+                          await _player.seek(Duration.zero);
+                        }
                         _player.play();
                       } else {
                         _player.pause();
