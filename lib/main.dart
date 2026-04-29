@@ -91,6 +91,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Database? _db;
   bool _isDownloading = false;
   double? _dragValue;
+  bool _isSwitchingTrack = false;
 
   @override
   void initState() {
@@ -98,14 +99,25 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    // Gère la fin de lecture et le mode boucle
+    // ÉCOUTE DES BOUTONS AIRPLAY / VERROUILLAGE
+    _player.currentIndexStream.listen((index) {
+      if (_isSwitchingTrack) return; 
+      if (index == 0) {
+        _isSwitchingTrack = true;
+        _playPrevious();
+      } else if (index == 2) {
+        _isSwitchingTrack = true;
+        _playNext();
+      }
+    });
+
     _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
         if (loopMode == LoopModeState.autoplay) {
-          _playNext();
-        } else {
-          _player.seek(Duration.zero);
-          _player.pause(); 
+          if (!_isSwitchingTrack) {
+            _isSwitchingTrack = true;
+            _playNext();
+          }
         }
       }
     });
@@ -152,7 +164,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  // TÉLÉCHARGEMENT INVISIBLE EN ARRIÈRE-PLAN
+  // Permet de mettre à jour les vieilles miniatures internet vers du hors-ligne
+  void _downloadThumbnailOffline(Map<String, dynamic> rec) async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final thumbFile = File(p.join(dir.path, "thumb_${rec['id']}.jpg"));
+      if (!await thumbFile.exists()) {
+         await Dio().download(rec['thumbnail'], thumbFile.path);
+      }
+      await _db?.update('recitations', {'thumbnail': thumbFile.path}, where: 'id = ?', whereArgs: [rec['id']]);
+      if (mounted) setState(() => rec['thumbnail'] = thumbFile.path);
+    } catch (_) {}
+  }
+
+  // Le vrai téléchargement silencieux pour la prochaine fois
   void _downloadYoutubeInBackground(String cleanUrl, File localFile) async {
     var yt = YoutubeExplode();
     try {
@@ -170,48 +195,57 @@ class _LibraryScreenState extends State<LibraryScreen> {
         await tempFile.rename(localFile.path);
       }
     } catch (e) {
-      debugPrint("Erreur background download: $e");
+      debugPrint("Erreur background: $e");
     } finally {
       yt.close();
     }
   }
 
-  Future<void> _play(Map<String, dynamic> rec) async {
-    setState(() => currentRecitation = rec);
-    if (rec['fichier'] == null) return;
-    
-    String path = rec['fichier'];
-    Duration? exactDuration;
-    if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
-      final parts = rec['duration'].toString().split(':');
-      if (parts.length == 2) exactDuration = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+  MediaItem _createMediaItem(Map<String, dynamic> r) {
+    Duration? exactDur;
+    if (r['duration'] != null && r['duration'].toString().contains(':')) {
+      final parts = r['duration'].toString().split(':');
+      if (parts.length == 2) exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
     }
-
     Uri? artUri;
-    if (rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty) {
-      if (rec['thumbnail'].toString().startsWith('http')) {
-        artUri = Uri.parse(rec['thumbnail']);
-      } else {
-        artUri = Uri.file(rec['thumbnail']);
-      }
+    if (r['thumbnail'] != null && r['thumbnail'].toString().isNotEmpty) {
+      artUri = r['thumbnail'].toString().startsWith('http') ? Uri.parse(r['thumbnail']) : Uri.file(r['thumbnail']);
     }
-
-    final mediaItem = MediaItem(
-      id: rec['id'].toString(),
+    return MediaItem(
+      id: r['id'].toString(),
       album: "Muhammad",
-      title: "${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}",
+      title: "${r['sourate_num'].toString().padLeft(3, '0')} - ${r['sourate_name']}",
       artist: "Muhammad Al-Luhaidan",
       artUri: artUri,
-      duration: exactDuration,
+      duration: exactDur,
     );
+  }
 
-    AudioSource buildSource(Uri uri) {
-      final base = AudioSource.uri(uri, tag: mediaItem);
-      if (exactDuration != null && exactDuration.inSeconds > 0) {
-        return ClippingAudioSource(child: base, end: exactDuration, tag: mediaItem);
-      }
-      return base;
+  AudioSource _buildSource(Uri uri, MediaItem mediaItem) {
+    final base = AudioSource.uri(uri, tag: mediaItem);
+    if (mediaItem.duration != null && mediaItem.duration!.inSeconds > 0) {
+      return ClippingAudioSource(child: base, end: mediaItem.duration, tag: mediaItem);
     }
+    return base;
+  }
+
+  Future<void> _play(Map<String, dynamic> rec) async {
+    _isSwitchingTrack = true;
+    setState(() => currentRecitation = rec);
+    if (rec['fichier'] == null) {
+      _isSwitchingTrack = false;
+      return;
+    }
+    
+    // Fix miniature hors-ligne rétroactif
+    if (rec['thumbnail'] != null && rec['thumbnail'].toString().startsWith('http')) {
+      _downloadThumbnailOffline(rec);
+    }
+
+    String path = rec['fichier'];
+    final currentMediaItem = _createMediaItem(rec);
+    Uri realUri;
+    AudioSource currentAudioSource;
 
     try {
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
@@ -221,18 +255,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final localFile = File(p.join(dir.path, fileName));
 
         if (await localFile.exists() && await localFile.length() > 0) {
-          // Lecture locale (Téléchargement déjà fini)
-          await _player.setAudioSource(buildSource(Uri.file(localFile.path)));
+          realUri = Uri.file(localFile.path);
+          currentAudioSource = _buildSource(realUri, currentMediaItem);
         } else {
-          // LECTURE INSTANTANÉE (Résout l'erreur -1 et la lenteur)
+          // LECTURE INSTANTANÉE (Fix Erreur -1 + Vitesse)
           setState(() => _isDownloading = true); 
           var yt = YoutubeExplode();
           var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-          var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
           
-          await _player.setAudioSource(buildSource(audioStream.url));
+          // Muxed stream est le plus apprécié par AVPlayer iOS
+          var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
+          var streamInfo = mp4Muxed.isNotEmpty ? mp4Muxed.withHighestBitrate() : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
           
-          // Lancement du téléchargement propre en tâche de fond
+          realUri = streamInfo.url;
+          currentAudioSource = _buildSource(realUri, currentMediaItem);
+          
           _downloadYoutubeInBackground(cleanUrl, localFile);
           
           await _db?.update('recitations', {'fichier': fileName}, where: 'id = ?', whereArgs: [rec['id']]);
@@ -243,15 +280,32 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final dir = await getApplicationDocumentsDirectory();
         final file = File(p.join(dir.path, path));
         if (await file.exists()) {
-          await _player.setAudioSource(buildSource(Uri.file(file.path)));
+          realUri = Uri.file(file.path);
+          currentAudioSource = _buildSource(realUri, currentMediaItem);
         } else {
           throw Exception("Fichier introuvable");
         }
       }
+
+      // TRICK AIRPLAY : Construction de la fausse file d'attente à 3 pistes pour illuminer les boutons iOS !
+      int currIdx = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
+      int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
+      int nextIdx = (currIdx + 1) % displayedRecitations.length;
+
+      var playlist = ConcatenatingAudioSource(children: [
+         _buildSource(realUri, _createMediaItem(displayedRecitations[prevIdx])), // Dummy 0
+         currentAudioSource,                                                     // La Vraie 1
+         _buildSource(realUri, _createMediaItem(displayedRecitations[nextIdx])), // Dummy 2
+      ]);
+
+      await _player.setAudioSource(playlist, initialIndex: 1);
       _player.play();
+
     } catch (e) {
       setState(() => _isDownloading = false);
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
+    } finally {
+      Future.delayed(const Duration(milliseconds: 300), () => _isSwitchingTrack = false);
     }
   }
 
@@ -273,7 +327,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     setState(() {
       if (loopMode == LoopModeState.off) {
         loopMode = LoopModeState.autoplay;
-        _player.setLoopMode(LoopMode.off);
       } else if (loopMode == LoopModeState.autoplay) {
         loopMode = LoopModeState.one;
         _player.setLoopMode(LoopMode.one);
@@ -281,6 +334,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
         loopMode = LoopModeState.off;
         _player.setLoopMode(LoopMode.off);
       }
+      
+      // On remet la boucle de la track à Off si on passe en mode "Autoplay / Off"
+      if (loopMode != LoopModeState.one) _player.setLoopMode(LoopMode.off);
     });
   }
 
@@ -444,7 +500,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     onPressed: () async {
                       if (showPlayIcon) {
                         if (processingState == ProcessingState.completed) {
-                          await _player.seek(Duration.zero);
+                          await _player.seek(Duration.zero, index: 1); // Reste à l'index actuel
                         }
                         _player.play();
                       } else {
@@ -457,7 +513,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               IconButton(icon: const Icon(Icons.skip_next, size: 32), onPressed: _playNext),
               IconButton(icon: const Icon(Icons.stop, size: 28, color: Colors.grey), onPressed: () {
                 _player.stop();
-                _player.seek(Duration.zero);
+                _player.seek(Duration.zero, index: 1);
               }),
             ],
           ),
