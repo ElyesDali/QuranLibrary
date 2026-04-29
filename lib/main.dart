@@ -146,13 +146,36 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (rec['fichier'] == null) return;
     
     String path = rec['fichier'];
+    
+    // 1. On récupère la vraie durée exacte depuis la base de données
+    Duration? exactDuration;
+    if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
+      final parts = rec['duration'].toString().split(':');
+      try {
+        if (parts.length == 2) {
+          exactDuration = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+        } else if (parts.length == 3) {
+          exactDuration = Duration(hours: int.parse(parts[0]), minutes: int.parse(parts[1]), seconds: int.parse(parts[2]));
+        }
+      } catch (_) {} // Si la durée est mal formatée, on ignore
+    }
+
     final mediaItem = MediaItem(
       id: rec['id'].toString(),
       album: "Muhammad",
       title: "${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}",
       artist: "Muhammad Al-Luhaidan",
       artUri: rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty ? Uri.parse(rec['thumbnail']) : null,
+      duration: exactDuration, // En bonus : la barre de l'écran de verrouillage iOS sera exacte !
     );
+
+    // 2. Le "coupe-circuit" : force la lecture à s'arrêter à la vraie durée
+    AudioSource buildSource(Uri uri) {
+      if (exactDuration != null && exactDuration!.inSeconds > 0) {
+        return ClippingAudioSource(child: AudioSource.uri(uri), end: exactDuration!, tag: mediaItem);
+      }
+      return AudioSource.uri(uri, tag: mediaItem); // Pour les fichiers locaux normaux
+    }
 
     try {
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
@@ -162,10 +185,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final localFile = File(p.join(dir.path, fileName));
 
         if (await localFile.exists()) {
-          // Joue le fichier téléchargé
-          await _player.setAudioSource(AudioSource.uri(Uri.file(localFile.path), tag: mediaItem));
+          // On passe par le coupe-circuit
+          await _player.setAudioSource(buildSource(Uri.file(localFile.path)));
         } else {
-          // Télécharge la piste en arrière-plan
           setState(() => _isDownloading = true);
           var yt = YoutubeExplode();
           var video = await yt.videos.get(cleanUrl);
@@ -177,14 +199,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
           yt.close();
           
           setState(() => _isDownloading = false);
-          await _player.setAudioSource(AudioSource.uri(Uri.file(localFile.path), tag: mediaItem));
+          // On passe par le coupe-circuit
+          await _player.setAudioSource(buildSource(Uri.file(localFile.path)));
         }
       } else {
-        // Fichier local classique
         final dir = await getApplicationDocumentsDirectory();
         final file = File(p.join(dir.path, path));
         if (await file.exists()) {
-          await _player.setAudioSource(AudioSource.uri(Uri.file(file.path), tag: mediaItem));
+          await _player.setAudioSource(buildSource(Uri.file(file.path)));
         } else {
           throw Exception("Fichier local introuvable");
         }
