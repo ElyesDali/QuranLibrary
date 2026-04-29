@@ -10,8 +10,17 @@ import 'package:sqflite/sqflite.dart';            // Base de données locale
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart'; // Pour YouTube
+import 'package:just_audio_background/just_audio_background.dart';
 
-void main() => runApp(const LuhaidanApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await JustAudioBackground.init(
+    androidNotificationChannelId: 'com.ryanheise.bg_demo.channel.audio',
+    androidNotificationChannelName: 'Lecture audio',
+    androidNotificationOngoing: true,
+  );
+  runApp(const LuhaidanApp());
+}
 
 const List<Map<String, dynamic>> ALL_SURAHS = [
   {"num": 1, "name": "Al-Fatiha"}, {"num": 2, "name": "Al-Baqarah"}, {"num": 3, "name": "Al-Imran"}, {"num": 4, "name": "An-Nisa"},
@@ -146,30 +155,45 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (rec['fichier'] != null) {
       try {
         String urlOrPath = rec['fichier'];
+        
+        // 1. Préparation des métadonnées pour AirPlay et la Dynamic Island
+        final mediaItem = MediaItem(
+          id: rec['id'].toString(),
+          album: "Muhammad",
+          title: "${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}",
+          artist: "Muhammad Al-Luhaidan",
+        );
 
         if (Platform.isIOS || Platform.isAndroid) {
-          if (urlOrPath.contains('youtube.com') || urlOrPath.contains('youtu.be') || urlOrPath.contains('shorts')) {
+          
+          // 2. CORRECTION YOUTUBE : On coupe les paramètres parasites (?is=...)
+          String cleanUrl = urlOrPath.split('?').first;
+          
+          if (cleanUrl.contains('youtube.com') || cleanUrl.contains('youtu.be') || cleanUrl.contains('shorts')) {
             var yt = YoutubeExplode();
             try {
-              var video = await yt.videos.get(urlOrPath);
+              var video = await yt.videos.get(cleanUrl);
               var manifest = await yt.videos.streamsClient.getManifest(video.id);
               
-              // Forcer MP4/AAC pour compatibilité iPhone
               var audioStreams = manifest.audioOnly.where((s) => s.container.name == 'mp4');
               var audioStream = audioStreams.isNotEmpty ? audioStreams.withHighestBitrate() : manifest.audioOnly.withHighestBitrate();
               
-              await _player.setUrl(audioStream.url.toString());
+              // On utilise setAudioSource avec le tag MediaItem pour iOS
+              await _player.setAudioSource(AudioSource.uri(
+                Uri.parse(audioStream.url.toString()),
+                tag: mediaItem,
+              ));
             } finally {
               yt.close();
             }
           } 
           else if (urlOrPath.startsWith('http')) {
-            await _player.setUrl(urlOrPath);
+            await _player.setAudioSource(AudioSource.uri(Uri.parse(urlOrPath), tag: mediaItem));
           } else {
             final dir = await getApplicationDocumentsDirectory();
             final file = File(p.join(dir.path, urlOrPath));
             if (await file.exists()) {
-              await _player.setFilePath(file.path);
+              await _player.setAudioSource(AudioSource.uri(Uri.file(file.path), tag: mediaItem));
             } else {
               throw Exception("Fichier local introuvable");
             }
