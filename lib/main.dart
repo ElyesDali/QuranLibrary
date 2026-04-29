@@ -102,12 +102,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
         if (loopMode == LoopModeState.autoplay) {
           _playNext();
         }
-        // On ne force plus la pause ici. On laisse iOS comprendre que c'est fini "naturellement".
       }
     });
 
-    // Capture les événements Play externes (ex: AirPlay, Centre de contrôle)
-    // Si on demande de jouer alors que c'est fini, on repart à zéro
+    // Capture les événements Play externes (ex: AirPlay)
     _player.playingStream.listen((playing) {
       if (playing && _player.processingState == ProcessingState.completed) {
         _player.seek(Duration.zero);
@@ -188,7 +186,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
     AudioSource buildSource(Uri uri) {
       final base = AudioSource.uri(uri, tag: mediaItem);
       if (exactDuration != null && exactDuration.inSeconds > 0) {
-        return ClippingAudioSource(child: base, end: exactDuration);
+        // LE CORRECTIF EST ICI : On ajoute le "tag: mediaItem" au ClippingAudioSource
+        return ClippingAudioSource(child: base, end: exactDuration, tag: mediaItem);
       }
       return base;
     }
@@ -272,7 +271,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Widget _buildThumbnail(String? thumbPath) {
     if (thumbPath == null || thumbPath.isEmpty) {
-      return Image.asset('assets/logo.jpg', width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
+      return Container(width: 50, height: 50, color: Colors.grey[900], child: const Icon(Icons.mic, size: 30, color: Color(0xFF7EB8C9)));
     }
     if (thumbPath.startsWith('http')) {
       return Image.network(thumbPath, width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
@@ -358,13 +357,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
               final pos = snapshot.data ?? Duration.zero;
               final dur = _player.duration ?? Duration.zero;
               
-              // 1. Calcul exact de la valeur du Slider (bloquée entre 0 et max)
               double maxDur = dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0;
               double sliderVal = _dragValue ?? pos.inSeconds.toDouble();
               if (sliderVal < 0) sliderVal = 0;
               if (sliderVal > maxDur) sliderVal = maxDur;
 
-              // 2. Le texte du timecode suit strictement la valeur du Slider
               String currentTimeText = _formatDuration(Duration(seconds: sliderVal.toInt()));
 
               return Column(
@@ -419,7 +416,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     return Container(margin: const EdgeInsets.symmetric(horizontal: 16), width: 48, height: 48, child: const CircularProgressIndicator(color: Color(0xFF7EB8C9)));
                   }
                   
-                  // L'icône devient un triangle si la musique est en pause OU si elle a touché la fin
                   bool showPlayIcon = !playing || processingState == ProcessingState.completed;
 
                   return IconButton(
@@ -427,7 +423,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     icon: Icon(showPlayIcon ? Icons.play_circle : Icons.pause_circle, color: const Color(0xFF7EB8C9)), 
                     onPressed: () async {
                       if (showPlayIcon) {
-                        // REPLAY AUTOMATIQUE : Si c'est à la fin, on remet à 0 avant de relancer
                         if (processingState == ProcessingState.completed) {
                           await _player.seek(Duration.zero);
                         }
