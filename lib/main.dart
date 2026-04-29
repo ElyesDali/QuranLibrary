@@ -248,7 +248,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   right: 24,
                   child: FloatingActionButton(
                     onPressed: () => _showForm(),
-                    backgroundColor: const Color(Colors.red),
+                    backgroundColor: const Color(0xFF4A8FA3), // Remis en bleu
                     child: const Icon(Icons.add, color: Colors.white, size: 30),
                   ),
                 ),
@@ -519,7 +519,7 @@ class _FormDialogState extends State<FormDialog> {
                   Expanded(child: TextField(controller: _file, decoration: const InputDecoration(labelText: "Fichier"))),
                   IconButton(icon: const Icon(Icons.folder), onPressed: () async {
                     if (Platform.isIOS || Platform.isAndroid) {
-                      FilePickerResult? result = await FilePicker.platform.pickFiles(type: FileType.audio);
+                      FilePickerResult? result = await FilePicker.pickFiles(type: FileType.audio); // CORRECTION ICI !
                       if (result != null) {
                         final file = result.files.single;
                         final dir = await getApplicationDocumentsDirectory();
