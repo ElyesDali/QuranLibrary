@@ -9,8 +9,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
-import 'package:dio/dio.dart';
-import 'package:flutter_media_metadata/flutter_media_metadata.dart'; // Pour la miniature locale
+import 'package:flutter_media_metadata/flutter_media_metadata.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -96,11 +95,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
     super.initState();
     _initApp();
     _player.setVolume(volume);
+    
+    // Gère la fin de lecture et le mode boucle
     _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
-        if (loopMode == LoopModeState.autoplay) _playNext();
+        if (loopMode == LoopModeState.autoplay) {
+          _playNext();
+        } else {
+          _player.seek(Duration.zero);
+          _player.pause(); 
+        }
       }
     });
+
+    // Capture les événements AirPlay
+    _player.playbackEventStream.listen((event) {}, onError: (Object e, StackTrace st) {});
   }
 
   Future<void> _initApp() async {
@@ -132,9 +141,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   void _applyFilters() {
     setState(() {
-      if (selectedYearFilter == null) displayedRecitations = allRecitations;
-      else if (selectedYearFilter == -1) displayedRecitations = allRecitations.where((r) => r['annee'] == null).toList();
-      else displayedRecitations = allRecitations.where((r) => r['annee'] == selectedYearFilter).toList();
+      if (selectedYearFilter == null) {
+        displayedRecitations = allRecitations;
+      } else if (selectedYearFilter == -1) {
+        displayedRecitations = allRecitations.where((r) => r['annee'] == null).toList();
+      } else {
+        displayedRecitations = allRecitations.where((r) => r['annee'] == selectedYearFilter).toList();
+      }
     });
   }
 
@@ -151,10 +164,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
     Uri? artUri;
     if (rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty) {
-      artUri = rec['thumbnail'].toString().startsWith('http') ? Uri.parse(rec['thumbnail']) : Uri.file(rec['thumbnail']);
+      if (rec['thumbnail'].toString().startsWith('http')) {
+        artUri = Uri.parse(rec['thumbnail']);
+      } else {
+        artUri = Uri.file(rec['thumbnail']);
+      }
     }
 
-    // L'étiquette pour iOS / Dynamic Island / AirPlay
     final mediaItem = MediaItem(
       id: rec['id'].toString(),
       album: "Muhammad",
@@ -164,7 +180,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       duration: exactDuration,
     );
 
-    // Fonction pour créer la source audio (avec le correctif de durée YouTube)
     AudioSource buildSource(Uri uri) {
       final base = AudioSource.uri(uri, tag: mediaItem);
       if (exactDuration != null && exactDuration.inSeconds > 0) {
@@ -174,9 +189,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
 
     try {
-      // Construction de la playlist "fantôme" pour activer les boutons AirPlay
-      // iOS verra qu'il y a une suite et activera les flèches Suivant/Précédent
-      
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
         final cleanUrl = path.split('?').first;
         final dir = await getApplicationDocumentsDirectory();
@@ -212,36 +224,23 @@ class _LibraryScreenState extends State<LibraryScreen> {
           throw Exception("Fichier introuvable");
         }
       }
-      
       _player.play();
-
-      // On écoute les boutons AirPlay / Centre de contrôle
-      // Si l'utilisateur clique sur "Suivant" depuis son écran de verrouillage :
-      _player.sequenceStateStream.listen((state) {
-        // just_audio_background gère les événements système. 
-        // On s'assure que notre UI reste synchronisée.
-      });
-
     } catch (e) {
       setState(() => _isDownloading = false);
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
     }
   }
 
-  // 1. NAVIGATION SUIVANTE CIRCULAIRE (Sans plafond)
   void _playNext() {
     if (displayedRecitations.isEmpty) return;
     int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
-    // Le modulo % permet de revenir à 0 quand on dépasse la taille de la liste
     int nextIndex = (index + 1) % displayedRecitations.length;
     _play(displayedRecitations[nextIndex]);
   }
 
-  // 2. NAVIGATION PRÉCÉDENTE CIRCULAIRE (Sans sol)
   void _playPrevious() {
     if (displayedRecitations.isEmpty) return;
     int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
-    // On ajoute la longueur de la liste avant le modulo pour éviter les nombres négatifs
     int prevIndex = (index - 1 + displayedRecitations.length) % displayedRecitations.length;
     _play(displayedRecitations[prevIndex]);
   }
@@ -268,7 +267,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Widget _buildThumbnail(String? thumbPath) {
     if (thumbPath == null || thumbPath.isEmpty) {
-      return Container(width: 50, height: 50, color: Colors.grey[900], child: const Icon(Icons.mic, size: 30, color: Color(0xFF7EB8C9)));
+      return Image.asset('assets/logo.jpg', width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
     }
     if (thumbPath.startsWith('http')) {
       return Image.network(thumbPath, width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
@@ -280,10 +279,24 @@ class _LibraryScreenState extends State<LibraryScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("مكتبة محمد اللحيدان", style: TextStyle(color: Color(0xFF7EB8C9)))),
+      appBar: AppBar(
+        title: const Text("مكتبة محمد اللحيدان", style: TextStyle(color: Color(0xFF7EB8C9))),
+        backgroundColor: const Color(0xFF111111),
+      ),
       drawer: _buildDrawer(),
       body: Column(
         children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text("${displayedRecitations.length} récitations", style: const TextStyle(color: Color(0xFF6A7A82), fontSize: 13)),
+                if (selectedYearFilter != null)
+                  Text(selectedYearFilter == -1 ? "Année inconnue" : "$selectedYearFilter H", style: const TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold)),
+              ],
+            ),
+          ),
           Expanded(
             child: Stack(
               children: [
@@ -305,7 +318,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     );
                   },
                 ),
-                Positioned(bottom: 20, right: 20, child: FloatingActionButton(onPressed: () => _showForm(), backgroundColor: const Color(0xFF4A8FA3), child: const Icon(Icons.add))),
+                Positioned(
+                  bottom: 16,
+                  right: 24,
+                  child: FloatingActionButton(
+                    onPressed: () => _showForm(),
+                    backgroundColor: const Color(0xFF4A8FA3),
+                    child: const Icon(Icons.add, color: Colors.white, size: 30),
+                  ),
+                ),
               ],
             ),
           ),
@@ -332,8 +353,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
               final pos = snapshot.data ?? Duration.zero;
               final dur = _player.duration ?? Duration.zero;
               
-              // LOGIQUE DYNAMIQUE : Si on déplace le curseur, on affiche le temps du curseur
-              // sinon on affiche le temps réel de la piste.
               double sliderVal = _dragValue ?? pos.inSeconds.toDouble().clamp(0, dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0);
               String currentTimeText = _dragValue != null 
                   ? _formatDuration(Duration(seconds: _dragValue!.toInt())) 
@@ -341,22 +360,28 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
               return Column(
                 children: [
-                  Slider(
-                    activeColor: const Color(0xFF7EB8C9),
-                    inactiveColor: Colors.white24,
-                    value: sliderVal,
-                    max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
-                    onChanged: (v) {
-                      setState(() {
-                        _dragValue = v; // Met à jour le timecode visuel en temps réel
-                      });
-                    },
-                    onChangeEnd: (v) {
-                      _player.seek(Duration(seconds: v.toInt()));
-                      setState(() {
-                        _dragValue = null; // Reprend le temps réel du morceau
-                      });
-                    },
+                  SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0),
+                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 14.0),
+                    ),
+                    child: Slider(
+                      activeColor: const Color(0xFF7EB8C9),
+                      inactiveColor: Colors.white24,
+                      value: sliderVal,
+                      max: dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0,
+                      onChanged: (v) {
+                        setState(() {
+                          _dragValue = v;
+                        });
+                      },
+                      onChangeEnd: (v) {
+                        _player.seek(Duration(seconds: v.toInt()));
+                        setState(() {
+                          _dragValue = null;
+                        });
+                      },
+                    ),
                   ),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween, 
@@ -385,7 +410,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     return Container(margin: const EdgeInsets.symmetric(horizontal: 16), width: 48, height: 48, child: const CircularProgressIndicator(color: Color(0xFF7EB8C9)));
                   }
                   
-                  // LOGIQUE DE L'ICÔNE : Si c'est fini ou en pause, on montre le triangle "Play"
                   bool showPlayIcon = !playing || processingState == ProcessingState.completed;
 
                   return IconButton(
@@ -414,32 +438,61 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Widget _buildDrawer() {
-    final years = allRecitations.map((r) => r['annee']).whereType<int>().toSet().toList()..sort((a, b) => b.compareTo(a));
+    final Map<int, int?> yearMap = {};
+    for (var r in allRecitations) {
+      if (r['annee'] != null) yearMap[r['annee'] as int] = r['annee_g'] as int?;
+    }
+    final years = yearMap.keys.toList()..sort((a, b) => b.compareTo(a));
+
     return Drawer(
       backgroundColor: const Color(0xFF0A0A0A),
       child: ListView(
         children: [
-          const DrawerHeader(child: Center(child: Text("FILTRES", style: TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold)))),
-          ListTile(title: const Text("Toutes"), onTap: () { setState(() => selectedYearFilter = null); _applyFilters(); Navigator.pop(context); }),
-          ListTile(title: const Text("Année inconnue"), onTap: () { setState(() => selectedYearFilter = -1); _applyFilters(); Navigator.pop(context); }),
+          const DrawerHeader(child: Center(child: Text("FILTRER PAR ANNÉE", style: TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold)))),
+          ListTile(title: const Text("Toutes les récitations"), selected: selectedYearFilter == null, onTap: () { setState(() => selectedYearFilter = null); _applyFilters(); Navigator.pop(context); }),
+          ListTile(title: const Text("Année inconnue"), selected: selectedYearFilter == -1, onTap: () { setState(() => selectedYearFilter = -1); _applyFilters(); Navigator.pop(context); }),
           const Divider(color: Colors.white24),
-          ...years.map((y) => ListTile(title: Text("$y H"), onTap: () { setState(() => selectedYearFilter = y); _applyFilters(); Navigator.pop(context); })),
+          ...years.map((y) {
+            return ListTile(
+              title: Text("$y H"),
+              selected: selectedYearFilter == y,
+              onTap: () { setState(() => selectedYearFilter = y); _applyFilters(); Navigator.pop(context); },
+            );
+          }),
         ],
       ),
     );
   }
 
   void _showOptions(Map<String, dynamic> rec) {
-    showModalBottomSheet(context: context, backgroundColor: const Color(0xFF111111), builder: (context) => Wrap(children: [
-      ListTile(leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)), title: const Text("Modifier"), onTap: () { Navigator.pop(context); _showForm(rec: rec); }),
-      ListTile(leading: const Icon(Icons.delete, color: Colors.red), title: const Text("Supprimer", style: TextStyle(color: Colors.red)), onTap: () async {
-        await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
-        _fetch(); Navigator.pop(context);
-      }),
-    ]));
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF111111),
+      builder: (context) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)),
+            title: const Text("Modifier"),
+            onTap: () { Navigator.pop(context); _showForm(rec: rec); },
+          ),
+          ListTile(
+            leading: const Icon(Icons.delete, color: Colors.red),
+            title: const Text("Supprimer", style: TextStyle(color: Colors.red)),
+            onTap: () async {
+              await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
+              _fetch();
+              Navigator.pop(context);
+            },
+          ),
+        ],
+      ),
+    );
   }
 
-  void _showForm({Map<String, dynamic>? rec}) => showDialog(context: context, builder: (context) => FormDialog(rec: rec, onSave: _fetch, db: _db));
+  void _showForm({Map<String, dynamic>? rec}) {
+    showDialog(context: context, builder: (context) => FormDialog(rec: rec, onSave: _fetch, db: _db));
+  }
 }
 
 class FormDialog extends StatefulWidget {
@@ -447,7 +500,8 @@ class FormDialog extends StatefulWidget {
   final VoidCallback onSave;
   final Database? db;
   const FormDialog({super.key, this.rec, required this.onSave, this.db});
-  @override State<FormDialog> createState() => _FormDialogState();
+  @override
+  State<FormDialog> createState() => _FormDialogState();
 }
 
 class _FormDialogState extends State<FormDialog> {
@@ -460,26 +514,23 @@ class _FormDialogState extends State<FormDialog> {
   @override
   void initState() {
     super.initState();
-    _initApp();
-    _player.setVolume(volume);
+    if (widget.rec != null) {
+      selectedNum = widget.rec!['sourate_num'];
+      selectedName = widget.rec!['sourate_name'];
+      isFull = widget.rec!['versets'] == "complet";
+      isLocal = !(widget.rec!['fichier']?.toString().contains('youtu') ?? false);
+    }
     
-    // Écoute les commandes du centre de contrôle iOS
-    _player.playerStateStream.listen((state) {
-      if (state.processingState == ProcessingState.completed) {
-        if (loopMode == LoopModeState.autoplay) {
-          _playNext();
-        } else {
-          // Si on n'est pas en lecture automatique, on revient à zéro
-          // Cela permet à iOS de réactiver le bouton "Play" au lieu de rester figé
-          _player.seek(Duration.zero);
-          _player.pause(); 
-        }
-      }
-    });
-
-    // Capture les boutons Suivant/Précédent d'AirPlay et du centre de contrôle
-    // Note : On utilise la logique manuelle car les liens YouTube doivent être extraits un par un
-    _player.playbackEventStream.listen((event) {}, onError: (Object e, StackTrace st) {});
+    _year = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
+    _file = TextEditingController(text: (widget.rec != null && isLocal) ? widget.rec!['fichier'] : "");
+    _ytUrl = TextEditingController(text: (widget.rec != null && !isLocal) ? widget.rec!['fichier'] : "");
+    _vStart = TextEditingController();
+    _vEnd = TextEditingController();
+    
+    if (!isFull) {
+      List<String> parts = widget.rec!['versets'].split('-');
+      if (parts.length == 2) { _vStart.text = parts[0]; _vEnd.text = parts[1]; }
+    }
   }
 
   @override
@@ -560,7 +611,6 @@ class _FormDialogState extends State<FormDialog> {
                 try {
                   var video = await yt.videos.get(_ytUrl.text.split('?').first);
                   thumb = video.thumbnails.standardResUrl;
-                  // CORRECTION DU BUG 9:590 (modulo 60)
                   dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
                 } catch (e) {
                   debugPrint("Erreur YouTube: $e");
@@ -572,7 +622,6 @@ class _FormDialogState extends State<FormDialog> {
                 final dir = await getApplicationDocumentsDirectory();
                 final localFilePath = p.join(dir.path, _file.text);
                 
-                // On sécurise la durée
                 try {
                   final player = AudioPlayer();
                   final d = await player.setFilePath(localFilePath);
@@ -582,7 +631,6 @@ class _FormDialogState extends State<FormDialog> {
                   debugPrint("Impossible de lire la durée locale: $e");
                 }
 
-                // On sécurise l'image pour éviter le crash silencieux
                 try {
                   final metadata = await MetadataRetriever.fromFile(File(localFilePath));
                   if (metadata.albumArt != null) {
@@ -591,7 +639,7 @@ class _FormDialogState extends State<FormDialog> {
                     thumb = artFile.path;
                   }
                 } catch (e) {
-                  debugPrint("Pas d'image trouvée dans le fichier local, ce n'est pas grave: $e");
+                  debugPrint("Pas d'image trouvée: $e");
                 }
               }
 
@@ -616,10 +664,7 @@ class _FormDialogState extends State<FormDialog> {
               if (mounted) Navigator.pop(context);
 
             } catch (e) {
-              // Si n'importe quelle erreur imprévue arrive, on l'affiche au lieu de bloquer !
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de sauvegarde : $e"), backgroundColor: Colors.red));
-              }
+              if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de sauvegarde : $e"), backgroundColor: Colors.red));
             }
           },
           child: const Text("Enregistrer", style: TextStyle(color: Colors.white)),
