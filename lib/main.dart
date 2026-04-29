@@ -189,7 +189,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
           var video = await yt.videos.get(cleanUrl);
           var manifest = await yt.videos.streamsClient.getManifest(video.id);
           var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-          await Dio().download(audioStream.url.toString(), localFile.path);
+          
+          // NOUVEAU SYSTÈME DE TÉLÉCHARGEMENT (Finit l'erreur 403 !)
+          var stream = yt.videos.streamsClient.get(audioStream);
+          var fileStream = localFile.openWrite();
+          await stream.pipe(fileStream);
+          await fileStream.flush();
+          await fileStream.close();
+          
           await _db?.update('recitations', {'fichier': fileName}, where: 'id = ?', whereArgs: [rec['id']]);
           yt.close();
           setState(() => _isDownloading = false);
@@ -482,65 +489,76 @@ class _FormDialogState extends State<FormDialog> {
               return;
             }
 
-            String thumb = widget.rec?['thumbnail'] ?? "";
-            String dur = widget.rec?['duration'] ?? "";
+            try {
+              String thumb = widget.rec?['thumbnail'] ?? "";
+              String dur = widget.rec?['duration'] ?? "";
 
-            // 1. YouTube metadata extraction
-            if (!isLocal && _ytUrl.text.isNotEmpty && (widget.rec == null || _ytUrl.text != widget.rec?['fichier'])) {
-              var yt = YoutubeExplode();
-              try {
-                var video = await yt.videos.get(_ytUrl.text.split('?').first);
-                thumb = video.thumbnails.standardResUrl;
-                dur = "${video.duration?.inMinutes}:${(video.duration?.inSeconds ?? 0).toString().padLeft(2, '0')}";
-              } catch (e) {
-                debugPrint("Erreur YouTube: $e");
-              } finally {
-                yt.close();
-              }
-            } 
-            // 2. Fichiers locaux : extraction de durée + image embarquée (ID3 tag)
-            else if (isLocal && _file.text.isNotEmpty && (widget.rec == null || _file.text != widget.rec?['fichier'])) {
-              final dir = await getApplicationDocumentsDirectory();
-              final localFilePath = p.join(dir.path, _file.text);
-              
-              // Durée
-              final player = AudioPlayer();
-              final d = await player.setFilePath(localFilePath);
-              if (d != null) dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
-              await player.dispose();
-
-              // Miniature (Album Art)
-              try {
-                final metadata = await MetadataRetriever.fromFile(File(localFilePath));
-                if (metadata.albumArt != null) {
-                  final artFile = File(p.join(dir.path, "thumb_${_file.text}.jpg"));
-                  await artFile.writeAsBytes(metadata.albumArt!);
-                  thumb = artFile.path;
+              if (!isLocal && _ytUrl.text.isNotEmpty && (widget.rec == null || _ytUrl.text != widget.rec?['fichier'])) {
+                var yt = YoutubeExplode();
+                try {
+                  var video = await yt.videos.get(_ytUrl.text.split('?').first);
+                  thumb = video.thumbnails.standardResUrl;
+                  // CORRECTION DU BUG 9:590 (modulo 60)
+                  dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
+                } catch (e) {
+                  debugPrint("Erreur YouTube: $e");
+                } finally {
+                  yt.close();
                 }
-              } catch (e) {
-                debugPrint("Pas d'image trouvée dans le fichier: $e");
+              } 
+              else if (isLocal && _file.text.isNotEmpty && (widget.rec == null || _file.text != widget.rec?['fichier'])) {
+                final dir = await getApplicationDocumentsDirectory();
+                final localFilePath = p.join(dir.path, _file.text);
+                
+                // On sécurise la durée
+                try {
+                  final player = AudioPlayer();
+                  final d = await player.setFilePath(localFilePath);
+                  if (d != null) dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+                  await player.dispose();
+                } catch (e) {
+                  debugPrint("Impossible de lire la durée locale: $e");
+                }
+
+                // On sécurise l'image pour éviter le crash silencieux
+                try {
+                  final metadata = await MetadataRetriever.fromFile(File(localFilePath));
+                  if (metadata.albumArt != null) {
+                    final artFile = File(p.join(dir.path, "thumb_${_file.text}.jpg"));
+                    await artFile.writeAsBytes(metadata.albumArt!);
+                    thumb = artFile.path;
+                  }
+                } catch (e) {
+                  debugPrint("Pas d'image trouvée dans le fichier local, ce n'est pas grave: $e");
+                }
+              }
+
+              String versets = isFull ? "complet" : "${_vStart.text}-${_vEnd.text}";
+              final data = {
+                "sourate_num": selectedNum,
+                "sourate_name": selectedName,
+                "annee": int.tryParse(_year.text),
+                "fichier": isLocal ? _file.text : _ytUrl.text,
+                "versets": versets,
+                "thumbnail": thumb,
+                "duration": dur,
+              };
+
+              if (widget.rec == null) {
+                await widget.db?.insert('recitations', data);
+              } else {
+                await widget.db?.update('recitations', data, where: 'id = ?', whereArgs: [widget.rec!['id']]);
+              }
+              
+              widget.onSave();
+              if (mounted) Navigator.pop(context);
+
+            } catch (e) {
+              // Si n'importe quelle erreur imprévue arrive, on l'affiche au lieu de bloquer !
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de sauvegarde : $e"), backgroundColor: Colors.red));
               }
             }
-
-            String versets = isFull ? "complet" : "${_vStart.text}-${_vEnd.text}";
-            final data = {
-              "sourate_num": selectedNum,
-              "sourate_name": selectedName,
-              "annee": int.tryParse(_year.text),
-              "fichier": isLocal ? _file.text : _ytUrl.text,
-              "versets": versets,
-              "thumbnail": thumb,
-              "duration": dur,
-            };
-
-            if (widget.rec == null) {
-              await widget.db?.insert('recitations', data);
-            } else {
-              await widget.db?.update('recitations', data, where: 'id = ?', whereArgs: [widget.rec!['id']]);
-            }
-            
-            widget.onSave();
-            Navigator.pop(context);
           },
           child: const Text("Enregistrer", style: TextStyle(color: Colors.white)),
         ),
