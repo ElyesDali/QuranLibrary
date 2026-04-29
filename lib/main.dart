@@ -83,7 +83,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
   List<dynamic> allRecitations = [];
   List<dynamic> displayedRecitations = [];
   final AudioPlayer _player = AudioPlayer();
-  ConcatenatingAudioSource? _playlist;
   Map<String, dynamic>? currentRecitation;
   
   double volume = 0.8;
@@ -98,27 +97,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
     super.initState();
     _initApp();
     _player.setVolume(volume);
-    
-    // Par défaut, la playlist est circulaire (pour que les boutons AirPlay marchent toujours)
-    _player.setLoopMode(LoopMode.all);
 
-    // Synchronisation de l'UI avec AirPlay/Verrouillage
-    _player.currentIndexStream.listen((index) {
-      if (index != null && displayedRecitations.isNotEmpty && index < displayedRecitations.length) {
-        if (mounted) setState(() => currentRecitation = displayedRecitations[index]);
-      }
-    });
-
-    // L'astuce magique : On met pause 300ms avant la fin naturelle si on a désactivé l'autoplay !
-    _player.positionStream.listen((pos) {
-      final dur = _player.duration;
-      if (dur != null && pos >= dur - const Duration(milliseconds: 300)) {
-        if (loopMode == LoopModeState.off && _player.playing) {
-          _player.pause();
+    // Gère la fin de lecture et le mode boucle
+    _player.playerStateStream.listen((state) {
+      if (state.processingState == ProcessingState.completed) {
+        if (loopMode == LoopModeState.autoplay) {
+          _playNext();
+        } else {
           _player.seek(Duration.zero);
+          _player.pause(); 
         }
       }
     });
+
+    _player.playbackEventStream.listen((event) {}, onError: (Object e, StackTrace st) {});
   }
 
   Future<void> _initApp() async {
@@ -158,135 +150,136 @@ class _LibraryScreenState extends State<LibraryScreen> {
         displayedRecitations = allRecitations.where((r) => r['annee'] == selectedYearFilter).toList();
       }
     });
-    _buildPlaylist(); // Reconstruit la file d'attente globale
   }
 
-  // --- LE MOTEUR AIRPLAY ---
-  // Construit la liste complète instantanément, mais ne télécharge la vidéo que lorsque tu l'écoutes
-  void _buildPlaylist() {
-    final children = <AudioSource>[];
-    for (var rec in displayedRecitations) {
-      Duration? exactDuration;
-      if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
-        final parts = rec['duration'].toString().split(':');
-        if (parts.length == 2) exactDuration = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+  // TÉLÉCHARGEMENT INVISIBLE EN ARRIÈRE-PLAN
+  void _downloadYoutubeInBackground(String cleanUrl, File localFile) async {
+    var yt = YoutubeExplode();
+    try {
+      var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
+      var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+      var stream = yt.videos.streamsClient.get(audioStream);
+      
+      final tempFile = File("${localFile.path}.tmp");
+      var fileStream = tempFile.openWrite();
+      await stream.pipe(fileStream);
+      await fileStream.flush();
+      await fileStream.close();
+      
+      if (await tempFile.length() > 0) {
+        await tempFile.rename(localFile.path);
       }
-
-      Uri? artUri;
-      if (rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty) {
-        artUri = rec['thumbnail'].toString().startsWith('http') ? Uri.parse(rec['thumbnail']) : Uri.file(rec['thumbnail']);
-      }
-
-      final mediaItem = MediaItem(
-        id: rec['id'].toString(),
-        album: "Muhammad",
-        title: "${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}",
-        artist: "Muhammad Al-Luhaidan",
-        artUri: artUri,
-        duration: exactDuration,
-      );
-
-      var resolvingSource = ResolvingAudioSource(
-        uniqueId: rec['id'].toString(),
-        tag: mediaItem,
-        resolve: () async {
-          String path = rec['fichier'];
-          
-          // TÉLÉCHARGEMENT MINIATURE HORS-LIGNE (Fix auto pour les anciennes vidéos)
-          if (rec['thumbnail'] != null && rec['thumbnail'].toString().startsWith('http')) {
-            try {
-              final dir = await getApplicationDocumentsDirectory();
-              final thumbFile = File(p.join(dir.path, "thumb_${rec['id']}.jpg"));
-              if (!await thumbFile.exists()) {
-                await Dio().download(rec['thumbnail'], thumbFile.path);
-              }
-              await _db?.update('recitations', {'thumbnail': thumbFile.path}, where: 'id = ?', whereArgs: [rec['id']]);
-              if (mounted) setState(() => rec['thumbnail'] = thumbFile.path);
-            } catch (_) {}
-          }
-
-          // RÉSOUUTION YOUTUBE : Télécharge d'abord -> Lit le fichier (Finit le bug -1)
-          if (path.contains('youtube') || path.contains('youtu.be') || path.contains('shorts')) {
-            final cleanUrl = path.split('?').first;
-            final dir = await getApplicationDocumentsDirectory();
-            final fileName = "yt_${rec['id']}.mp4";
-            final localFile = File(p.join(dir.path, fileName));
-
-            if (await localFile.exists() && await localFile.length() > 0) {
-              return localFile.uri;
-            } else {
-              if (mounted) setState(() => _isDownloading = true);
-              var yt = YoutubeExplode();
-              try {
-                var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-                var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-                
-                var stream = yt.videos.streamsClient.get(audioStream);
-                var fileStream = localFile.openWrite();
-                await stream.pipe(fileStream);
-                await fileStream.flush();
-                await fileStream.close();
-                
-                await _db?.update('recitations', {'fichier': fileName}, where: 'id = ?', whereArgs: [rec['id']]);
-                if (mounted) setState(() => _isDownloading = false);
-                return localFile.uri;
-              } catch (e) {
-                if (mounted) setState(() => _isDownloading = false);
-                throw Exception("Erreur YT: $e");
-              } finally {
-                yt.close();
-              }
-            }
-          } else {
-            final dir = await getApplicationDocumentsDirectory();
-            final file = File(p.join(dir.path, path));
-            return file.uri;
-          }
-        }
-      );
-
-      // Enveloppe coupe-circuit pour bug YouTube durée double
-      if (exactDuration != null && exactDuration.inSeconds > 0) {
-        children.add(ClippingAudioSource(child: resolvingSource, end: exactDuration, tag: mediaItem));
-      } else {
-        children.add(resolvingSource);
-      }
+    } catch (e) {
+      debugPrint("Erreur background download: $e");
+    } finally {
+      yt.close();
     }
-
-    _playlist = ConcatenatingAudioSource(children: children, useLazyPreparation: true);
   }
 
   Future<void> _play(Map<String, dynamic> rec) async {
-    if (_playlist == null) return;
-    int index = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
-    if (index == -1) return;
+    setState(() => currentRecitation = rec);
+    if (rec['fichier'] == null) return;
+    
+    String path = rec['fichier'];
+    Duration? exactDuration;
+    if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
+      final parts = rec['duration'].toString().split(':');
+      if (parts.length == 2) exactDuration = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+    }
+
+    Uri? artUri;
+    if (rec['thumbnail'] != null && rec['thumbnail'].toString().isNotEmpty) {
+      if (rec['thumbnail'].toString().startsWith('http')) {
+        artUri = Uri.parse(rec['thumbnail']);
+      } else {
+        artUri = Uri.file(rec['thumbnail']);
+      }
+    }
+
+    final mediaItem = MediaItem(
+      id: rec['id'].toString(),
+      album: "Muhammad",
+      title: "${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}",
+      artist: "Muhammad Al-Luhaidan",
+      artUri: artUri,
+      duration: exactDuration,
+    );
+
+    AudioSource buildSource(Uri uri) {
+      final base = AudioSource.uri(uri, tag: mediaItem);
+      if (exactDuration != null && exactDuration.inSeconds > 0) {
+        return ClippingAudioSource(child: base, end: exactDuration, tag: mediaItem);
+      }
+      return base;
+    }
 
     try {
-      if (_player.audioSource != _playlist) {
-        await _player.setAudioSource(_playlist!, initialIndex: index);
+      if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
+        final cleanUrl = path.split('?').first;
+        final dir = await getApplicationDocumentsDirectory();
+        final fileName = "yt_${rec['id']}.mp4";
+        final localFile = File(p.join(dir.path, fileName));
+
+        if (await localFile.exists() && await localFile.length() > 0) {
+          // Lecture locale (Téléchargement déjà fini)
+          await _player.setAudioSource(buildSource(Uri.file(localFile.path)));
+        } else {
+          // LECTURE INSTANTANÉE (Résout l'erreur -1 et la lenteur)
+          setState(() => _isDownloading = true); 
+          var yt = YoutubeExplode();
+          var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
+          var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+          
+          await _player.setAudioSource(buildSource(audioStream.url));
+          
+          // Lancement du téléchargement propre en tâche de fond
+          _downloadYoutubeInBackground(cleanUrl, localFile);
+          
+          await _db?.update('recitations', {'fichier': fileName}, where: 'id = ?', whereArgs: [rec['id']]);
+          yt.close();
+          setState(() => _isDownloading = false);
+        }
       } else {
-        await _player.seek(Duration.zero, index: index);
+        final dir = await getApplicationDocumentsDirectory();
+        final file = File(p.join(dir.path, path));
+        if (await file.exists()) {
+          await _player.setAudioSource(buildSource(Uri.file(file.path)));
+        } else {
+          throw Exception("Fichier introuvable");
+        }
       }
       _player.play();
     } catch (e) {
+      setState(() => _isDownloading = false);
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
     }
   }
 
-  void _playNext() => _player.seekToNext();
-  void _playPrevious() => _player.seekToPrevious();
+  void _playNext() {
+    if (displayedRecitations.isEmpty) return;
+    int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
+    int nextIndex = (index + 1) % displayedRecitations.length;
+    _play(displayedRecitations[nextIndex]);
+  }
+
+  void _playPrevious() {
+    if (displayedRecitations.isEmpty) return;
+    int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
+    int prevIndex = (index - 1 + displayedRecitations.length) % displayedRecitations.length;
+    _play(displayedRecitations[prevIndex]);
+  }
 
   void _toggleLoop() {
     setState(() {
       if (loopMode == LoopModeState.off) {
         loopMode = LoopModeState.autoplay;
-        _player.setLoopMode(LoopMode.all);
+        _player.setLoopMode(LoopMode.off);
       } else if (loopMode == LoopModeState.autoplay) {
         loopMode = LoopModeState.one;
         _player.setLoopMode(LoopMode.one);
       } else {
         loopMode = LoopModeState.off;
-        _player.setLoopMode(LoopMode.all); // On garde 'all' en natif pour que AirPlay ne se bloque jamais !
+        _player.setLoopMode(LoopMode.off);
       }
     });
   }
