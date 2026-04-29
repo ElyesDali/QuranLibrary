@@ -493,7 +493,7 @@ class _FormDialogState extends State<FormDialog> {
                 icon: const Icon(Icons.folder_open), label: const Text("Parcourir l'iPhone..."),
                 onPressed: () async {
                   try {
-                    FilePickerResult? result = await FilePicker.platform.pickFiles(type: FileType.any);
+                    FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any);
                     if (result != null) {
                       final file = result.files.single;
                       final dir = await getApplicationDocumentsDirectory();
