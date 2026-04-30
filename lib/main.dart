@@ -127,20 +127,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    // Écouteur spécial pour les boutons iOS AirPlay et Écran de verrouillage
-    _player.currentIndexStream.listen((index) {
-      if (_isSwitchingTrack || index == null) return; 
-      
-      if (index == 0) {
-        _isSwitchingTrack = true;
-        _playPrevious();
-      } else if (index == 2) {
-        _isSwitchingTrack = true;
-        _playNext();
-      }
-    });
-
-    // Écouteur de fin de piste
+    // Fin de piste : on passe à la suivante si Autoplay est activé
     _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
         if (loopMode == LoopModeState.autoplay && !_isSwitchingTrack) {
@@ -149,6 +136,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
         }
       }
     });
+  }
+
+  // NOUVEAU : VÉRIFICATION EXPRESS DE LA CONNEXION (Empêche le chargement infini)
+  Future<bool> _hasInternet() async {
+    try {
+      final result = await InternetAddress.lookup('youtube.com').timeout(const Duration(seconds: 2));
+      return result.isNotEmpty && result[0].rawAddress.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<void> _initApp() async {
@@ -237,7 +234,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Future<void> _play(Map<String, dynamic> rec) async {
     _isSwitchingTrack = true;
     
-    // Arrêt immédiat et radical de la lecture précédente
+    // ARRÊT IMMÉDIAT ET RADICAL de la lecture précédente
     await _player.stop(); 
     
     setState(() {
@@ -261,61 +258,44 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final dir = await getApplicationDocumentsDirectory();
         final localFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
 
-        // Vérification hors-ligne stricte : Existe ET n'est pas un fichier vide/corrompu (plus de 500ko)
+        // 1. Vérification hors-ligne stricte (le fichier doit faire plus de 500ko pour éviter les fichiers corrompus)
         if (await localFile.exists() && await localFile.length() > 500000) {
            finalSource = _buildSource(Uri.file(localFile.path), currentMediaItem);
         } else {
-          // Lecture en ligne via flux internet
+          // 2. Si pas de fichier local, vérification expresse d'internet
+          if (!await _hasInternet()) {
+            throw Exception("Hors-ligne : La vidéo n'a pas fini de se télécharger la dernière fois.");
+          }
+
+          // 3. Lecture en ligne via flux internet
           var yt = YoutubeExplode();
           try {
-            var manifest = await yt.videos.streamsClient.getManifest(cleanUrl).timeout(const Duration(seconds: 5));
+            var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
             var streamInfo = manifest.muxed.withHighestBitrate();
             finalSource = _buildSource(streamInfo.url, currentMediaItem);
             
-            // On lance la sauvegarde en arrière-plan sans bloquer
+            // On relance la sauvegarde en arrière-plan
             downloadYoutubeInBackground(cleanUrl, localFile);
-          } catch (e) {
-            throw Exception("Fichier non disponible hors-ligne");
           } finally {
             yt.close();
           }
         }
       } else {
-        // Fichier local normal
+        // Fichier local normal de l'iPhone
         final file = File(_resolvePath(path));
         if (await file.exists()) {
           finalSource = _buildSource(Uri.file(file.path), currentMediaItem);
         } else {
-          throw Exception("Fichier introuvable sur le disque");
+          throw Exception("Fichier local introuvable sur le disque");
         }
       }
 
-      // Si le fichier est lu hors-ligne (en local), on prépare la "fausse" liste de 3 pistes
-      // pour forcer iOS à allumer les boutons AirPlay Suivant/Précédent.
-      if (finalSource is UriAudioSource && finalSource.uri.isScheme('file')) {
-        int currIdx = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
-        int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
-        int nextIdx = (currIdx + 1) % displayedRecitations.length;
-
-        var playlist = ConcatenatingAudioSource(children: [
-           _buildSource(finalSource.uri, _createMediaItem(displayedRecitations[prevIdx])),
-           finalSource,
-           _buildSource(finalSource.uri, _createMediaItem(displayedRecitations[nextIdx])),
-        ]);
-        await _player.setAudioSource(playlist, initialIndex: 1);
-      } else {
-        // Si c'est en streaming YouTube, on lit sans playlist pour ne pas causer l'erreur réseau iOS
-        await _player.setAudioSource(finalSource);
-      }
-
+      // LECTURE SIMPLE (Garantit 100% de stabilité sur la touche Pause)
+      await _player.setAudioSource(finalSource);
       _player.play();
 
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("❌ $e"), backgroundColor: Colors.red)
-        );
-      }
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ $e"), backgroundColor: Colors.red));
     } finally {
       setState(() => _isDownloading = false);
       Future.delayed(const Duration(milliseconds: 500), () => _isSwitchingTrack = false);
