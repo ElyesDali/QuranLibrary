@@ -120,51 +120,55 @@ class _LibraryScreenState extends State<LibraryScreen> {
     
     setState(() => _activeDownloads[id] = 0.0);
     var yt = YoutubeExplode();
+    
     try {
       var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-      var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-      var stream = yt.videos.streamsClient.get(audioStream);
+      
+      // Le flux Muxed (Audio + Vidéo basique) est beaucoup moins bridé par YouTube que le flux Audio seul.
+      var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
+      var streamInfo = mp4Muxed.isNotEmpty 
+          ? mp4Muxed.withHighestBitrate() 
+          : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
       
       final tempFile = File("${localFile.path}.tmp");
-      var fileStream = tempFile.openWrite();
+      int lastUpdateValue = 0;
       
-      var totalBytes = audioStream.size.totalBytes;
-      var bytesCount = 0;
-      int lastPercentage = 0;
-
-      await for (var data in stream) {
-        fileStream.add(data);
-        bytesCount += data.length;
-        if (totalBytes > 0) {
-          int percentage = ((bytesCount / totalBytes) * 100).toInt();
-          // CORRECTIF N°1 : On ne rafraîchit l'écran que tous les 1% minimum
-          // Ça empêche l'iPhone de "freeze" et le cercle va s'animer fluidement
-          if (percentage != lastPercentage) {
-            lastPercentage = percentage;
-            if (mounted) setState(() => _activeDownloads[id] = percentage / 100.0);
+      // Utilisation de Dio en mode brut (Respecte la signature YouTube)
+      await Dio().download(
+        streamInfo.url.toString(),
+        tempFile.path,
+        onReceiveProgress: (received, total) {
+          if (total != -1) {
+            // YouTube donne la taille : On affiche un vrai pourcentage (0% à 100%)
+            int percentage = ((received / total) * 100).toInt();
+            // On limite le rafraîchissement à 1% pour ne pas figer l'iPhone
+            if (percentage != lastUpdateValue) {
+              lastUpdateValue = percentage;
+              if (mounted) setState(() => _activeDownloads[id] = percentage / 100.0);
+            }
+          } else {
+            // YouTube CACHE la taille (total = -1). 
+            // On utilise une valeur négative pour dire à l'interface d'afficher les MO au lieu du %
+            int megabyteStep = (received / 500000).toInt(); // Maj tous les 500 Ko
+            if (megabyteStep != lastUpdateValue) {
+              lastUpdateValue = megabyteStep;
+              if (mounted) setState(() => _activeDownloads[id] = -(received.toDouble()));
+            }
           }
-        }
-      }
+        },
+      );
       
-      await fileStream.flush();
-      await fileStream.close();
-      
-      // On s'assure que le fichier pèse au moins 500ko (non corrompu)
       if (await tempFile.exists() && await tempFile.length() > 500000) {
-        // CORRECTIF N°2 : Sécurité iOS, on détruit tout fichier fantôme existant
-        if (await localFile.exists()) {
-          await localFile.delete(); 
-        }
-        await tempFile.rename(localFile.path); // Validation finale du fichier .mp4
+        if (await localFile.exists()) await localFile.delete(); // Sécurité nettoyage
+        await tempFile.rename(localFile.path); 
       } else {
         throw Exception("Fichier corrompu ou trop petit.");
       }
     } catch (e) {
       debugPrint("Erreur téléchargement: $e");
-      // S'il y a un souci, tu le verras ENFIN en rouge !
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text("❌ Échec du téléchargement : $e"), 
+          content: Text("❌ Échec du DL : $e"), 
           backgroundColor: Colors.red
         ));
       }
@@ -172,7 +176,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       yt.close();
       if (mounted) setState(() => _activeDownloads.remove(id)); 
     }
-  }
+  } 
 
   // NOUVEAU : VÉRIFICATION EXPRESS DE LA CONNEXION (Empêche le chargement infini)
   Future<bool> _hasInternet() async {
@@ -446,6 +450,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       title: Text("${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}"),
                       subtitle: Text("${rec['annee'] ?? '??'} H • Versets: ${rec['versets']}"),
                       // Affiche le cercle dynamique ou le temps
+                      // Affiche le cercle dynamique (en % ou en Mégaoctets) ou le temps
                       trailing: _activeDownloads.containsKey(rec['id'])
                           ? SizedBox(
                               width: 44,
@@ -454,14 +459,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                 alignment: Alignment.center,
                                 children: [
                                   CircularProgressIndicator(
-                                    // S'il est à 0.0, il tourne à l'infini. Sinon, il se remplit.
-                                    value: _activeDownloads[rec['id']] == 0.0 ? null : _activeDownloads[rec['id']],
+                                    // Si la valeur est négative, on fait tourner le cercle à l'infini
+                                    value: _activeDownloads[rec['id']]! >= 0 ? _activeDownloads[rec['id']] : null,
                                     backgroundColor: Colors.white24,
                                     color: const Color(0xFF7EB8C9),
                                     strokeWidth: 3,
                                   ),
                                   Text(
-                                    "${(_activeDownloads[rec['id']]! * 100).toInt()}%", 
+                                    // Si positif -> Affiche le %, Si négatif -> Affiche les MO (ex: 1.5M)
+                                    _activeDownloads[rec['id']]! >= 0 
+                                      ? "${(_activeDownloads[rec['id']]! * 100).toInt()}%"
+                                      : "${(-_activeDownloads[rec['id']]! / 1024 / 1024).toStringAsFixed(1)}M", 
                                     style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)
                                   ),
                                 ],
