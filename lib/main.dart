@@ -94,9 +94,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Database? _db;
   bool _isDownloading = false;
   double? _dragValue;
-  bool _isSwitchingTrack = false;
   String? _appDirPath;
-  Map<int, double> _activeDownloads = {};
+  
+  Map<int, double> _activeDownloads = {}; 
+  int _expectedIndex = 1; // LE VERROU MAGIQUE : Empêche les sauts aléatoires
 
   @override
   void initState() {
@@ -104,12 +105,32 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    // Fin de piste : on passe à la suivante si Autoplay est activé
-    _player.playerStateStream.listen((state) {
-      if (state.processingState == ProcessingState.completed) {
-        if (loopMode == LoopModeState.autoplay && !_isSwitchingTrack) {
-          _isSwitchingTrack = true;
-          _playNext();
+    // 1. ÉCOUTEUR D'INDEX STRICT (Gère AirPlay Suivant/Précédent sans faux positifs)
+    _player.currentIndexStream.listen((index) {
+      if (index == null || index == _expectedIndex) return;
+      
+      if (index == 0) {
+        _expectedIndex = 1;
+        _playPrevious();
+      } else if (index == 2) {
+        _expectedIndex = 1;
+        _playNext();
+      }
+    });
+
+    // 2. GESTIONNAIRE DE FIN DE PISTE PROPRE
+    _player.positionStream.listen((pos) {
+      final dur = _player.duration;
+      if (dur != null && dur.inMilliseconds > 0) {
+        // Si on est à la toute fin de la piste (300ms avant la fin absolue)
+        if (pos.inMilliseconds >= dur.inMilliseconds - 300) {
+          if (loopMode == LoopModeState.off && _player.playing) {
+            // Si on ne boucle pas, on met pause proprement AVANT de déborder sur la suivante
+            _player.pause();
+            _player.seek(Duration.zero, index: 1);
+          }
+          // Note : Si l'autoplay est activé, just_audio glissera naturellement vers 
+          // la piste fantôme (index 2), ce qui déclenchera _playNext() automatiquement !
         }
       }
     });
