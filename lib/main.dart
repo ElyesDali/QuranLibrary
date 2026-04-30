@@ -115,42 +115,46 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
+  // Fonction de téléchargement avec "déguisement" iPhone
   Future<void> _startDownload(int id, String cleanUrl, File localFile) async {
-    if (_activeDownloads.containsKey(id)) return; // Empêche de lancer 2 fois le même
+    if (_activeDownloads.containsKey(id)) return; 
     
     setState(() => _activeDownloads[id] = 0.0);
     var yt = YoutubeExplode();
     try {
       var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-      var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-      var stream = yt.videos.streamsClient.get(audioStream);
+      
+      // On prend le même flux que la lecture pour garantir qu'il existe
+      var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
+      var streamInfo = mp4Muxed.isNotEmpty 
+          ? mp4Muxed.withHighestBitrate() 
+          : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
       
       final tempFile = File("${localFile.path}.tmp");
-      var fileStream = tempFile.openWrite();
       
-      var totalBytes = audioStream.size.totalBytes;
-      var bytesCount = 0;
-
-      await for (var data in stream) {
-        fileStream.add(data);
-        bytesCount += data.length;
-        if (totalBytes > 0) {
-          double progress = bytesCount / totalBytes;
-          if (mounted) setState(() => _activeDownloads[id] = progress); // Met à jour le cercle
-        }
-      }
+      // Utilisation de Dio avec l'identité Safari iOS 17 (Évite l'erreur 403 et le blocage à 0%)
+      await Dio().download(
+        streamInfo.url.toString(),
+        tempFile.path,
+        options: Options(headers: {
+          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        }),
+        onReceiveProgress: (received, total) {
+          if (total != -1 && mounted) {
+            setState(() => _activeDownloads[id] = received / total);
+          }
+        },
+      );
       
-      await fileStream.flush();
-      await fileStream.close();
-      
-      if (await tempFile.length() > 0) {
-        await tempFile.rename(localFile.path); // Valide le fichier
+      // On vérifie que le fichier n'est pas corrompu avant de le valider
+      if (await tempFile.exists() && await tempFile.length() > 500000) {
+        await tempFile.rename(localFile.path); 
       }
     } catch (e) {
       debugPrint("Erreur téléchargement: $e");
     } finally {
       yt.close();
-      if (mounted) setState(() => _activeDownloads.remove(id)); // Fait disparaître le cercle
+      if (mounted) setState(() => _activeDownloads.remove(id)); 
     }
   }
 
@@ -425,7 +429,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       ),
                       title: Text("${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}"),
                       subtitle: Text("${rec['annee'] ?? '??'} H • Versets: ${rec['versets']}"),
-                      // NOUVEAU TRAILING (Affiche le cercle de progression ou la durée)
+                      // Affiche le cercle dynamique ou le temps
                       trailing: _activeDownloads.containsKey(rec['id'])
                           ? SizedBox(
                               width: 44,
@@ -434,7 +438,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                 alignment: Alignment.center,
                                 children: [
                                   CircularProgressIndicator(
-                                    value: _activeDownloads[rec['id']],
+                                    // S'il est à 0.0, il tourne à l'infini. Sinon, il se remplit.
+                                    value: _activeDownloads[rec['id']] == 0.0 ? null : _activeDownloads[rec['id']],
                                     backgroundColor: Colors.white24,
                                     color: const Color(0xFF7EB8C9),
                                     strokeWidth: 3,
