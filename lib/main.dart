@@ -23,30 +23,6 @@ Future<void> main() async {
   runApp(const LuhaidanApp());
 }
 
-// Fonction globale de téléchargement silencieux
-Future<void> downloadYoutubeInBackground(String cleanUrl, File localFile) async {
-  var yt = YoutubeExplode();
-  try {
-    var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-    var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-    var stream = yt.videos.streamsClient.get(audioStream);
-    
-    final tempFile = File("${localFile.path}.tmp");
-    var fileStream = tempFile.openWrite();
-    await stream.pipe(fileStream);
-    await fileStream.flush();
-    await fileStream.close();
-    
-    if (await tempFile.length() > 0) {
-      await tempFile.rename(localFile.path); // Validation finale du fichier
-    }
-  } catch (e) {
-    debugPrint("Erreur background download: $e");
-  } finally {
-    yt.close();
-  }
-}
-
 const List<Map<String, dynamic>> ALL_SURAHS = [
   {"num": 1, "name": "Al-Fatiha"}, {"num": 2, "name": "Al-Baqarah"}, {"num": 3, "name": "Al-Imran"}, {"num": 4, "name": "An-Nisa"},
   {"num": 5, "name": "Al-Maidah"}, {"num": 6, "name": "Al-An'am"}, {"num": 7, "name": "Al-A'raf"}, {"num": 8, "name": "Al-Anfal"},
@@ -120,6 +96,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   double? _dragValue;
   bool _isSwitchingTrack = false;
   String? _appDirPath;
+  Map<int, double> _activeDownloads = {};
 
   @override
   void initState() {
@@ -136,6 +113,45 @@ class _LibraryScreenState extends State<LibraryScreen> {
         }
       }
     });
+  }
+
+  Future<void> _startDownload(int id, String cleanUrl, File localFile) async {
+    if (_activeDownloads.containsKey(id)) return; // Empêche de lancer 2 fois le même
+    
+    setState(() => _activeDownloads[id] = 0.0);
+    var yt = YoutubeExplode();
+    try {
+      var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
+      var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+      var stream = yt.videos.streamsClient.get(audioStream);
+      
+      final tempFile = File("${localFile.path}.tmp");
+      var fileStream = tempFile.openWrite();
+      
+      var totalBytes = audioStream.size.totalBytes;
+      var bytesCount = 0;
+
+      await for (var data in stream) {
+        fileStream.add(data);
+        bytesCount += data.length;
+        if (totalBytes > 0) {
+          double progress = bytesCount / totalBytes;
+          if (mounted) setState(() => _activeDownloads[id] = progress); // Met à jour le cercle
+        }
+      }
+      
+      await fileStream.flush();
+      await fileStream.close();
+      
+      if (await tempFile.length() > 0) {
+        await tempFile.rename(localFile.path); // Valide le fichier
+      }
+    } catch (e) {
+      debugPrint("Erreur téléchargement: $e");
+    } finally {
+      yt.close();
+      if (mounted) setState(() => _activeDownloads.remove(id)); // Fait disparaître le cercle
+    }
   }
 
   // NOUVEAU : VÉRIFICATION EXPRESS DE LA CONNEXION (Empêche le chargement infini)
@@ -275,7 +291,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             finalSource = _buildSource(streamInfo.url, currentMediaItem);
             
             // On relance la sauvegarde en arrière-plan
-            downloadYoutubeInBackground(cleanUrl, localFile);
+            _startDownload(rec['id'], cleanUrl, localFile);
           } finally {
             yt.close();
           }
@@ -409,7 +425,28 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       ),
                       title: Text("${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}"),
                       subtitle: Text("${rec['annee'] ?? '??'} H • Versets: ${rec['versets']}"),
-                      trailing: Text(rec['duration'] ?? "--:--", style: const TextStyle(color: Colors.grey, fontSize: 12)),
+                      // NOUVEAU TRAILING (Affiche le cercle de progression ou la durée)
+                      trailing: _activeDownloads.containsKey(rec['id'])
+                          ? SizedBox(
+                              width: 44,
+                              height: 44,
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  CircularProgressIndicator(
+                                    value: _activeDownloads[rec['id']],
+                                    backgroundColor: Colors.white24,
+                                    color: const Color(0xFF7EB8C9),
+                                    strokeWidth: 3,
+                                  ),
+                                  Text(
+                                    "${(_activeDownloads[rec['id']]! * 100).toInt()}%", 
+                                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)
+                                  ),
+                                ],
+                              ),
+                            )
+                          : Text(rec['duration'] ?? "--:--", style: const TextStyle(color: Colors.grey, fontSize: 12)),
                       onTap: () => _play(rec),
                       onLongPress: () => _showOptions(rec),
                     );
@@ -681,7 +718,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   void _showForm({Map<String, dynamic>? rec}) {
-    showDialog(context: context, builder: (context) => FormDialog(rec: rec, onSave: _fetch, db: _db));
+  showDialog(
+    context: context, 
+    builder: (context) => FormDialog(
+      rec: rec, 
+      onSave: _fetch, 
+      db: _db,
+      onDownload: (id, url, file) => _startDownload(id, url, file), // Relais du téléchargement
+    )
+  );
   }
 }
 
@@ -689,9 +734,9 @@ class FormDialog extends StatefulWidget {
   final Map<String, dynamic>? rec;
   final VoidCallback onSave;
   final Database? db;
-  
-  const FormDialog({super.key, this.rec, required this.onSave, this.db});
-  
+  final Function(int, String, File)? onDownload; // NOUVELLE LIGNE
+
+  const FormDialog({super.key, this.rec, required this.onSave, this.db, this.onDownload});
   @override
   State<FormDialog> createState() => _FormDialogState();
 }
@@ -906,12 +951,13 @@ class _FormDialogState extends State<FormDialog> {
               }
 
               if (!isLocal && _ytUrl.text.isNotEmpty) {
-                final cleanUrl = _ytUrl.text.split('?').first;
-                final dir = await getApplicationDocumentsDirectory();
-                final localAudioFile = File(p.join(dir.path, "yt_$recordId.mp4"));
-                if (!await localAudioFile.exists()) {
-                  downloadYoutubeInBackground(cleanUrl, localAudioFile);
-                }
+              final cleanUrl = _ytUrl.text.split('?').first;
+              final dir = await getApplicationDocumentsDirectory();
+              final localAudioFile = File(p.join(dir.path, "yt_$recordId.mp4"));
+              if (!await localAudioFile.exists()) {
+                // Déclenche l'animation dans l'interface principale
+                widget.onDownload?.call(recordId, cleanUrl, localAudioFile); 
+              }
               }
               
               widget.onSave();
