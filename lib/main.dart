@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/services.dart';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:async'; // Ajouté pour le TimeoutException
+import 'dart:async';
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:file_picker/file_picker.dart';
@@ -21,6 +22,29 @@ Future<void> main() async {
     androidNotificationOngoing: true,
   );
   runApp(const LuhaidanApp());
+}
+
+Future<void> downloadYoutubeInBackground(String cleanUrl, File localFile) async {
+  var yt = YoutubeExplode();
+  try {
+    var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
+    var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+    var stream = yt.videos.streamsClient.get(audioStream);
+    
+    final tempFile = File("${localFile.path}.tmp");
+    var fileStream = tempFile.openWrite();
+    await stream.pipe(fileStream);
+    await fileStream.flush();
+    await fileStream.close();
+    
+    if (await tempFile.length() > 0) {
+      await tempFile.rename(localFile.path);
+    }
+  } catch (e) {
+    debugPrint("Erreur DL: $e");
+  } finally {
+    yt.close();
+  }
 }
 
 const List<Map<String, dynamic>> ALL_SURAHS = [
@@ -94,10 +118,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Database? _db;
   bool _isDownloading = false;
   double? _dragValue;
+  bool _isSwitchingTrack = false;
   String? _appDirPath;
-  
   Map<int, double> _activeDownloads = {}; 
-  int _expectedIndex = 1; // LE VERROU MAGIQUE : Empêche les sauts aléatoires
+
+  Timer? _sleepTimer;
+  int _selectedTimerMinutes = 15;
 
   @override
   void initState() {
@@ -105,108 +131,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    // 1. ÉCOUTEUR D'INDEX STRICT (Gère AirPlay Suivant/Précédent sans faux positifs)
-    _player.currentIndexStream.listen((index) {
-      if (index == null || index == _expectedIndex) return;
-      
-      if (index == 0) {
-        _expectedIndex = 1;
-        _playPrevious();
-      } else if (index == 2) {
-        _expectedIndex = 1;
-        _playNext();
-      }
-    });
-
-    // 2. GESTIONNAIRE DE FIN DE PISTE PROPRE
-    _player.positionStream.listen((pos) {
-      final dur = _player.duration;
-      if (dur != null && dur.inMilliseconds > 0) {
-        // Si on est à la toute fin de la piste (300ms avant la fin absolue)
-        if (pos.inMilliseconds >= dur.inMilliseconds - 300) {
-          if (loopMode == LoopModeState.off && _player.playing) {
-            // Si on ne boucle pas, on met pause proprement AVANT de déborder sur la suivante
-            _player.pause();
-            _player.seek(Duration.zero, index: 1);
-          }
-          // Note : Si l'autoplay est activé, just_audio glissera naturellement vers 
-          // la piste fantôme (index 2), ce qui déclenchera _playNext() automatiquement !
+    _player.playerStateStream.listen((state) {
+      if (state.processingState == ProcessingState.completed) {
+        if (loopMode == LoopModeState.autoplay && !_isSwitchingTrack) {
+          _isSwitchingTrack = true;
+          _playNext();
+        } else if (loopMode == LoopModeState.off) {
+          _player.pause();
+          _player.seek(Duration.zero);
         }
       }
     });
-  }
-
-  Future<void> _startDownload(int id, String cleanUrl, File localFile) async {
-    if (_activeDownloads.containsKey(id)) return; 
-    
-    setState(() => _activeDownloads[id] = 0.0);
-    var yt = YoutubeExplode();
-    
-    try {
-      var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-      
-      // Le flux Muxed (Audio + Vidéo basique) est beaucoup moins bridé par YouTube que le flux Audio seul.
-      var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
-      var streamInfo = mp4Muxed.isNotEmpty 
-          ? mp4Muxed.withHighestBitrate() 
-          : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-      
-      final tempFile = File("${localFile.path}.tmp");
-      int lastUpdateValue = 0;
-      
-      // Utilisation de Dio en mode brut (Respecte la signature YouTube)
-      await Dio().download(
-        streamInfo.url.toString(),
-        tempFile.path,
-        onReceiveProgress: (received, total) {
-          if (total != -1) {
-            // YouTube donne la taille : On affiche un vrai pourcentage (0% à 100%)
-            int percentage = ((received / total) * 100).toInt();
-            // On limite le rafraîchissement à 1% pour ne pas figer l'iPhone
-            if (percentage != lastUpdateValue) {
-              lastUpdateValue = percentage;
-              if (mounted) setState(() => _activeDownloads[id] = percentage / 100.0);
-            }
-          } else {
-            // YouTube CACHE la taille (total = -1). 
-            // On utilise une valeur négative pour dire à l'interface d'afficher les MO au lieu du %
-            int megabyteStep = (received / 500000).toInt(); // Maj tous les 500 Ko
-            if (megabyteStep != lastUpdateValue) {
-              lastUpdateValue = megabyteStep;
-              if (mounted) setState(() => _activeDownloads[id] = -(received.toDouble()));
-            }
-          }
-        },
-      );
-      
-      if (await tempFile.exists() && await tempFile.length() > 500000) {
-        if (await localFile.exists()) await localFile.delete(); // Sécurité nettoyage
-        await tempFile.rename(localFile.path); 
-      } else {
-        throw Exception("Fichier corrompu ou trop petit.");
-      }
-    } catch (e) {
-      debugPrint("Erreur téléchargement: $e");
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text("❌ Échec du DL : $e"), 
-          backgroundColor: Colors.red
-        ));
-      }
-    } finally {
-      yt.close();
-      if (mounted) setState(() => _activeDownloads.remove(id)); 
-    }
-  } 
-
-  // NOUVEAU : VÉRIFICATION EXPRESS DE LA CONNEXION (Empêche le chargement infini)
-  Future<bool> _hasInternet() async {
-    try {
-      final result = await InternetAddress.lookup('youtube.com').timeout(const Duration(seconds: 2));
-      return result.isNotEmpty && result[0].rawAddress.isNotEmpty;
-    } catch (_) {
-      return false;
-    }
   }
 
   Future<void> _initApp() async {
@@ -217,11 +152,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _db = await openDatabase(
       path,
       version: 2,
-      onCreate: (db, version) {
-        db.execute(
-          'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, fichier TEXT, versets TEXT, annee_g INTEGER, thumbnail TEXT, duration TEXT)'
-        );
-      },
+      onCreate: (db, version) => db.execute(
+        'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, fichier TEXT, versets TEXT, annee_g INTEGER, thumbnail TEXT, duration TEXT)'
+      ),
       onUpgrade: (db, oldV, newV) {
         if (oldV < 2) {
           db.execute('ALTER TABLE recitations ADD COLUMN thumbnail TEXT');
@@ -252,7 +185,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  // Reconstruit les adresses de fichiers même si Apple change le dossier caché de l'appli
   String _resolvePath(String pathStr) {
     if (pathStr.startsWith('http')) return pathStr;
     if (pathStr.startsWith('/')) return pathStr; 
@@ -292,20 +224,65 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return base;
   }
 
-  // NOUVEAU : Crée une piste fantôme de 1 milliseconde pour tromper iOS
-  // Ça force l'activation des boutons AirPlay sans créer de bugs de cache
-  AudioSource _buildDummySource(Uri uri, MediaItem mediaItem) {
-    final base = AudioSource.uri(uri, tag: mediaItem);
-    return ClippingAudioSource(
-      child: base, 
-      start: Duration.zero, 
-      end: const Duration(milliseconds: 1), // Invisible à l'oreille !
-      tag: mediaItem
-    );
+  Future<void> _startDownload(int id, String cleanUrl, File localFile) async {
+    if (_activeDownloads.containsKey(id)) return; 
+    
+    setState(() => _activeDownloads[id] = 0.0);
+    var yt = YoutubeExplode();
+    
+    try {
+      var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
+      var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
+      var streamInfo = mp4Muxed.isNotEmpty 
+          ? mp4Muxed.withHighestBitrate() 
+          : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+      
+      final tempFile = File("${localFile.path}.tmp");
+      int lastUpdateValue = 0;
+      
+      await Dio().download(
+        streamInfo.url.toString(),
+        tempFile.path,
+        onReceiveProgress: (received, total) {
+          if (total != -1) {
+            int percentage = ((received / total) * 100).toInt();
+            if (percentage != lastUpdateValue) {
+              lastUpdateValue = percentage;
+              if (mounted) {
+                setState(() => _activeDownloads[id] = percentage / 100.0);
+              }
+            }
+          } else {
+            int megabyteStep = (received / 500000).toInt(); 
+            if (megabyteStep != lastUpdateValue) {
+              lastUpdateValue = megabyteStep;
+              if (mounted) {
+                setState(() => _activeDownloads[id] = -(received.toDouble()));
+              }
+            }
+          }
+        },
+      );
+      
+      if (await tempFile.exists() && await tempFile.length() > 500000) {
+        if (await localFile.exists()) await localFile.delete(); 
+        await tempFile.rename(localFile.path); 
+      } else {
+        throw Exception("Fichier corrompu.");
+      }
+    } catch (e) {
+      debugPrint("Erreur téléchargement: $e");
+    } finally {
+      yt.close();
+      if (mounted) {
+        setState(() => _activeDownloads.remove(id));
+      }
+    }
   }
 
   Future<void> _play(Map<String, dynamic> rec) async {
-    _expectedIndex = 1; // On dit au lecteur qu'on s'attend à être sur la piste centrale
+    _isSwitchingTrack = true;
+    await _player.stop(); 
     
     setState(() {
       currentRecitation = rec;
@@ -313,6 +290,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
 
     if (rec['fichier'] == null) {
+      _isSwitchingTrack = false;
       setState(() => _isDownloading = false);
       return;
     }
@@ -320,7 +298,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     String path = rec['fichier'];
     final currentMediaItem = _createMediaItem(rec);
     AudioSource finalSource;
-    Uri realUri;
 
     try {
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
@@ -329,17 +306,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final localFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
 
         if (await localFile.exists() && await localFile.length() > 500000) {
-           realUri = Uri.file(localFile.path);
-           finalSource = _buildSource(realUri, currentMediaItem);
+           finalSource = _buildSource(Uri.file(localFile.path), currentMediaItem);
         } else {
           var yt = YoutubeExplode();
           try {
             var manifest = await yt.videos.streamsClient.getManifest(cleanUrl).timeout(const Duration(seconds: 5));
             var streamInfo = manifest.muxed.withHighestBitrate();
-            realUri = streamInfo.url;
-            finalSource = _buildSource(realUri, currentMediaItem);
+            finalSource = _buildSource(streamInfo.url, currentMediaItem);
             
-            _startDownload(rec['id'], cleanUrl, localFile); // Lancement du cercle %
+            _startDownload(rec['id'], cleanUrl, localFile); 
           } catch (e) {
             throw Exception("Fichier non disponible hors-ligne");
           } finally {
@@ -349,32 +324,24 @@ class _LibraryScreenState extends State<LibraryScreen> {
       } else {
         final file = File(_resolvePath(path));
         if (await file.exists()) {
-          realUri = Uri.file(file.path);
-          finalSource = _buildSource(realUri, currentMediaItem);
+          finalSource = _buildSource(Uri.file(file.path), currentMediaItem);
         } else {
-          throw Exception("Fichier introuvable sur le disque");
+          throw Exception("Fichier local introuvable");
         }
       }
 
-      // LA PLAYLIST MAGIQUE : 3 pistes, dont 2 fantômes !
-      int currIdx = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
-      int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
-      int nextIdx = (currIdx + 1) % displayedRecitations.length;
-
-      var playlist = ConcatenatingAudioSource(children: [
-         _buildDummySource(realUri, _createMediaItem(displayedRecitations[prevIdx])),
-         finalSource,                                                     
-         _buildDummySource(realUri, _createMediaItem(displayedRecitations[nextIdx])),
-      ]);
-
-      // Le setAudioSource écrase et remplace l'ancienne lecture instantanément (sans bug)
-      await _player.setAudioSource(playlist, initialIndex: 1);
+      await _player.setAudioSource(finalSource);
       _player.play();
 
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red)
+        );
+      }
     } finally {
       setState(() => _isDownloading = false);
+      Future.delayed(const Duration(milliseconds: 300), () => _isSwitchingTrack = false);
     }
   }
 
@@ -401,10 +368,82 @@ class _LibraryScreenState extends State<LibraryScreen> {
         loopMode = LoopModeState.off;
         _player.setLoopMode(LoopMode.off);
       }
+      
       if (loopMode != LoopModeState.one) {
         _player.setLoopMode(LoopMode.off);
       }
     });
+  }
+
+  void _showTimerDialog() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF111111),
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return Container(
+              height: 300,
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                children: [
+                  const Text(
+                    "Minuteur de mise en veille", 
+                    style: TextStyle(color: Color(0xFF7EB8C9), fontSize: 18, fontWeight: FontWeight.bold)
+                  ),
+                  const SizedBox(height: 10),
+                  Expanded(
+                    child: CupertinoTheme(
+                      data: const CupertinoThemeData(
+                        textTheme: CupertinoTextThemeData(
+                          dateTimePickerTextStyle: TextStyle(color: Colors.white, fontSize: 22)
+                        ),
+                      ),
+                      child: CupertinoPicker(
+                        itemExtent: 40,
+                        scrollController: FixedExtentScrollController(initialItem: _selectedTimerMinutes - 1),
+                        onSelectedItemChanged: (idx) {
+                          setModalState(() => _selectedTimerMinutes = idx + 1);
+                        },
+                        children: List.generate(60, (index) => Center(child: Text("${index + 1} min"))),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      if (_sleepTimer != null && _sleepTimer!.isActive)
+                        TextButton(
+                          onPressed: () {
+                            _sleepTimer?.cancel();
+                            setState(() {}); 
+                            Navigator.pop(context);
+                          },
+                          child: const Text("Désactiver", style: TextStyle(color: Colors.red)),
+                        ),
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
+                        onPressed: () {
+                          _sleepTimer?.cancel();
+                          _sleepTimer = Timer(Duration(minutes: _selectedTimerMinutes), () {
+                            _player.pause();
+                            setState(() {}); 
+                          });
+                          setState(() {}); 
+                          Navigator.pop(context);
+                        },
+                        child: const Text("Démarrer", style: TextStyle(color: Colors.white)),
+                      ),
+                    ],
+                  )
+                ],
+              ),
+            );
+          }
+        );
+      }
+    );
   }
 
   String _formatDuration(Duration d) {
@@ -480,29 +519,24 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     return ListTile(
                       selected: currentRecitation?['id'] == rec['id'],
                       leading: ClipRRect(
-                        borderRadius: BorderRadius.circular(6),
-                        child: _buildThumbnail(rec['thumbnail']),
+                        borderRadius: BorderRadius.circular(6), 
+                        child: _buildThumbnail(rec['thumbnail'])
                       ),
                       title: Text("${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}"),
                       subtitle: Text("${rec['annee'] ?? '??'} H • Versets: ${rec['versets']}"),
-                      // Affiche le cercle dynamique ou le temps
-                      // Affiche le cercle dynamique (en % ou en Mégaoctets) ou le temps
                       trailing: _activeDownloads.containsKey(rec['id'])
                           ? SizedBox(
-                              width: 44,
-                              height: 44,
+                              width: 44, height: 44,
                               child: Stack(
                                 alignment: Alignment.center,
                                 children: [
                                   CircularProgressIndicator(
-                                    // Si la valeur est négative, on fait tourner le cercle à l'infini
                                     value: _activeDownloads[rec['id']]! >= 0 ? _activeDownloads[rec['id']] : null,
-                                    backgroundColor: Colors.white24,
-                                    color: const Color(0xFF7EB8C9),
+                                    backgroundColor: Colors.white24, 
+                                    color: const Color(0xFF7EB8C9), 
                                     strokeWidth: 3,
                                   ),
                                   Text(
-                                    // Si positif -> Affiche le %, Si négatif -> Affiche les MO (ex: 1.5M)
                                     _activeDownloads[rec['id']]! >= 0 
                                       ? "${(_activeDownloads[rec['id']]! * 100).toInt()}%"
                                       : "${(-_activeDownloads[rec['id']]! / 1024 / 1024).toStringAsFixed(1)}M", 
@@ -518,13 +552,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   },
                 ),
                 Positioned(
-                  bottom: 16,
-                  right: 24,
+                  bottom: 16, 
+                  right: 24, 
                   child: FloatingActionButton(
-                    onPressed: () => _showForm(),
-                    backgroundColor: const Color(0xFF4A8FA3),
-                    child: const Icon(Icons.add, color: Colors.white, size: 30),
-                  ),
+                    onPressed: () => _showForm(), 
+                    backgroundColor: const Color(0xFF4A8FA3), 
+                    child: const Icon(Icons.add, color: Colors.white, size: 30)
+                  )
                 ),
               ],
             ),
@@ -549,57 +583,46 @@ class _LibraryScreenState extends State<LibraryScreen> {
             ),
           Text(
             "${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}", 
-            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)
+            style: const TextStyle(fontWeight: FontWeight.bold)
           ),
-          Text(
-            "${currentRecitation!['annee'] ?? '??'} H • Versets: ${currentRecitation!['versets']}", 
-            style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82))
-          ),
-          const SizedBox(height: 8),
           StreamBuilder<Duration>(
             stream: _player.positionStream,
             builder: (context, snapshot) {
               final pos = snapshot.data ?? Duration.zero;
               final dur = _player.duration ?? Duration.zero;
-              
               double maxDur = dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0;
-              double sliderVal = _dragValue ?? pos.inSeconds.toDouble();
+              double sliderVal = _dragValue ?? pos.inSeconds.toDouble().clamp(0, maxDur);
               
-              if (sliderVal < 0) sliderVal = 0;
-              if (sliderVal > maxDur) sliderVal = maxDur;
-
-              String currentTimeText = _formatDuration(Duration(seconds: sliderVal.toInt()));
-
               return Column(
                 children: [
                   SliderTheme(
                     data: SliderTheme.of(context).copyWith(
-                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0),
-                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 14.0),
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0), 
+                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 14.0)
                     ),
                     child: Slider(
-                      activeColor: const Color(0xFF7EB8C9),
+                      activeColor: const Color(0xFF7EB8C9), 
                       inactiveColor: Colors.white24,
-                      value: sliderVal,
+                      value: sliderVal, 
                       max: maxDur,
-                      onChanged: (v) {
-                        setState(() {
-                          _dragValue = v;
-                        });
-                      },
+                      onChanged: (v) => setState(() => _dragValue = v),
                       onChangeEnd: (v) {
                         _player.seek(Duration(seconds: v.toInt()));
-                        setState(() {
-                          _dragValue = null;
-                        });
+                        setState(() => _dragValue = null);
                       },
                     ),
                   ),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween, 
                     children: [
-                      Text(currentTimeText, style: const TextStyle(fontSize: 11, color: Colors.grey)), 
-                      Text(_formatDuration(dur), style: const TextStyle(fontSize: 11, color: Colors.grey))
+                      Text(
+                        _formatDuration(Duration(seconds: sliderVal.toInt())), 
+                        style: const TextStyle(fontSize: 11, color: Colors.grey)
+                      ), 
+                      Text(
+                        _formatDuration(dur), 
+                        style: const TextStyle(fontSize: 11, color: Colors.grey)
+                      )
                     ]
                   ),
                 ],
@@ -624,10 +647,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 stream: _player.playerStateStream,
                 builder: (context, snapshot) {
                   final state = snapshot.data;
-                  final processingState = state?.processingState;
                   final playing = state?.playing ?? false;
-
-                  if (processingState == ProcessingState.loading || processingState == ProcessingState.buffering) {
+                  
+                  if (state?.processingState == ProcessingState.loading || state?.processingState == ProcessingState.buffering) {
                     return Container(
                       margin: const EdgeInsets.symmetric(horizontal: 16), 
                       width: 48, 
@@ -636,15 +658,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     );
                   }
                   
-                  bool showPlayIcon = !playing || processingState == ProcessingState.completed;
-
+                  bool showPlayIcon = !playing || state?.processingState == ProcessingState.completed;
                   return IconButton(
                     iconSize: 64, 
                     icon: Icon(showPlayIcon ? Icons.play_circle : Icons.pause_circle, color: const Color(0xFF7EB8C9)), 
                     onPressed: () async {
                       if (showPlayIcon) {
-                        if (processingState == ProcessingState.completed) {
-                          await _player.seek(Duration.zero, index: 1); 
+                        if (state?.processingState == ProcessingState.completed) {
+                          await _player.seek(Duration.zero);
                         }
                         _player.play();
                       } else {
@@ -659,11 +680,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 onPressed: _playNext
               ),
               IconButton(
-                icon: const Icon(Icons.stop, size: 28, color: Colors.grey), 
-                onPressed: () {
-                  _player.stop();
-                  _player.seek(Duration.zero, index: 1);
-                }
+                icon: Icon(
+                  _sleepTimer != null && _sleepTimer!.isActive ? Icons.timer : Icons.timer_off, 
+                  color: _sleepTimer != null && _sleepTimer!.isActive ? const Color(0xFF7EB8C9) : Colors.grey,
+                  size: 28
+                ), 
+                onPressed: _showTimerDialog
               ),
             ],
           ),
@@ -673,53 +695,28 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Widget _buildDrawer() {
-    final Map<int, int?> yearMap = {};
-    for (var r in allRecitations) {
-      if (r['annee'] != null) {
-        yearMap[r['annee'] as int] = r['annee_g'] as int?;
-      }
-    }
-    final years = yearMap.keys.toList()..sort((a, b) => b.compareTo(a));
-
+    final years = allRecitations.map((r) => r['annee']).whereType<int>().toSet().toList()..sort((a, b) => b.compareTo(a));
     return Drawer(
       backgroundColor: const Color(0xFF0A0A0A),
       child: ListView(
         children: [
-          const DrawerHeader(
-            child: Center(
-              child: Text("FILTRER PAR ANNÉE", style: TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold))
-            )
-          ),
+          const DrawerHeader(child: Center(child: Text("FILTRES", style: TextStyle(color: Color(0xFF7EB8C9))))),
           ListTile(
-            title: const Text("Toutes les récitations"), 
-            selected: selectedYearFilter == null, 
+            title: const Text("Toutes"), 
             onTap: () { 
               setState(() => selectedYearFilter = null); 
               _applyFilters(); 
               Navigator.pop(context); 
             }
           ),
-          ListTile(
-            title: const Text("Année inconnue"), 
-            selected: selectedYearFilter == -1, 
+          ...years.map((y) => ListTile(
+            title: Text("$y H"), 
             onTap: () { 
-              setState(() => selectedYearFilter = -1); 
+              setState(() => selectedYearFilter = y); 
               _applyFilters(); 
               Navigator.pop(context); 
             }
-          ),
-          const Divider(color: Colors.white24),
-          ...years.map((y) {
-            return ListTile(
-              title: Text("$y H"),
-              selected: selectedYearFilter == y,
-              onTap: () { 
-                setState(() => selectedYearFilter = y); 
-                _applyFilters(); 
-                Navigator.pop(context); 
-              },
-            );
-          }),
+          )),
         ],
       ),
     );
@@ -727,71 +724,46 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   void _showOptions(Map<String, dynamic> rec) {
     showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF111111),
-      builder: (context) => Column(
-        mainAxisSize: MainAxisSize.min,
+      context: context, 
+      backgroundColor: const Color(0xFF111111), 
+      builder: (context) => Wrap(
         children: [
           ListTile(
-            leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)),
-            title: const Text("Modifier"),
+            leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)), 
+            title: const Text("Modifier"), 
             onTap: () { 
               Navigator.pop(context); 
               _showForm(rec: rec); 
-            },
+            }
           ),
           ListTile(
-            leading: const Icon(Icons.delete, color: Colors.red),
-            title: const Text("Supprimer", style: TextStyle(color: Colors.red)),
+            leading: const Icon(Icons.delete, color: Colors.red), 
+            title: const Text("Supprimer"), 
             onTap: () async {
               if (currentRecitation?['id'] == rec['id']) {
                 await _player.stop();
-                setState(() => currentRecitation = null);
               }
-              
               await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
-              
               try {
                 final dir = await getApplicationDocumentsDirectory();
-                
-                // Suppression de la miniature
-                if (rec['thumbnail'] != null && !rec['thumbnail'].toString().startsWith('http')) {
-                  final t = File(_resolvePath(rec['thumbnail']));
-                  if (await t.exists()) await t.delete();
-                }
-                
-                // Suppression du fichier audio
-                String path = rec['fichier'] ?? "";
-                if (path.contains('youtube') || path.contains('youtu.be') || path.contains('shorts')) {
-                  final f = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
-                  if (await f.exists()) await f.delete();
-                } else {
-                  final f = File(p.join(dir.path, path));
-                  if (await f.exists()) await f.delete();
-                }
-              } catch (e) {
-                debugPrint("Erreur suppression fichiers: $e");
-              }
+                final f = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
+                if (await f.exists()) await f.delete();
+              } catch (_) {}
               
-              _fetch();
+              _fetch(); 
               if (mounted) Navigator.pop(context);
-            },
+            }
           ),
-        ],
-      ),
+        ]
+      )
     );
   }
 
   void _showForm({Map<String, dynamic>? rec}) {
-  showDialog(
-    context: context, 
-    builder: (context) => FormDialog(
-      rec: rec, 
-      onSave: _fetch, 
-      db: _db,
-      onDownload: (id, url, file) => _startDownload(id, url, file), // Relais du téléchargement
-    )
-  );
+    showDialog(
+      context: context, 
+      builder: (context) => FormDialog(rec: rec, onSave: _fetch, db: _db)
+    );
   }
 }
 
@@ -799,10 +771,10 @@ class FormDialog extends StatefulWidget {
   final Map<String, dynamic>? rec;
   final VoidCallback onSave;
   final Database? db;
-  final Function(int, String, File)? onDownload; // NOUVELLE LIGNE
-
-  const FormDialog({super.key, this.rec, required this.onSave, this.db, this.onDownload});
-  @override
+  
+  const FormDialog({super.key, this.rec, required this.onSave, this.db});
+  
+  @override 
   State<FormDialog> createState() => _FormDialogState();
 }
 
@@ -810,7 +782,7 @@ class _FormDialogState extends State<FormDialog> {
   int? selectedNum = 1;
   String? selectedName = "Al-Fatiha";
   late TextEditingController _year, _file, _ytUrl, _vStart, _vEnd;
-  bool isLocal = true;
+  bool isLocal = true; 
   bool isFull = true;
 
   @override
@@ -826,46 +798,34 @@ class _FormDialogState extends State<FormDialog> {
     _year = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
     _file = TextEditingController(text: (widget.rec != null && isLocal) ? widget.rec!['fichier'] : "");
     _ytUrl = TextEditingController(text: (widget.rec != null && !isLocal) ? widget.rec!['fichier'] : "");
-    _vStart = TextEditingController();
+    _vStart = TextEditingController(); 
     _vEnd = TextEditingController();
-    
-    if (!isFull) {
-      List<String> parts = widget.rec!['versets'].split('-');
-      if (parts.length == 2) { 
-        _vStart.text = parts[0]; 
-        _vEnd.text = parts[1]; 
-      }
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: const Color(0xFF111111),
-      title: Text(widget.rec == null ? "Ajouter" : "Modifier", style: const TextStyle(color: Color(0xFF7EB8C9))),
+      title: Text(widget.rec == null ? "Ajouter" : "Modifier"),
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             DropdownMenu<Map<String, dynamic>>(
               initialSelection: widget.rec != null ? ALL_SURAHS.firstWhere((s) => s['num'] == widget.rec!['sourate_num']) : ALL_SURAHS[0],
-              width: 280, 
-              label: const Text("Sourate"), 
-              enableSearch: true,
-              dropdownMenuEntries: ALL_SURAHS.map((s) => DropdownMenuEntry(value: s, label: "${s['num']} - ${s['name']}")).toList(),
               onSelected: (s) { 
                 selectedNum = s?['num']; 
                 selectedName = s?['name']; 
               },
+              dropdownMenuEntries: ALL_SURAHS.map((s) => DropdownMenuEntry(value: s, label: "${s['num']} - ${s['name']}")).toList(),
             ),
-            const SizedBox(height: 15),
+            const SizedBox(height: 10),
             TextField(
               controller: _year, 
               keyboardType: TextInputType.number, 
-              decoration: const InputDecoration(labelText: "Année (H ou G)")
+              decoration: const InputDecoration(labelText: "Année (H)")
             ),
-            const SizedBox(height: 15),
-            const Text("Étendue :"),
+            const SizedBox(height: 10),
             Row(
               children: [
                 Radio(value: true, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), 
@@ -874,15 +834,6 @@ class _FormDialogState extends State<FormDialog> {
                 const Text("Partiel"),
               ]
             ),
-            if (!isFull) Row(
-              children: [
-                Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
-                const SizedBox(width: 10),
-                Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
-              ]
-            ),
-            const SizedBox(height: 15),
-            const Text("Source :"),
             Row(
               children: [
                 Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), 
@@ -891,151 +842,96 @@ class _FormDialogState extends State<FormDialog> {
                 const Text("YouTube"),
               ]
             ),
-            if (isLocal) Column(
-              crossAxisAlignment: CrossAxisAlignment.start, 
-              children: [
-                const SizedBox(height: 10),
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.grey[800], 
-                    foregroundColor: Colors.white, 
-                    minimumSize: const Size(double.infinity, 45)
-                  ),
-                  icon: const Icon(Icons.folder_open), 
-                  label: const Text("Parcourir l'iPhone..."),
-                  onPressed: () async {
-                    try {
-                      FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any); 
-                      if (result != null) {
-                        final file = result.files.single;
-                        final dir = await getApplicationDocumentsDirectory();
-                        await File(file.path!).copy(p.join(dir.path, file.name));
-                        setState(() => _file.text = file.name);
-                      }
-                    } catch (e) {
-                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur fichiers : $e"), backgroundColor: Colors.red));
-                    }
+            const SizedBox(height: 10),
+            if (isLocal) 
+              ElevatedButton(
+                onPressed: () async {
+                  FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any); 
+                  if (result != null) {
+                    final file = result.files.single;
+                    final dir = await getApplicationDocumentsDirectory();
+                    await File(file.path!).copy(p.join(dir.path, file.name));
+                    setState(() => _file.text = file.name);
                   }
-                ),
-                if (_file.text.isNotEmpty) 
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8.0), 
-                    child: Text("🎵 Fichier sélectionné : \n${_file.text}", style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 13))
-                  ),
-              ]
-            )
-            else TextField(
-              controller: _ytUrl, 
-              decoration: const InputDecoration(labelText: "Lien YouTube ou Shorts")
-            ),
+                }, 
+                child: const Text("Choisir fichier")
+              )
+            else 
+              TextField(
+                controller: _ytUrl, 
+                decoration: const InputDecoration(labelText: "Lien YouTube")
+              ),
           ],
         ),
       ),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text("Annuler")),
         ElevatedButton(
-          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
           onPressed: () async {
-            if (selectedNum == null) {
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("⚠️ Vous devez sélectionner une sourate"), backgroundColor: Colors.red));
-              return;
-            }
-
-            try {
-              String thumb = widget.rec?['thumbnail'] ?? "";
-              String dur = widget.rec?['duration'] ?? "";
-
-              if (!isLocal && _ytUrl.text.isNotEmpty && (widget.rec == null || _ytUrl.text != widget.rec?['fichier'])) {
-                var yt = YoutubeExplode();
-                try {
-                  var video = await yt.videos.get(_ytUrl.text.split('?').first).timeout(const Duration(seconds: 10));
-                  String remoteThumb = video.thumbnails.highResUrl;
-                  if (remoteThumb.isEmpty) {
-                    remoteThumb = video.thumbnails.standardResUrl;
-                  }
-                  
-                  dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
-                  
-                  try {
-                    final dir = await getApplicationDocumentsDirectory();
-                    final thumbName = "thumb_yt_${video.id}.jpg";
-                    final thumbFile = File(p.join(dir.path, thumbName));
-                    await Dio().download(remoteThumb, thumbFile.path);
-                    thumb = thumbName; 
-                  } catch (e) {
-                    thumb = remoteThumb; 
-                  }
-                } catch (e) {
-                  debugPrint("Erreur YouTube: $e");
-                } finally {
-                  yt.close();
-                }
-              } 
-              else if (isLocal && _file.text.isNotEmpty && (widget.rec == null || _file.text != widget.rec?['fichier'])) {
-                final dir = await getApplicationDocumentsDirectory();
-                final localFilePath = p.join(dir.path, _file.text);
-                
-                // CORRECTION : On utilise les métadonnées pour TOUT (Durée + Image)
-                // Fini le crash du double lecteur audio !
-                try {
-                  final metadata = await MetadataRetriever.fromFile(File(localFilePath));
-                  
-                  if (metadata.trackDuration != null) {
-                    final d = Duration(milliseconds: metadata.trackDuration!);
-                    dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
-                  }
-
-                  if (metadata.albumArt != null) {
-                    final thumbName = "thumb_${_file.text}.jpg";
-                    final artFile = File(p.join(dir.path, thumbName));
-                    await artFile.writeAsBytes(metadata.albumArt!);
-                    thumb = thumbName; 
-                  }
-                } catch (e) {
-                  debugPrint("Erreur metadata: $e");
-                }
-              }
-
-              String versets = isFull ? "complet" : "${_vStart.text}-${_vEnd.text}";
-              final data = {
-                "sourate_num": selectedNum,
-                "sourate_name": selectedName,
-                "annee": int.tryParse(_year.text),
-                "fichier": isLocal ? _file.text : _ytUrl.text,
-                "versets": versets,
-                "thumbnail": thumb,
-                "duration": dur,
-              };
-
-              int recordId;
-              if (widget.rec == null) {
-                recordId = await widget.db!.insert('recitations', data);
-              } else {
-                recordId = widget.rec!['id'];
-                await widget.db!.update('recitations', data, where: 'id = ?', whereArgs: [recordId]);
-              }
-
-              if (!isLocal && _ytUrl.text.isNotEmpty) {
-              final cleanUrl = _ytUrl.text.split('?').first;
-              final dir = await getApplicationDocumentsDirectory();
-              final localAudioFile = File(p.join(dir.path, "yt_$recordId.mp4"));
-              if (!await localAudioFile.exists()) {
-                // Déclenche l'animation dans l'interface principale
-                widget.onDownload?.call(recordId, cleanUrl, localAudioFile); 
-              }
-              }
+            String thumb = widget.rec?['thumbnail'] ?? "";
+            String dur = widget.rec?['duration'] ?? "";
+            
+            if (!isLocal && _ytUrl.text.isNotEmpty) {
+              var yt = YoutubeExplode();
+              var video = await yt.videos.get(_ytUrl.text.split('?').first);
+              dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
               
-              widget.onSave();
-              if (mounted) Navigator.pop(context);
-
-            } catch (e) {
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de sauvegarde : $e"), backgroundColor: Colors.red));
+              try {
+                 final dir = await getApplicationDocumentsDirectory();
+                 final thumbName = "thumb_yt_${video.id}.jpg";
+                 await Dio().download(video.thumbnails.highResUrl, p.join(dir.path, thumbName));
+                 thumb = thumbName;
+              } catch (_) { 
+                 thumb = video.thumbnails.standardResUrl; 
+              }
+              yt.close();
+            } else if (isLocal && _file.text.isNotEmpty) {
+              final dir = await getApplicationDocumentsDirectory();
+              final localFilePath = p.join(dir.path, _file.text);
+              
+              try {
+                final metadata = await MetadataRetriever.fromFile(File(localFilePath));
+                if (metadata.trackDuration != null) {
+                  final d = Duration(milliseconds: metadata.trackDuration!);
+                  dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+                }
+                if (metadata.albumArt != null) {
+                  final thumbName = "thumb_${_file.text}.jpg";
+                  await File(p.join(dir.path, thumbName)).writeAsBytes(metadata.albumArt!);
+                  thumb = thumbName;
+                }
+              } catch (e) { 
+                debugPrint("Erreur metadata: $e"); 
               }
             }
-          },
-          child: const Text("Enregistrer", style: TextStyle(color: Colors.white)),
-        ),
+            
+            final data = {
+              "sourate_num": selectedNum, 
+              "sourate_name": selectedName,
+              "annee": int.tryParse(_year.text), 
+              "fichier": isLocal ? _file.text : _ytUrl.text,
+              "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
+              "thumbnail": thumb, 
+              "duration": dur,
+            };
+            
+            int recordId = widget.rec == null 
+                ? await widget.db!.insert('recitations', data) 
+                : widget.rec!['id'];
+                
+            if (widget.rec != null) {
+              await widget.db!.update('recitations', data, where: 'id = ?', whereArgs: [recordId]);
+            }
+            
+            if (!isLocal) {
+              final dir = await getApplicationDocumentsDirectory();
+              downloadYoutubeInBackground(_ytUrl.text, File(p.join(dir.path, "yt_$recordId.mp4")));
+            }
+            
+            widget.onSave(); 
+            if (mounted) Navigator.pop(context);
+          }, 
+          child: const Text("Enregistrer")
+        )
       ],
     );
   }
