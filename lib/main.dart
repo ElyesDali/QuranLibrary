@@ -134,7 +134,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    // GESTION DE FIN DE PISTE 100% STABLE
+    // INTERCEPTION DES BOUTONS AIRPLAY / VERROUILLAGE
+    _player.currentIndexStream.listen((index) {
+      if (_isSwitchingTrack || index == null || index == 1) return; 
+      
+      _isSwitchingTrack = true;
+      _player.pause(); // Coupe le son instantanément pour éviter d'entendre la fausse piste
+      
+      if (index == 0) {
+        _playPrevious();
+      } else if (index == 2) {
+        _playNext();
+      }
+    });
+
+    // GESTION DE LA FIN NATURELLE DE LA PISTE
     _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
         if (loopMode == LoopModeState.autoplay && !_isSwitchingTrack) {
@@ -142,7 +156,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
           _playNext();
         } else if (loopMode == LoopModeState.off) {
           _player.pause();
-          _player.seek(Duration.zero);
+          _player.seek(Duration.zero, index: 1); // Reset propre au centre
         }
       }
     });
@@ -292,6 +306,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     String path = rec['fichier'];
     final currentMediaItem = _createMediaItem(rec);
     AudioSource finalSource;
+    Uri realUri;
 
     try {
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
@@ -300,13 +315,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final localFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
 
         if (await localFile.exists() && await localFile.length() > 500000) {
-           finalSource = _buildSource(Uri.file(localFile.path), currentMediaItem);
+           realUri = Uri.file(localFile.path);
+           finalSource = _buildSource(realUri, currentMediaItem);
         } else {
           var yt = YoutubeExplode();
           try {
             var manifest = await yt.videos.streamsClient.getManifest(cleanUrl).timeout(const Duration(seconds: 5));
             var streamInfo = manifest.muxed.withHighestBitrate();
-            finalSource = _buildSource(streamInfo.url, currentMediaItem);
+            realUri = streamInfo.url;
+            finalSource = _buildSource(realUri, currentMediaItem);
             
             _startDownload(rec['id'], cleanUrl, localFile); 
           } catch (e) {
@@ -318,17 +335,36 @@ class _LibraryScreenState extends State<LibraryScreen> {
       } else {
         final file = File(_resolvePath(path));
         if (await file.exists()) {
-          finalSource = _buildSource(Uri.file(file.path), currentMediaItem);
+          realUri = Uri.file(file.path);
+          finalSource = _buildSource(realUri, currentMediaItem);
         } else {
           throw Exception("Fichier local introuvable");
         }
       }
 
-      await _player.setAudioSource(finalSource);
+      // LA PLAYLIST MAGIQUE : 3 pistes, mais avec les MÊMES URLs pour ne pas faire bugger iOS
+      int currIdx = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
+      int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
+      int nextIdx = (currIdx + 1) % displayedRecitations.length;
+
+      var playlist = ConcatenatingAudioSource(children: [
+         // Piste 0 : Fantôme pour le bouton "Précédent"
+         AudioSource.uri(realUri, tag: _createMediaItem(displayedRecitations[prevIdx])),
+         // Piste 1 : La Vraie Piste Actuelle
+         finalSource,                                                     
+         // Piste 2 : Fantôme pour le bouton "Suivant"
+         AudioSource.uri(realUri, tag: _createMediaItem(displayedRecitations[nextIdx])),
+      ]);
+
+      await _player.setAudioSource(playlist, initialIndex: 1);
       _player.play();
 
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red)
+        );
+      }
     } finally {
       setState(() => _isDownloading = false);
       Future.delayed(const Duration(milliseconds: 300), () => _isSwitchingTrack = false);
@@ -432,7 +468,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       ElevatedButton(
                         style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
                         onPressed: () {
-                          _cancelTimer(); // Nettoie l'ancien minuteur si existant
+                          _cancelTimer(); 
                           _timerEndTime = DateTime.now().add(Duration(minutes: _selectedTimerMinutes));
                           
                           _sleepTimer = Timer(Duration(minutes: _selectedTimerMinutes), () {
@@ -601,10 +637,53 @@ class _LibraryScreenState extends State<LibraryScreen> {
               padding: EdgeInsets.only(bottom: 8.0), 
               child: LinearProgressIndicator(color: Color(0xFF7EB8C9))
             ),
-          Text(
-            "${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}", 
-            style: const TextStyle(fontWeight: FontWeight.bold)
+            
+          // LIGNE DU HAUT : INFO SOURATE + MINUTEUR
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      "${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}", 
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)
+                    ),
+                    Text(
+                      "${currentRecitation!['annee'] ?? '??'} H • Versets: ${currentRecitation!['versets']}", 
+                      style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82))
+                    ),
+                  ],
+                ),
+              ),
+              InkWell(
+                onTap: _showTimerDialog,
+                borderRadius: BorderRadius.circular(20),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 4.0),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _timerEndTime != null ? Icons.timer : Icons.timer_outlined, 
+                        color: _timerEndTime != null ? const Color(0xFF7EB8C9) : Colors.grey,
+                        size: 24
+                      ),
+                      if (_timerEndTime != null)
+                        Text(
+                          _formatCountdown(_timerEndTime!.difference(DateTime.now())),
+                          style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 11, fontWeight: FontWeight.bold)
+                        )
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ),
+          
+          const SizedBox(height: 4),
+          
           StreamBuilder<Duration>(
             stream: _player.positionStream,
             builder: (context, snapshot) {
@@ -627,7 +706,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       max: maxDur,
                       onChanged: (v) => setState(() => _dragValue = v),
                       onChangeEnd: (v) {
-                        _player.seek(Duration(seconds: v.toInt()));
+                        _player.seek(Duration(seconds: v.toInt()), index: 1);
                         setState(() => _dragValue = null);
                       },
                     ),
@@ -649,6 +728,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
               );
             },
           ),
+          
+          // LIGNE DU BAS : SYMETRIE PARFAITE A 5 BOUTONS
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
@@ -660,7 +741,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 onPressed: _toggleLoop
               ),
               IconButton(
-                icon: const Icon(Icons.skip_previous, size: 30), 
+                icon: const Icon(Icons.skip_previous, size: 34), 
                 onPressed: _playPrevious
               ),
               StreamBuilder<PlayerState>(
@@ -672,20 +753,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   if (state?.processingState == ProcessingState.loading || state?.processingState == ProcessingState.buffering) {
                     return Container(
                       margin: const EdgeInsets.symmetric(horizontal: 8), 
-                      width: 48, 
-                      height: 48, 
+                      width: 52, 
+                      height: 52, 
                       child: const CircularProgressIndicator(color: Color(0xFF7EB8C9))
                     );
                   }
                   
                   bool showPlayIcon = !playing || state?.processingState == ProcessingState.completed;
                   return IconButton(
-                    iconSize: 56, 
+                    iconSize: 60, 
                     icon: Icon(showPlayIcon ? Icons.play_circle : Icons.pause_circle, color: const Color(0xFF7EB8C9)), 
                     onPressed: () async {
                       if (showPlayIcon) {
                         if (state?.processingState == ProcessingState.completed) {
-                          await _player.seek(Duration.zero);
+                          await _player.seek(Duration.zero, index: 1);
                         }
                         _player.play();
                       } else {
@@ -696,37 +777,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 },
               ),
               IconButton(
-                icon: const Icon(Icons.skip_next, size: 30), 
+                icon: const Icon(Icons.skip_next, size: 34), 
                 onPressed: _playNext
               ),
               IconButton(
-                icon: const Icon(Icons.stop, size: 28, color: Colors.grey), 
+                icon: const Icon(Icons.stop, size: 30, color: Colors.grey), 
                 onPressed: () {
                   _player.stop();
-                  _player.seek(Duration.zero);
+                  _player.seek(Duration.zero, index: 1);
                 }
-              ),
-              InkWell(
-                onTap: _showTimerDialog,
-                borderRadius: BorderRadius.circular(20),
-                child: Padding(
-                  padding: const EdgeInsets.all(8.0),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        _timerEndTime != null ? Icons.timer : Icons.timer_off, 
-                        color: _timerEndTime != null ? const Color(0xFF7EB8C9) : Colors.grey,
-                        size: 24
-                      ),
-                      if (_timerEndTime != null)
-                        Text(
-                          _formatCountdown(_timerEndTime!.difference(DateTime.now())),
-                          style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 10, fontWeight: FontWeight.bold)
-                        )
-                    ],
-                  ),
-                ),
               ),
             ],
           ),
@@ -859,18 +918,21 @@ class _FormDialogState extends State<FormDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: const Color(0xFF111111),
-      title: Text(widget.rec == null ? "Ajouter" : "Modifier"),
+      title: Text(widget.rec == null ? "Ajouter" : "Modifier", style: const TextStyle(color: Color(0xFF7EB8C9))),
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             DropdownMenu<Map<String, dynamic>>(
               initialSelection: widget.rec != null ? ALL_SURAHS.firstWhere((s) => s['num'] == widget.rec!['sourate_num']) : ALL_SURAHS[0],
+              width: 280,
+              label: const Text("Sourate"),
+              enableSearch: true,
+              dropdownMenuEntries: ALL_SURAHS.map((s) => DropdownMenuEntry(value: s, label: "${s['num']} - ${s['name']}")).toList(),
               onSelected: (s) { 
                 selectedNum = s?['num']; 
                 selectedName = s?['name']; 
               },
-              dropdownMenuEntries: ALL_SURAHS.map((s) => DropdownMenuEntry(value: s, label: "${s['num']} - ${s['name']}")).toList(),
             ),
             const SizedBox(height: 10),
             TextField(
@@ -898,6 +960,7 @@ class _FormDialogState extends State<FormDialog> {
             const SizedBox(height: 10),
             if (isLocal) 
               ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[800], foregroundColor: Colors.white),
                 onPressed: () async {
                   FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any); 
                   if (result != null) {
@@ -918,7 +981,9 @@ class _FormDialogState extends State<FormDialog> {
         ),
       ),
       actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text("Annuler")),
         ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
           onPressed: () async {
             String thumb = widget.rec?['thumbnail'] ?? "";
             String dur = widget.rec?['duration'] ?? "";
@@ -983,7 +1048,7 @@ class _FormDialogState extends State<FormDialog> {
             widget.onSave(); 
             if (mounted) Navigator.pop(context);
           }, 
-          child: const Text("Enregistrer")
+          child: const Text("Enregistrer", style: TextStyle(color: Colors.white))
         )
       ],
     );
