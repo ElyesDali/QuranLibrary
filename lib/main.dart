@@ -851,7 +851,7 @@ class _FormDialogState extends State<FormDialog> {
                     final thumbName = "thumb_yt_${video.id}.jpg";
                     final thumbFile = File(p.join(dir.path, thumbName));
                     await Dio().download(remoteThumb, thumbFile.path);
-                    thumb = thumbName; // STOCKAGE RELATIF
+                    thumb = thumbName; 
                   } catch (e) {
                     thumb = remoteThumb; 
                   }
@@ -865,27 +865,24 @@ class _FormDialogState extends State<FormDialog> {
                 final dir = await getApplicationDocumentsDirectory();
                 final localFilePath = p.join(dir.path, _file.text);
                 
-                try {
-                  final player = AudioPlayer();
-                  final d = await player.setFilePath(localFilePath);
-                  if (d != null) {
-                    dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
-                  }
-                  await player.dispose();
-                } catch (e) {
-                  debugPrint("Impossible de lire la durée locale: $e");
-                }
-
+                // CORRECTION : On utilise les métadonnées pour TOUT (Durée + Image)
+                // Fini le crash du double lecteur audio !
                 try {
                   final metadata = await MetadataRetriever.fromFile(File(localFilePath));
+                  
+                  if (metadata.trackDuration != null) {
+                    final d = Duration(milliseconds: metadata.trackDuration!);
+                    dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+                  }
+
                   if (metadata.albumArt != null) {
                     final thumbName = "thumb_${_file.text}.jpg";
                     final artFile = File(p.join(dir.path, thumbName));
                     await artFile.writeAsBytes(metadata.albumArt!);
-                    thumb = thumbName; // STOCKAGE RELATIF
+                    thumb = thumbName; 
                   }
                 } catch (e) {
-                  debugPrint("Pas d'image trouvée: $e");
+                  debugPrint("Erreur metadata: $e");
                 }
               }
 
