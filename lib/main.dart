@@ -292,11 +292,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return base;
   }
 
+  // NOUVEAU : Crée une piste fantôme de 1 milliseconde pour tromper iOS
+  // Ça force l'activation des boutons AirPlay sans créer de bugs de cache
+  AudioSource _buildDummySource(Uri uri, MediaItem mediaItem) {
+    final base = AudioSource.uri(uri, tag: mediaItem);
+    return ClippingAudioSource(
+      child: base, 
+      start: Duration.zero, 
+      end: const Duration(milliseconds: 1), // Invisible à l'oreille !
+      tag: mediaItem
+    );
+  }
+
   Future<void> _play(Map<String, dynamic> rec) async {
-    _isSwitchingTrack = true;
-    
-    // ARRÊT IMMÉDIAT ET RADICAL de la lecture précédente
-    await _player.stop(); 
+    _expectedIndex = 1; // On dit au lecteur qu'on s'attend à être sur la piste centrale
     
     setState(() {
       currentRecitation = rec;
@@ -304,7 +313,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
 
     if (rec['fichier'] == null) {
-      _isSwitchingTrack = false;
       setState(() => _isDownloading = false);
       return;
     }
@@ -312,6 +320,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     String path = rec['fichier'];
     final currentMediaItem = _createMediaItem(rec);
     AudioSource finalSource;
+    Uri realUri;
 
     try {
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
@@ -319,47 +328,53 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final dir = await getApplicationDocumentsDirectory();
         final localFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
 
-        // 1. Vérification hors-ligne stricte (le fichier doit faire plus de 500ko pour éviter les fichiers corrompus)
         if (await localFile.exists() && await localFile.length() > 500000) {
-           finalSource = _buildSource(Uri.file(localFile.path), currentMediaItem);
+           realUri = Uri.file(localFile.path);
+           finalSource = _buildSource(realUri, currentMediaItem);
         } else {
-          // 2. Si pas de fichier local, vérification expresse d'internet
-          if (!await _hasInternet()) {
-            throw Exception("Hors-ligne : La vidéo n'a pas fini de se télécharger la dernière fois.");
-          }
-
-          // 3. Lecture en ligne via flux internet
           var yt = YoutubeExplode();
           try {
-            var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
+            var manifest = await yt.videos.streamsClient.getManifest(cleanUrl).timeout(const Duration(seconds: 5));
             var streamInfo = manifest.muxed.withHighestBitrate();
-            finalSource = _buildSource(streamInfo.url, currentMediaItem);
+            realUri = streamInfo.url;
+            finalSource = _buildSource(realUri, currentMediaItem);
             
-            // On relance la sauvegarde en arrière-plan
-            _startDownload(rec['id'], cleanUrl, localFile);
+            _startDownload(rec['id'], cleanUrl, localFile); // Lancement du cercle %
+          } catch (e) {
+            throw Exception("Fichier non disponible hors-ligne");
           } finally {
             yt.close();
           }
         }
       } else {
-        // Fichier local normal de l'iPhone
         final file = File(_resolvePath(path));
         if (await file.exists()) {
-          finalSource = _buildSource(Uri.file(file.path), currentMediaItem);
+          realUri = Uri.file(file.path);
+          finalSource = _buildSource(realUri, currentMediaItem);
         } else {
-          throw Exception("Fichier local introuvable sur le disque");
+          throw Exception("Fichier introuvable sur le disque");
         }
       }
 
-      // LECTURE SIMPLE (Garantit 100% de stabilité sur la touche Pause)
-      await _player.setAudioSource(finalSource);
+      // LA PLAYLIST MAGIQUE : 3 pistes, dont 2 fantômes !
+      int currIdx = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
+      int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
+      int nextIdx = (currIdx + 1) % displayedRecitations.length;
+
+      var playlist = ConcatenatingAudioSource(children: [
+         _buildDummySource(realUri, _createMediaItem(displayedRecitations[prevIdx])),
+         finalSource,                                                     
+         _buildDummySource(realUri, _createMediaItem(displayedRecitations[nextIdx])),
+      ]);
+
+      // Le setAudioSource écrase et remplace l'ancienne lecture instantanément (sans bug)
+      await _player.setAudioSource(playlist, initialIndex: 1);
       _player.play();
 
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ $e"), backgroundColor: Colors.red));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
     } finally {
       setState(() => _isDownloading = false);
-      Future.delayed(const Duration(milliseconds: 500), () => _isSwitchingTrack = false);
     }
   }
 
