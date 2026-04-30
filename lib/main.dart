@@ -122,7 +122,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
   String? _appDirPath;
   Map<int, double> _activeDownloads = {}; 
 
+  // VARIABLES DU MINUTEUR
   Timer? _sleepTimer;
+  Timer? _countdownTimer;
+  DateTime? _timerEndTime;
   int _selectedTimerMinutes = 15;
 
   @override
@@ -131,6 +134,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
+    // GESTION DE FIN DE PISTE 100% STABLE
     _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
         if (loopMode == LoopModeState.autoplay && !_isSwitchingTrack) {
@@ -195,17 +199,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
     Duration? exactDur;
     if (r['duration'] != null && r['duration'].toString().contains(':')) {
       final parts = r['duration'].toString().split(':');
-      if (parts.length == 2) {
-        exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
-      }
+      if (parts.length == 2) exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
     }
-    
     Uri? artUri;
     if (r['thumbnail'] != null && r['thumbnail'].toString().isNotEmpty) {
       String resolved = _resolvePath(r['thumbnail'].toString());
       artUri = resolved.startsWith('http') ? Uri.parse(resolved) : Uri.file(resolved);
     }
-    
     return MediaItem(
       id: r['id'].toString(),
       album: "Muhammad",
@@ -248,17 +248,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
             int percentage = ((received / total) * 100).toInt();
             if (percentage != lastUpdateValue) {
               lastUpdateValue = percentage;
-              if (mounted) {
-                setState(() => _activeDownloads[id] = percentage / 100.0);
-              }
+              if (mounted) setState(() => _activeDownloads[id] = percentage / 100.0);
             }
           } else {
             int megabyteStep = (received / 500000).toInt(); 
             if (megabyteStep != lastUpdateValue) {
               lastUpdateValue = megabyteStep;
-              if (mounted) {
-                setState(() => _activeDownloads[id] = -(received.toDouble()));
-              }
+              if (mounted) setState(() => _activeDownloads[id] = -(received.toDouble()));
             }
           }
         },
@@ -274,9 +270,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       debugPrint("Erreur téléchargement: $e");
     } finally {
       yt.close();
-      if (mounted) {
-        setState(() => _activeDownloads.remove(id));
-      }
+      if (mounted) setState(() => _activeDownloads.remove(id)); 
     }
   }
 
@@ -334,11 +328,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       _player.play();
 
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red)
-        );
-      }
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
     } finally {
       setState(() => _isDownloading = false);
       Future.delayed(const Duration(milliseconds: 300), () => _isSwitchingTrack = false);
@@ -368,11 +358,29 @@ class _LibraryScreenState extends State<LibraryScreen> {
         loopMode = LoopModeState.off;
         _player.setLoopMode(LoopMode.off);
       }
-      
-      if (loopMode != LoopModeState.one) {
-        _player.setLoopMode(LoopMode.off);
-      }
+      if (loopMode != LoopModeState.one) _player.setLoopMode(LoopMode.off);
     });
+  }
+
+  // GESTION DU MINUTEUR
+  void _cancelTimer() {
+    _sleepTimer?.cancel();
+    _countdownTimer?.cancel();
+    _sleepTimer = null;
+    _countdownTimer = null;
+    _timerEndTime = null;
+    if (mounted) setState(() {});
+  }
+
+  String _formatCountdown(Duration d) {
+    if (d.isNegative) return "00:00";
+    String mm = d.inMinutes.toString().padLeft(2, '0');
+    String ss = (d.inSeconds % 60).toString().padLeft(2, '0');
+    if (d.inHours > 0) {
+      String hh = d.inHours.toString().padLeft(2, '0');
+      return "$hh:$mm:$ss";
+    }
+    return "$mm:$ss";
   }
 
   void _showTimerDialog() {
@@ -413,11 +421,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
-                      if (_sleepTimer != null && _sleepTimer!.isActive)
+                      if (_timerEndTime != null)
                         TextButton(
                           onPressed: () {
-                            _sleepTimer?.cancel();
-                            setState(() {}); 
+                            _cancelTimer();
                             Navigator.pop(context);
                           },
                           child: const Text("Désactiver", style: TextStyle(color: Colors.red)),
@@ -425,12 +432,25 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       ElevatedButton(
                         style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
                         onPressed: () {
-                          _sleepTimer?.cancel();
+                          _cancelTimer(); // Nettoie l'ancien minuteur si existant
+                          _timerEndTime = DateTime.now().add(Duration(minutes: _selectedTimerMinutes));
+                          
                           _sleepTimer = Timer(Duration(minutes: _selectedTimerMinutes), () {
                             _player.pause();
-                            setState(() {}); 
+                            _cancelTimer();
                           });
-                          setState(() {}); 
+
+                          _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+                            if (_timerEndTime != null) {
+                              if (DateTime.now().isAfter(_timerEndTime!)) {
+                                _cancelTimer();
+                              } else {
+                                if (mounted) setState(() {});
+                              }
+                            }
+                          });
+
+                          if (mounted) setState(() {}); 
                           Navigator.pop(context);
                         },
                         child: const Text("Démarrer", style: TextStyle(color: Colors.white)),
@@ -572,7 +592,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Widget _buildPlayerUI() {
     return Container(
       color: const Color(0xFF0D0D0D),
-      padding: const EdgeInsets.fromLTRB(20, 10, 20, 30),
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 30),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -640,7 +660,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 onPressed: _toggleLoop
               ),
               IconButton(
-                icon: const Icon(Icons.skip_previous, size: 32), 
+                icon: const Icon(Icons.skip_previous, size: 30), 
                 onPressed: _playPrevious
               ),
               StreamBuilder<PlayerState>(
@@ -651,7 +671,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   
                   if (state?.processingState == ProcessingState.loading || state?.processingState == ProcessingState.buffering) {
                     return Container(
-                      margin: const EdgeInsets.symmetric(horizontal: 16), 
+                      margin: const EdgeInsets.symmetric(horizontal: 8), 
                       width: 48, 
                       height: 48, 
                       child: const CircularProgressIndicator(color: Color(0xFF7EB8C9))
@@ -660,7 +680,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   
                   bool showPlayIcon = !playing || state?.processingState == ProcessingState.completed;
                   return IconButton(
-                    iconSize: 64, 
+                    iconSize: 56, 
                     icon: Icon(showPlayIcon ? Icons.play_circle : Icons.pause_circle, color: const Color(0xFF7EB8C9)), 
                     onPressed: () async {
                       if (showPlayIcon) {
@@ -676,16 +696,37 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 },
               ),
               IconButton(
-                icon: const Icon(Icons.skip_next, size: 32), 
+                icon: const Icon(Icons.skip_next, size: 30), 
                 onPressed: _playNext
               ),
               IconButton(
-                icon: Icon(
-                  _sleepTimer != null && _sleepTimer!.isActive ? Icons.timer : Icons.timer_off, 
-                  color: _sleepTimer != null && _sleepTimer!.isActive ? const Color(0xFF7EB8C9) : Colors.grey,
-                  size: 28
-                ), 
-                onPressed: _showTimerDialog
+                icon: const Icon(Icons.stop, size: 28, color: Colors.grey), 
+                onPressed: () {
+                  _player.stop();
+                  _player.seek(Duration.zero);
+                }
+              ),
+              InkWell(
+                onTap: _showTimerDialog,
+                borderRadius: BorderRadius.circular(20),
+                child: Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _timerEndTime != null ? Icons.timer : Icons.timer_off, 
+                        color: _timerEndTime != null ? const Color(0xFF7EB8C9) : Colors.grey,
+                        size: 24
+                      ),
+                      if (_timerEndTime != null)
+                        Text(
+                          _formatCountdown(_timerEndTime!.difference(DateTime.now())),
+                          style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 10, fontWeight: FontWeight.bold)
+                        )
+                    ],
+                  ),
+                ),
               ),
             ],
           ),
@@ -702,15 +743,27 @@ class _LibraryScreenState extends State<LibraryScreen> {
         children: [
           const DrawerHeader(child: Center(child: Text("FILTRES", style: TextStyle(color: Color(0xFF7EB8C9))))),
           ListTile(
-            title: const Text("Toutes"), 
+            title: const Text("Toutes les récitations"), 
+            selected: selectedYearFilter == null,
             onTap: () { 
               setState(() => selectedYearFilter = null); 
               _applyFilters(); 
               Navigator.pop(context); 
             }
           ),
+          ListTile(
+            title: const Text("Année inconnue"), 
+            selected: selectedYearFilter == -1,
+            onTap: () { 
+              setState(() => selectedYearFilter = -1); 
+              _applyFilters(); 
+              Navigator.pop(context); 
+            }
+          ),
+          const Divider(color: Colors.white24),
           ...years.map((y) => ListTile(
             title: Text("$y H"), 
+            selected: selectedYearFilter == y,
             onTap: () { 
               setState(() => selectedYearFilter = y); 
               _applyFilters(); 
