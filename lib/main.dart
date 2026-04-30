@@ -115,7 +115,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  // Fonction de téléchargement avec "déguisement" iPhone
   Future<void> _startDownload(int id, String cleanUrl, File localFile) async {
     if (_activeDownloads.containsKey(id)) return; 
     
@@ -123,35 +122,52 @@ class _LibraryScreenState extends State<LibraryScreen> {
     var yt = YoutubeExplode();
     try {
       var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-      
-      // On prend le même flux que la lecture pour garantir qu'il existe
-      var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
-      var streamInfo = mp4Muxed.isNotEmpty 
-          ? mp4Muxed.withHighestBitrate() 
-          : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+      var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+      var stream = yt.videos.streamsClient.get(audioStream);
       
       final tempFile = File("${localFile.path}.tmp");
+      var fileStream = tempFile.openWrite();
       
-      // Utilisation de Dio avec l'identité Safari iOS 17 (Évite l'erreur 403 et le blocage à 0%)
-      await Dio().download(
-        streamInfo.url.toString(),
-        tempFile.path,
-        options: Options(headers: {
-          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-        }),
-        onReceiveProgress: (received, total) {
-          if (total != -1 && mounted) {
-            setState(() => _activeDownloads[id] = received / total);
+      var totalBytes = audioStream.size.totalBytes;
+      var bytesCount = 0;
+      int lastPercentage = 0;
+
+      await for (var data in stream) {
+        fileStream.add(data);
+        bytesCount += data.length;
+        if (totalBytes > 0) {
+          int percentage = ((bytesCount / totalBytes) * 100).toInt();
+          // CORRECTIF N°1 : On ne rafraîchit l'écran que tous les 1% minimum
+          // Ça empêche l'iPhone de "freeze" et le cercle va s'animer fluidement
+          if (percentage != lastPercentage) {
+            lastPercentage = percentage;
+            if (mounted) setState(() => _activeDownloads[id] = percentage / 100.0);
           }
-        },
-      );
+        }
+      }
       
-      // On vérifie que le fichier n'est pas corrompu avant de le valider
+      await fileStream.flush();
+      await fileStream.close();
+      
+      // On s'assure que le fichier pèse au moins 500ko (non corrompu)
       if (await tempFile.exists() && await tempFile.length() > 500000) {
-        await tempFile.rename(localFile.path); 
+        // CORRECTIF N°2 : Sécurité iOS, on détruit tout fichier fantôme existant
+        if (await localFile.exists()) {
+          await localFile.delete(); 
+        }
+        await tempFile.rename(localFile.path); // Validation finale du fichier .mp4
+      } else {
+        throw Exception("Fichier corrompu ou trop petit.");
       }
     } catch (e) {
       debugPrint("Erreur téléchargement: $e");
+      // S'il y a un souci, tu le verras ENFIN en rouge !
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text("❌ Échec du téléchargement : $e"), 
+          backgroundColor: Colors.red
+        ));
+      }
     } finally {
       yt.close();
       if (mounted) setState(() => _activeDownloads.remove(id)); 
