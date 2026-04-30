@@ -83,6 +83,7 @@ enum LoopModeState { off, autoplay, one }
 
 class LuhaidanApp extends StatelessWidget {
   const LuhaidanApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -100,6 +101,7 @@ class LuhaidanApp extends StatelessWidget {
 
 class LibraryScreen extends StatefulWidget {
   const LibraryScreen({super.key});
+
   @override
   State<LibraryScreen> createState() => _LibraryScreenState();
 }
@@ -117,7 +119,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   bool _isDownloading = false;
   double? _dragValue;
   bool _isSwitchingTrack = false;
-  String? _appDirPath; // Stockage de l'adresse racine du téléphone
+  String? _appDirPath;
 
   @override
   void initState() {
@@ -125,8 +127,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
+    // Écouteur spécial pour les boutons iOS AirPlay et Écran de verrouillage
     _player.currentIndexStream.listen((index) {
-      if (_isSwitchingTrack) return; 
+      if (_isSwitchingTrack || index == null) return; 
+      
       if (index == 0) {
         _isSwitchingTrack = true;
         _playPrevious();
@@ -136,31 +140,30 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
     });
 
+    // Écouteur de fin de piste
     _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
-        if (loopMode == LoopModeState.autoplay) {
-          if (!_isSwitchingTrack) {
-            _isSwitchingTrack = true;
-            _playNext();
-          }
+        if (loopMode == LoopModeState.autoplay && !_isSwitchingTrack) {
+          _isSwitchingTrack = true;
+          _playNext();
         }
       }
     });
-
-    _player.playbackEventStream.listen((event) {}, onError: (Object e, StackTrace st) {});
   }
 
   Future<void> _initApp() async {
     final dir = await getApplicationDocumentsDirectory();
-    _appDirPath = dir.path; // Sécurise l'adresse racine actuelle de l'appli sur iOS
+    _appDirPath = dir.path;
 
     final path = p.join(dir.path, 'luhaidan.db');
     _db = await openDatabase(
       path,
       version: 2,
-      onCreate: (db, version) => db.execute(
-        'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, fichier TEXT, versets TEXT, annee_g INTEGER, thumbnail TEXT, duration TEXT)'
-      ),
+      onCreate: (db, version) {
+        db.execute(
+          'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, fichier TEXT, versets TEXT, annee_g INTEGER, thumbnail TEXT, duration TEXT)'
+        );
+      },
       onUpgrade: (db, oldV, newV) {
         if (oldV < 2) {
           db.execute('ALTER TABLE recitations ADD COLUMN thumbnail TEXT');
@@ -191,10 +194,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  // Permet de reconstruire l'adresse d'une miniature même si Apple change le nom du dossier
+  // Reconstruit les adresses de fichiers même si Apple change le dossier caché de l'appli
   String _resolvePath(String pathStr) {
     if (pathStr.startsWith('http')) return pathStr;
-    if (pathStr.startsWith('/')) return pathStr; // Ancien chemin absolu sauvegardé avant cette mise à jour
+    if (pathStr.startsWith('/')) return pathStr; 
     return _appDirPath != null ? p.join(_appDirPath!, pathStr) : pathStr;
   }
 
@@ -202,13 +205,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
     Duration? exactDur;
     if (r['duration'] != null && r['duration'].toString().contains(':')) {
       final parts = r['duration'].toString().split(':');
-      if (parts.length == 2) exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+      if (parts.length == 2) {
+        exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+      }
     }
+    
     Uri? artUri;
     if (r['thumbnail'] != null && r['thumbnail'].toString().isNotEmpty) {
       String resolved = _resolvePath(r['thumbnail'].toString());
       artUri = resolved.startsWith('http') ? Uri.parse(resolved) : Uri.file(resolved);
     }
+    
     return MediaItem(
       id: r['id'].toString(),
       album: "Muhammad",
@@ -230,7 +237,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Future<void> _play(Map<String, dynamic> rec) async {
     _isSwitchingTrack = true;
     
-    await _player.stop(); // Arrêt immédiat de la piste précédente
+    // Arrêt immédiat et radical de la lecture précédente
+    await _player.stop(); 
     
     setState(() {
       currentRecitation = rec;
@@ -245,8 +253,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
     String path = rec['fichier'];
     final currentMediaItem = _createMediaItem(rec);
-    Uri realUri;
-    AudioSource currentAudioSource;
+    AudioSource finalSource;
 
     try {
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
@@ -254,72 +261,77 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final dir = await getApplicationDocumentsDirectory();
         final localFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
 
-        if (await localFile.exists() && await localFile.length() > 0) {
-          // Lecture depuis la mémoire interne : Succès hors ligne garanti
-          realUri = Uri.file(localFile.path);
-          currentAudioSource = _buildSource(realUri, currentMediaItem);
+        // Vérification hors-ligne stricte : Existe ET n'est pas un fichier vide/corrompu (plus de 500ko)
+        if (await localFile.exists() && await localFile.length() > 500000) {
+           finalSource = _buildSource(Uri.file(localFile.path), currentMediaItem);
         } else {
-          // Streaming direct + Timeout de sécurité
+          // Lecture en ligne via flux internet
           var yt = YoutubeExplode();
           try {
-            var manifest = await yt.videos.streamsClient.getManifest(cleanUrl).timeout(const Duration(seconds: 7));
-            var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
-            var streamInfo = mp4Muxed.isNotEmpty ? mp4Muxed.withHighestBitrate() : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+            var manifest = await yt.videos.streamsClient.getManifest(cleanUrl).timeout(const Duration(seconds: 5));
+            var streamInfo = manifest.muxed.withHighestBitrate();
+            finalSource = _buildSource(streamInfo.url, currentMediaItem);
             
-            realUri = streamInfo.url;
-            currentAudioSource = _buildSource(realUri, currentMediaItem);
-            
-            downloadYoutubeInBackground(cleanUrl, localFile); // Lancement du backup en sourdine
-          } on TimeoutException {
-            throw Exception("Le fichier n'est pas encore téléchargé et le téléphone est hors-ligne.");
+            // On lance la sauvegarde en arrière-plan sans bloquer
+            downloadYoutubeInBackground(cleanUrl, localFile);
+          } catch (e) {
+            throw Exception("Fichier non disponible hors-ligne");
           } finally {
             yt.close();
           }
         }
       } else {
-        final dir = await getApplicationDocumentsDirectory();
-        final file = File(p.join(dir.path, path));
+        // Fichier local normal
+        final file = File(_resolvePath(path));
         if (await file.exists()) {
-          realUri = Uri.file(file.path);
-          currentAudioSource = _buildSource(realUri, currentMediaItem);
+          finalSource = _buildSource(Uri.file(file.path), currentMediaItem);
         } else {
-          throw Exception("Fichier local introuvable");
+          throw Exception("Fichier introuvable sur le disque");
         }
       }
 
-      int currIdx = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
-      int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
-      int nextIdx = (currIdx + 1) % displayedRecitations.length;
+      // Si le fichier est lu hors-ligne (en local), on prépare la "fausse" liste de 3 pistes
+      // pour forcer iOS à allumer les boutons AirPlay Suivant/Précédent.
+      if (finalSource is UriAudioSource && finalSource.uri.isScheme('file')) {
+        int currIdx = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
+        int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
+        int nextIdx = (currIdx + 1) % displayedRecitations.length;
 
-      var playlist = ConcatenatingAudioSource(children: [
-         _buildSource(realUri, _createMediaItem(displayedRecitations[prevIdx])),
-         currentAudioSource,                                                     
-         _buildSource(realUri, _createMediaItem(displayedRecitations[nextIdx])),
-      ]);
+        var playlist = ConcatenatingAudioSource(children: [
+           _buildSource(finalSource.uri, _createMediaItem(displayedRecitations[prevIdx])),
+           finalSource,
+           _buildSource(finalSource.uri, _createMediaItem(displayedRecitations[nextIdx])),
+        ]);
+        await _player.setAudioSource(playlist, initialIndex: 1);
+      } else {
+        // Si c'est en streaming YouTube, on lit sans playlist pour ne pas causer l'erreur réseau iOS
+        await _player.setAudioSource(finalSource);
+      }
 
-      await _player.setAudioSource(playlist, initialIndex: 1);
       _player.play();
 
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("❌ $e"), backgroundColor: Colors.red)
+        );
+      }
     } finally {
       setState(() => _isDownloading = false);
-      Future.delayed(const Duration(milliseconds: 300), () => _isSwitchingTrack = false);
+      Future.delayed(const Duration(milliseconds: 500), () => _isSwitchingTrack = false);
     }
   }
 
   void _playNext() {
     if (displayedRecitations.isEmpty) return;
     int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
-    int nextIndex = (index + 1) % displayedRecitations.length;
-    _play(displayedRecitations[nextIndex]);
+    _play(displayedRecitations[(index + 1) % displayedRecitations.length]);
   }
 
   void _playPrevious() {
     if (displayedRecitations.isEmpty) return;
     int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
-    int prevIndex = (index - 1 + displayedRecitations.length) % displayedRecitations.length;
-    _play(displayedRecitations[prevIndex]);
+    _play(displayedRecitations[(index - 1 + displayedRecitations.length) % displayedRecitations.length]);
   }
 
   void _toggleLoop() {
@@ -333,7 +345,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
         loopMode = LoopModeState.off;
         _player.setLoopMode(LoopMode.off);
       }
-      if (loopMode != LoopModeState.one) _player.setLoopMode(LoopMode.off);
+      if (loopMode != LoopModeState.one) {
+        _player.setLoopMode(LoopMode.off);
+      }
     });
   }
 
@@ -344,13 +358,32 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Widget _buildThumbnail(String? thumbPath) {
     if (thumbPath == null || thumbPath.isEmpty) {
-      return Image.asset('assets/logo.jpg', width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
+      return Image.asset(
+        'assets/logo.jpg', 
+        width: 50, 
+        height: 50, 
+        fit: BoxFit.cover, 
+        errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40)
+      );
     }
+    
     String resolvedPath = _resolvePath(thumbPath);
     if (resolvedPath.startsWith('http')) {
-      return Image.network(resolvedPath, width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
+      return Image.network(
+        resolvedPath, 
+        width: 50, 
+        height: 50, 
+        fit: BoxFit.cover, 
+        errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40)
+      );
     } else {
-      return Image.file(File(resolvedPath), width: 50, height: 50, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40));
+      return Image.file(
+        File(resolvedPath), 
+        width: 50, 
+        height: 50, 
+        fit: BoxFit.cover, 
+        errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40)
+      );
     }
   }
 
@@ -369,9 +402,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text("${displayedRecitations.length} récitations", style: const TextStyle(color: Color(0xFF6A7A82), fontSize: 13)),
+                Text(
+                  "${displayedRecitations.length} récitations", 
+                  style: const TextStyle(color: Color(0xFF6A7A82), fontSize: 13)
+                ),
                 if (selectedYearFilter != null)
-                  Text(selectedYearFilter == -1 ? "Année inconnue" : "$selectedYearFilter H", style: const TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold)),
+                  Text(
+                    selectedYearFilter == -1 ? "Année inconnue" : "$selectedYearFilter H", 
+                    style: const TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold)
+                  ),
               ],
             ),
           ),
@@ -421,9 +460,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (_isDownloading) const Padding(padding: EdgeInsets.only(bottom: 8.0), child: LinearProgressIndicator(color: Color(0xFF7EB8C9))),
-          Text("${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-          Text("${currentRecitation!['annee'] ?? '??'} H • Versets: ${currentRecitation!['versets']}", style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82))),
+          if (_isDownloading) 
+            const Padding(
+              padding: EdgeInsets.only(bottom: 8.0), 
+              child: LinearProgressIndicator(color: Color(0xFF7EB8C9))
+            ),
+          Text(
+            "${currentRecitation!['sourate_num'].toString().padLeft(3, '0')} - ${currentRecitation!['sourate_name']}", 
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)
+          ),
+          Text(
+            "${currentRecitation!['annee'] ?? '??'} H • Versets: ${currentRecitation!['versets']}", 
+            style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82))
+          ),
           const SizedBox(height: 8),
           StreamBuilder<Duration>(
             stream: _player.positionStream,
@@ -433,6 +482,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               
               double maxDur = dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0;
               double sliderVal = _dragValue ?? pos.inSeconds.toDouble();
+              
               if (sliderVal < 0) sliderVal = 0;
               if (sliderVal > maxDur) sliderVal = maxDur;
 
@@ -477,8 +527,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              IconButton(icon: Icon(loopMode == LoopModeState.off ? Icons.repeat : (loopMode == LoopModeState.autoplay ? Icons.repeat_on : Icons.repeat_one_on), color: loopMode == LoopModeState.off ? Colors.grey : const Color(0xFF7EB8C9)), onPressed: _toggleLoop),
-              IconButton(icon: const Icon(Icons.skip_previous, size: 32), onPressed: _playPrevious),
+              IconButton(
+                icon: Icon(
+                  loopMode == LoopModeState.off ? Icons.repeat : (loopMode == LoopModeState.autoplay ? Icons.repeat_on : Icons.repeat_one_on), 
+                  color: loopMode == LoopModeState.off ? Colors.grey : const Color(0xFF7EB8C9)
+                ), 
+                onPressed: _toggleLoop
+              ),
+              IconButton(
+                icon: const Icon(Icons.skip_previous, size: 32), 
+                onPressed: _playPrevious
+              ),
               StreamBuilder<PlayerState>(
                 stream: _player.playerStateStream,
                 builder: (context, snapshot) {
@@ -487,7 +546,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   final playing = state?.playing ?? false;
 
                   if (processingState == ProcessingState.loading || processingState == ProcessingState.buffering) {
-                    return Container(margin: const EdgeInsets.symmetric(horizontal: 16), width: 48, height: 48, child: const CircularProgressIndicator(color: Color(0xFF7EB8C9)));
+                    return Container(
+                      margin: const EdgeInsets.symmetric(horizontal: 16), 
+                      width: 48, 
+                      height: 48, 
+                      child: const CircularProgressIndicator(color: Color(0xFF7EB8C9))
+                    );
                   }
                   
                   bool showPlayIcon = !playing || processingState == ProcessingState.completed;
@@ -508,11 +572,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   );
                 },
               ),
-              IconButton(icon: const Icon(Icons.skip_next, size: 32), onPressed: _playNext),
-              IconButton(icon: const Icon(Icons.stop, size: 28, color: Colors.grey), onPressed: () {
-                _player.stop();
-                _player.seek(Duration.zero, index: 1);
-              }),
+              IconButton(
+                icon: const Icon(Icons.skip_next, size: 32), 
+                onPressed: _playNext
+              ),
+              IconButton(
+                icon: const Icon(Icons.stop, size: 28, color: Colors.grey), 
+                onPressed: () {
+                  _player.stop();
+                  _player.seek(Duration.zero, index: 1);
+                }
+              ),
             ],
           ),
         ],
@@ -523,7 +593,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Widget _buildDrawer() {
     final Map<int, int?> yearMap = {};
     for (var r in allRecitations) {
-      if (r['annee'] != null) yearMap[r['annee'] as int] = r['annee_g'] as int?;
+      if (r['annee'] != null) {
+        yearMap[r['annee'] as int] = r['annee_g'] as int?;
+      }
     }
     final years = yearMap.keys.toList()..sort((a, b) => b.compareTo(a));
 
@@ -531,15 +603,39 @@ class _LibraryScreenState extends State<LibraryScreen> {
       backgroundColor: const Color(0xFF0A0A0A),
       child: ListView(
         children: [
-          const DrawerHeader(child: Center(child: Text("FILTRER PAR ANNÉE", style: TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold)))),
-          ListTile(title: const Text("Toutes les récitations"), selected: selectedYearFilter == null, onTap: () { setState(() => selectedYearFilter = null); _applyFilters(); Navigator.pop(context); }),
-          ListTile(title: const Text("Année inconnue"), selected: selectedYearFilter == -1, onTap: () { setState(() => selectedYearFilter = -1); _applyFilters(); Navigator.pop(context); }),
+          const DrawerHeader(
+            child: Center(
+              child: Text("FILTRER PAR ANNÉE", style: TextStyle(color: Color(0xFF7EB8C9), fontWeight: FontWeight.bold))
+            )
+          ),
+          ListTile(
+            title: const Text("Toutes les récitations"), 
+            selected: selectedYearFilter == null, 
+            onTap: () { 
+              setState(() => selectedYearFilter = null); 
+              _applyFilters(); 
+              Navigator.pop(context); 
+            }
+          ),
+          ListTile(
+            title: const Text("Année inconnue"), 
+            selected: selectedYearFilter == -1, 
+            onTap: () { 
+              setState(() => selectedYearFilter = -1); 
+              _applyFilters(); 
+              Navigator.pop(context); 
+            }
+          ),
           const Divider(color: Colors.white24),
           ...years.map((y) {
             return ListTile(
               title: Text("$y H"),
               selected: selectedYearFilter == y,
-              onTap: () { setState(() => selectedYearFilter = y); _applyFilters(); Navigator.pop(context); },
+              onTap: () { 
+                setState(() => selectedYearFilter = y); 
+                _applyFilters(); 
+                Navigator.pop(context); 
+              },
             );
           }),
         ],
@@ -557,7 +653,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
           ListTile(
             leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)),
             title: const Text("Modifier"),
-            onTap: () { Navigator.pop(context); _showForm(rec: rec); },
+            onTap: () { 
+              Navigator.pop(context); 
+              _showForm(rec: rec); 
+            },
           ),
           ListTile(
             leading: const Icon(Icons.delete, color: Colors.red),
@@ -572,10 +671,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
               
               try {
                 final dir = await getApplicationDocumentsDirectory();
+                
+                // Suppression de la miniature
                 if (rec['thumbnail'] != null && !rec['thumbnail'].toString().startsWith('http')) {
                   final t = File(_resolvePath(rec['thumbnail']));
                   if (await t.exists()) await t.delete();
                 }
+                
+                // Suppression du fichier audio
                 String path = rec['fichier'] ?? "";
                 if (path.contains('youtube') || path.contains('youtu.be') || path.contains('shorts')) {
                   final f = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
@@ -606,7 +709,9 @@ class FormDialog extends StatefulWidget {
   final Map<String, dynamic>? rec;
   final VoidCallback onSave;
   final Database? db;
+  
   const FormDialog({super.key, this.rec, required this.onSave, this.db});
+  
   @override
   State<FormDialog> createState() => _FormDialogState();
 }
@@ -636,7 +741,10 @@ class _FormDialogState extends State<FormDialog> {
     
     if (!isFull) {
       List<String> parts = widget.rec!['versets'].split('-');
-      if (parts.length == 2) { _vStart.text = parts[0]; _vEnd.text = parts[1]; }
+      if (parts.length == 2) { 
+        _vStart.text = parts[0]; 
+        _vEnd.text = parts[1]; 
+      }
     }
   }
 
@@ -651,51 +759,85 @@ class _FormDialogState extends State<FormDialog> {
           children: [
             DropdownMenu<Map<String, dynamic>>(
               initialSelection: widget.rec != null ? ALL_SURAHS.firstWhere((s) => s['num'] == widget.rec!['sourate_num']) : ALL_SURAHS[0],
-              width: 280, label: const Text("Sourate"), enableSearch: true,
+              width: 280, 
+              label: const Text("Sourate"), 
+              enableSearch: true,
               dropdownMenuEntries: ALL_SURAHS.map((s) => DropdownMenuEntry(value: s, label: "${s['num']} - ${s['name']}")).toList(),
-              onSelected: (s) { selectedNum = s?['num']; selectedName = s?['name']; },
+              onSelected: (s) { 
+                selectedNum = s?['num']; 
+                selectedName = s?['name']; 
+              },
             ),
             const SizedBox(height: 15),
-            TextField(controller: _year, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Année (H ou G)")),
+            TextField(
+              controller: _year, 
+              keyboardType: TextInputType.number, 
+              decoration: const InputDecoration(labelText: "Année (H ou G)")
+            ),
             const SizedBox(height: 15),
             const Text("Étendue :"),
-            Row(children: [
-              Radio(value: true, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Complet"),
-              Radio(value: false, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), const Text("Partiel"),
-            ]),
-            if (!isFull) Row(children: [
-              Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
-              const SizedBox(width: 10),
-              Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
-            ]),
+            Row(
+              children: [
+                Radio(value: true, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), 
+                const Text("Complet"),
+                Radio(value: false, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), 
+                const Text("Partiel"),
+              ]
+            ),
+            if (!isFull) Row(
+              children: [
+                Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
+                const SizedBox(width: 10),
+                Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
+              ]
+            ),
             const SizedBox(height: 15),
             const Text("Source :"),
-            Row(children: [
-              Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("Local"),
-              Radio(value: false, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), const Text("YouTube"),
-            ]),
-            if (isLocal) Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const SizedBox(height: 10),
-              ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[800], foregroundColor: Colors.white, minimumSize: const Size(double.infinity, 45)),
-                icon: const Icon(Icons.folder_open), label: const Text("Parcourir l'iPhone..."),
-                onPressed: () async {
-                  try {
-                    FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any); 
-                    if (result != null) {
-                      final file = result.files.single;
-                      final dir = await getApplicationDocumentsDirectory();
-                      await File(file.path!).copy(p.join(dir.path, file.name));
-                      setState(() => _file.text = file.name);
+            Row(
+              children: [
+                Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), 
+                const Text("Local"),
+                Radio(value: false, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), 
+                const Text("YouTube"),
+              ]
+            ),
+            if (isLocal) Column(
+              crossAxisAlignment: CrossAxisAlignment.start, 
+              children: [
+                const SizedBox(height: 10),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.grey[800], 
+                    foregroundColor: Colors.white, 
+                    minimumSize: const Size(double.infinity, 45)
+                  ),
+                  icon: const Icon(Icons.folder_open), 
+                  label: const Text("Parcourir l'iPhone..."),
+                  onPressed: () async {
+                    try {
+                      FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any); 
+                      if (result != null) {
+                        final file = result.files.single;
+                        final dir = await getApplicationDocumentsDirectory();
+                        await File(file.path!).copy(p.join(dir.path, file.name));
+                        setState(() => _file.text = file.name);
+                      }
+                    } catch (e) {
+                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur fichiers : $e"), backgroundColor: Colors.red));
                     }
-                  } catch (e) {
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur fichiers : $e"), backgroundColor: Colors.red));
                   }
-                }
-              ),
-              if (_file.text.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8.0), child: Text("🎵 Fichier sélectionné : \n${_file.text}", style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 13))),
-            ])
-            else TextField(controller: _ytUrl, decoration: const InputDecoration(labelText: "Lien YouTube ou Shorts")),
+                ),
+                if (_file.text.isNotEmpty) 
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8.0), 
+                    child: Text("🎵 Fichier sélectionné : \n${_file.text}", style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 13))
+                  ),
+              ]
+            )
+            else TextField(
+              controller: _ytUrl, 
+              decoration: const InputDecoration(labelText: "Lien YouTube ou Shorts")
+            ),
           ],
         ),
       ),
@@ -718,7 +860,9 @@ class _FormDialogState extends State<FormDialog> {
                 try {
                   var video = await yt.videos.get(_ytUrl.text.split('?').first).timeout(const Duration(seconds: 10));
                   String remoteThumb = video.thumbnails.highResUrl;
-                  if (remoteThumb.isEmpty) remoteThumb = video.thumbnails.standardResUrl;
+                  if (remoteThumb.isEmpty) {
+                    remoteThumb = video.thumbnails.standardResUrl;
+                  }
                   
                   dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
                   
@@ -727,7 +871,7 @@ class _FormDialogState extends State<FormDialog> {
                     final thumbName = "thumb_yt_${video.id}.jpg";
                     final thumbFile = File(p.join(dir.path, thumbName));
                     await Dio().download(remoteThumb, thumbFile.path);
-                    thumb = thumbName; // STOCKAGE RELATIF DE LA MINIATURE !
+                    thumb = thumbName; // STOCKAGE RELATIF
                   } catch (e) {
                     thumb = remoteThumb; 
                   }
@@ -744,7 +888,9 @@ class _FormDialogState extends State<FormDialog> {
                 try {
                   final player = AudioPlayer();
                   final d = await player.setFilePath(localFilePath);
-                  if (d != null) dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+                  if (d != null) {
+                    dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+                  }
                   await player.dispose();
                 } catch (e) {
                   debugPrint("Impossible de lire la durée locale: $e");
@@ -756,7 +902,7 @@ class _FormDialogState extends State<FormDialog> {
                     final thumbName = "thumb_${_file.text}.jpg";
                     final artFile = File(p.join(dir.path, thumbName));
                     await artFile.writeAsBytes(metadata.albumArt!);
-                    thumb = thumbName; // STOCKAGE RELATIF DE LA MINIATURE !
+                    thumb = thumbName; // STOCKAGE RELATIF
                   }
                 } catch (e) {
                   debugPrint("Pas d'image trouvée: $e");
@@ -782,7 +928,6 @@ class _FormDialogState extends State<FormDialog> {
                 await widget.db!.update('recitations', data, where: 'id = ?', whereArgs: [recordId]);
               }
 
-              // DECLENCHE LE TÉLÉCHARGEMENT DIRECTEMENT !
               if (!isLocal && _ytUrl.text.isNotEmpty) {
                 final cleanUrl = _ytUrl.text.split('?').first;
                 final dir = await getApplicationDocumentsDirectory();
@@ -796,7 +941,9 @@ class _FormDialogState extends State<FormDialog> {
               if (mounted) Navigator.pop(context);
 
             } catch (e) {
-              if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de sauvegarde : $e"), backgroundColor: Colors.red));
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de sauvegarde : $e"), backgroundColor: Colors.red));
+              }
             }
           },
           child: const Text("Enregistrer", style: TextStyle(color: Colors.white)),
