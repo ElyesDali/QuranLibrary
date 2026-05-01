@@ -13,7 +13,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'package:flutter_media_metadata/flutter_media_metadata.dart';
 import 'package:dio/dio.dart';
-import 'package:webview_flutter/webview_flutter.dart'; // NOUVEAU: Le navigateur web !
+import 'package:webview_flutter/webview_flutter.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -23,29 +23,6 @@ Future<void> main() async {
     androidNotificationOngoing: true,
   );
   runApp(const LuhaidanApp());
-}
-
-Future<void> downloadYoutubeInBackground(String cleanUrl, File localFile) async {
-  var yt = YoutubeExplode();
-  try {
-    var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-    var audioStream = manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-    var stream = yt.videos.streamsClient.get(audioStream);
-    
-    final tempFile = File("${localFile.path}.tmp");
-    var fileStream = tempFile.openWrite();
-    await stream.pipe(fileStream);
-    await fileStream.flush();
-    await fileStream.close();
-    
-    if (await tempFile.length() > 0) {
-      await tempFile.rename(localFile.path);
-    }
-  } catch (e) {
-    debugPrint("Erreur DL: $e");
-  } finally {
-    yt.close();
-  }
 }
 
 const List<Map<String, dynamic>> ALL_SURAHS = [
@@ -113,7 +90,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
   final AudioPlayer _player = AudioPlayer();
   Map<String, dynamic>? currentRecitation;
   
-  
   double volume = 0.8;
   LoopModeState loopMode = LoopModeState.off;
   int? selectedYearFilter;
@@ -128,41 +104,43 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Timer? _countdownTimer;
   DateTime? _timerEndTime;
   int _selectedTimerMinutes = 15;
-  int _lastPosition = 0; // NOUVEAU : Le radar de position
   
+  int _lastPosition = 0; 
+  int _lastDuration = 0; // Le radar mémorise la durée totale de la piste pour éviter les faux positifs
+
   @override
   void initState() {
     super.initState();
     _initApp();
     _player.setVolume(volume);
 
-    // 1. Le radar mémorise la position de la piste en direct
+    // 1. Le radar enregistre l'avancée et la durée de la vraie piste
     _player.positionStream.listen((pos) {
       if (_player.currentIndex == 1 && pos.inMilliseconds > 0) {
         _lastPosition = pos.inMilliseconds;
+        _lastDuration = _player.duration?.inMilliseconds ?? 0;
       }
     });
 
-    // 2. Interception intelligente du changement de piste
+    // 2. Interception intelligente du changement d'index
     _player.currentIndexStream.listen((index) {
       if (_isSwitchingTrack || index == null || index == 1) return; 
       
       _isSwitchingTrack = true;
       _player.pause(); 
       
-      final dur = _player.duration?.inMilliseconds ?? 0;
-      // On vérifie si la piste s'est terminée naturellement (à moins d'une seconde de la fin)
-      bool isNaturalEnd = (_lastPosition > 0 && dur > 0 && _lastPosition >= dur - 1000);
+      // On vérifie si la piste s'est terminée naturellement (à moins d'une seconde de SA durée mémorisée)
+      bool isNaturalEnd = (_lastPosition > 0 && _lastDuration > 0 && _lastPosition >= _lastDuration - 1000);
 
       if (index == 0) {
         _playPrevious();
       } else if (index == 2) {
-        // LA FAMEUSE UTILISATION DE LA VARIABLE : Si bouton gris ET fin naturelle -> On bloque !
         if (loopMode == LoopModeState.off && isNaturalEnd) {
+          // Fin naturelle ET bouton gris -> On bloque l'enchaînement et on rembobine
           _player.seek(Duration.zero, index: 1);
           _isSwitchingTrack = false;
         } else {
-          // Si l'utilisateur a appuyé sur Suivant, ou si Autoplay est activé -> On enchaîne
+          // Bouton bleu OU clic manuel de l'utilisateur -> On enchaîne !
           _playNext();
         }
       }
@@ -245,6 +223,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return base;
   }
 
+  // NOUVEAU : Le générateur de pistes fantômes compatibles avec iOS
+  AudioSource _buildDummySource(Uri uri, MediaItem mediaItem) {
+    return ClippingAudioSource(
+      child: AudioSource.uri(uri, tag: mediaItem), 
+      start: Duration.zero, 
+      end: const Duration(milliseconds: 100), 
+      tag: mediaItem
+    );
+  }
+
   Future<void> _startDownload(int id, String cleanUrl, File localFile) async {
     if (_activeDownloads.containsKey(id)) return; 
     
@@ -285,7 +273,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
         if (await localFile.exists()) await localFile.delete(); 
         await tempFile.rename(localFile.path); 
         
-        // NOUVEAU : POP-UP DE SUCCÈS
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -313,7 +300,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Future<void> _play(Map<String, dynamic> rec) async {
     _isSwitchingTrack = true;
-    _lastPosition = 0; // Reset du radar
+    _lastPosition = 0; 
+    _lastDuration = 0; // Remise à zéro du radar
     await _player.stop(); 
     
     setState(() {
@@ -370,11 +358,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
       int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
       int nextIdx = (currIdx + 1) % displayedRecitations.length;
 
-      // LA SOLUTION D'OPTIMISATION : Des pistes silencieuses natives qui ne téléchargent RIEN
       var playlist = ConcatenatingAudioSource(children: [
-         SilenceAudioSource(duration: const Duration(milliseconds: 500), tag: _createMediaItem(displayedRecitations[prevIdx])),
+         _buildDummySource(realUri, _createMediaItem(displayedRecitations[prevIdx])),
          finalSource,                                                     
-         SilenceAudioSource(duration: const Duration(milliseconds: 500), tag: _createMediaItem(displayedRecitations[nextIdx])),
+         _buildDummySource(realUri, _createMediaItem(displayedRecitations[nextIdx])),
       ]);
 
       await _player.setAudioSource(playlist, initialIndex: 1);
@@ -818,11 +805,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
         children: [
           const DrawerHeader(
             child: Center(
-              child: Text("Luhaidan Library", style: TextStyle(color: Color(0xFF7EB8C9), fontSize: 24, fontWeight: FontWeight.bold))
+              child: Text("MAMK", style: TextStyle(color: Color(0xFF7EB8C9), fontSize: 24, fontWeight: FontWeight.bold))
             )
           ),
           
-          // NOUVEAU : BOUTON NAVIGATEUR YOUTUBE
           ListTile(
             leading: const Icon(Icons.language, color: Color(0xFF7EB8C9)),
             title: const Text("Navigateur YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
@@ -833,7 +819,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 MaterialPageRoute(
                   builder: (context) => YoutubeBrowserScreen(
                     db: _db, 
-                    onSave: _fetch
+                    onSave: _fetch,
+                    onDownload: (id, url, file) => _startDownload(id, url, file),
                   )
                 )
               );
@@ -925,21 +912,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
         onSave: _fetch, 
         db: _db, 
         initialUrl: initialUrl,
-        // NOUVEAU : On donne au formulaire l'accès à la barre de progression
-        onDownload: (id, url, file) => _startDownload(id, url, file), 
+        onDownload: (id, url, file) => _startDownload(id, url, file),
       )
     );
   }
 }
 
-// ============================================================================
-// NOUVEAU : L'ÉCRAN DU NAVIGATEUR YOUTUBE (WEBVIEW)
-// ============================================================================
 class YoutubeBrowserScreen extends StatefulWidget {
   final Database? db;
   final VoidCallback onSave;
-  
-  const YoutubeBrowserScreen({super.key, required this.db, required this.onSave});
+  final Function(int, String, File)? onDownload; 
+
+  const YoutubeBrowserScreen({super.key, required this.db, required this.onSave, this.onDownload});
 
   @override
   State<YoutubeBrowserScreen> createState() => _YoutubeBrowserScreenState();
@@ -968,7 +952,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
           }
         ),
       )
-      ..loadRequest(Uri.parse('https://m.youtube.com/'));
+      ..loadRequest(Uri.parse('https://m.youtube.com/results?search_query=muhammad+al+luhaidan'));
   }
 
   bool get _isVideoPage {
@@ -993,20 +977,19 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
         ],
       ),
       body: WebViewWidget(controller: _controller),
-      // LE BOUTON MAGIQUE ! Il apparaît seulement quand tu es sur une vidéo.
       floatingActionButton: _isVideoPage
           ? FloatingActionButton.extended(
               onPressed: () {
-                // Ouvre la fenêtre d'ajout pré-remplie et referme le navigateur si l'enregistrement réussit
                 showDialog(
                   context: context,
                   builder: (dialogContext) => FormDialog(
                     db: widget.db,
                     onSave: () {
                       widget.onSave();
-                      Navigator.pop(context); // Ferme la page du navigateur
+                      Navigator.pop(context); 
                     },
                     initialUrl: _currentUrl,
+                    onDownload: widget.onDownload, 
                   )
                 );
               },
@@ -1018,15 +1001,13 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
     );
   }
 }
-// ============================================================================
-
 
 class FormDialog extends StatefulWidget {
   final Map<String, dynamic>? rec;
   final VoidCallback onSave;
   final Database? db;
-  final String? initialUrl;
-  final Function(int, String, File)? onDownload; // NOUVEAU
+  final String? initialUrl; 
+  final Function(int, String, File)? onDownload; 
   
   const FormDialog({super.key, this.rec, required this.onSave, this.db, this.initialUrl, this.onDownload});
   
@@ -1066,7 +1047,6 @@ class _FormDialogState extends State<FormDialog> {
     _vStart = TextEditingController(); 
     _vEnd = TextEditingController();
     
-    // Remplir les champs si partiel
     if (widget.rec != null && !isFull) {
       List<String> parts = widget.rec!['versets'].split('-');
       if (parts.length == 2) { 
@@ -1111,8 +1091,6 @@ class _FormDialogState extends State<FormDialog> {
                 const Text("Partiel"),
               ]
             ),
-            
-            // CORRECTION : RESTAURATION DES CHAMPS DEBUT ET FIN
             if (!isFull) Row(
               children: [
                 Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
@@ -1121,7 +1099,6 @@ class _FormDialogState extends State<FormDialog> {
               ]
             ),
             const SizedBox(height: 10),
-            
             Row(
               children: [
                 Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), 
@@ -1158,14 +1135,12 @@ class _FormDialogState extends State<FormDialog> {
         ElevatedButton(
           style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
           onPressed: () async {
-            // NOUVEAU : On englobe tout pour attraper les erreurs (plus de plantage silencieux)
             try {
               String thumb = widget.rec?['thumbnail'] ?? "";
               String dur = widget.rec?['duration'] ?? "";
               
               if (!isLocal && _ytUrl.text.isNotEmpty) {
                 var yt = YoutubeExplode();
-                // CORRECTION MAJEURE : On donne l'URL entière, YoutubeExplode est assez intelligent pour la lire
                 var video = await yt.videos.get(_ytUrl.text);
                 dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
                 
@@ -1209,11 +1184,10 @@ class _FormDialogState extends State<FormDialog> {
               if (widget.rec != null) await widget.db!.update('recitations', data, where: 'id = ?', whereArgs: [recordId]);
               
               if (!isLocal && _ytUrl.text.isNotEmpty) {
-                final cleanUrl = _ytUrl.text; // On garde l'URL pure
+                final cleanUrl = _ytUrl.text;
                 final dir = await getApplicationDocumentsDirectory();
                 final localAudioFile = File(p.join(dir.path, "yt_$recordId.mp4"));
                 if (!await localAudioFile.exists()) {
-                  // DÉCLENCHE ENFIN LA BARRE DE PROGRESSION !
                   widget.onDownload?.call(recordId, cleanUrl, localAudioFile);
                 }
               }
@@ -1222,12 +1196,11 @@ class _FormDialogState extends State<FormDialog> {
               if (mounted) Navigator.pop(context);
 
             } catch (e) {
-              // Si le lien YouTube est invalide, tu auras un pop-up rouge au lieu de rien !
               if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : L'URL est invalide ou la vidéo est privée"), backgroundColor: Colors.red));
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : Lien invalide ou vidéo privée"), backgroundColor: Colors.red));
               }
             }
-          },
+          }, 
           child: const Text("Enregistrer", style: TextStyle(color: Colors.white))
         )
       ],
