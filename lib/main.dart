@@ -13,6 +13,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'package:flutter_media_metadata/flutter_media_metadata.dart';
 import 'package:dio/dio.dart';
+import 'package:webview_flutter/webview_flutter.dart'; // NOUVEAU: Le navigateur web !
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -122,7 +123,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
   String? _appDirPath;
   Map<int, double> _activeDownloads = {}; 
 
-  // VARIABLES DU MINUTEUR
   Timer? _sleepTimer;
   Timer? _countdownTimer;
   DateTime? _timerEndTime;
@@ -134,12 +134,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    // INTERCEPTION DES BOUTONS AIRPLAY / VERROUILLAGE
     _player.currentIndexStream.listen((index) {
       if (_isSwitchingTrack || index == null || index == 1) return; 
       
       _isSwitchingTrack = true;
-      _player.pause(); // Coupe le son instantanément pour éviter d'entendre la fausse piste
+      _player.pause(); 
       
       if (index == 0) {
         _playPrevious();
@@ -148,7 +147,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
     });
 
-    // GESTION DE LA FIN NATURELLE DE LA PISTE
     _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
         if (loopMode == LoopModeState.autoplay && !_isSwitchingTrack) {
@@ -156,7 +154,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
           _playNext();
         } else if (loopMode == LoopModeState.off) {
           _player.pause();
-          _player.seek(Duration.zero, index: 1); // Reset propre au centre
+          _player.seek(Duration.zero, index: 1); 
         }
       }
     });
@@ -342,17 +340,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
         }
       }
 
-      // LA PLAYLIST MAGIQUE : 3 pistes, mais avec les MÊMES URLs pour ne pas faire bugger iOS
       int currIdx = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
       int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
       int nextIdx = (currIdx + 1) % displayedRecitations.length;
 
       var playlist = ConcatenatingAudioSource(children: [
-         // Piste 0 : Fantôme pour le bouton "Précédent"
          AudioSource.uri(realUri, tag: _createMediaItem(displayedRecitations[prevIdx])),
-         // Piste 1 : La Vraie Piste Actuelle
          finalSource,                                                     
-         // Piste 2 : Fantôme pour le bouton "Suivant"
          AudioSource.uri(realUri, tag: _createMediaItem(displayedRecitations[nextIdx])),
       ]);
 
@@ -398,7 +392,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  // GESTION DU MINUTEUR
   void _cancelTimer() {
     _sleepTimer?.cancel();
     _countdownTimer?.cancel();
@@ -638,7 +631,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
               child: LinearProgressIndicator(color: Color(0xFF7EB8C9))
             ),
             
-          // LIGNE DU HAUT : INFO SOURATE + MINUTEUR
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -729,7 +721,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
             },
           ),
           
-          // LIGNE DU BAS : SYMETRIE PARFAITE A 5 BOUTONS
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
@@ -800,7 +791,37 @@ class _LibraryScreenState extends State<LibraryScreen> {
       backgroundColor: const Color(0xFF0A0A0A),
       child: ListView(
         children: [
-          const DrawerHeader(child: Center(child: Text("FILTRES", style: TextStyle(color: Color(0xFF7EB8C9))))),
+          const DrawerHeader(
+            child: Center(
+              child: Text("MAMK", style: TextStyle(color: Color(0xFF7EB8C9), fontSize: 24, fontWeight: FontWeight.bold))
+            )
+          ),
+          
+          // NOUVEAU : BOUTON NAVIGATEUR YOUTUBE
+          ListTile(
+            leading: const Icon(Icons.language, color: Color(0xFF7EB8C9)),
+            title: const Text("Navigateur YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
+            onTap: () {
+              Navigator.pop(context); 
+              Navigator.push(
+                context, 
+                MaterialPageRoute(
+                  builder: (context) => YoutubeBrowserScreen(
+                    db: _db, 
+                    onSave: _fetch
+                  )
+                )
+              );
+            },
+          ),
+          
+          const Divider(color: Colors.white24),
+          
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+            child: Text("Filtres", style: TextStyle(color: Colors.grey, fontSize: 12)),
+          ),
+          
           ListTile(
             title: const Text("Toutes les récitations"), 
             selected: selectedYearFilter == null,
@@ -871,20 +892,110 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
   }
 
-  void _showForm({Map<String, dynamic>? rec}) {
+  void _showForm({Map<String, dynamic>? rec, String? initialUrl}) {
     showDialog(
       context: context, 
-      builder: (context) => FormDialog(rec: rec, onSave: _fetch, db: _db)
+      builder: (context) => FormDialog(rec: rec, onSave: _fetch, db: _db, initialUrl: initialUrl)
     );
   }
 }
+
+// ============================================================================
+// NOUVEAU : L'ÉCRAN DU NAVIGATEUR YOUTUBE (WEBVIEW)
+// ============================================================================
+class YoutubeBrowserScreen extends StatefulWidget {
+  final Database? db;
+  final VoidCallback onSave;
+  
+  const YoutubeBrowserScreen({super.key, required this.db, required this.onSave});
+
+  @override
+  State<YoutubeBrowserScreen> createState() => _YoutubeBrowserScreenState();
+}
+
+class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
+  late final WebViewController _controller;
+  String _currentUrl = "";
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onUrlChange: (UrlChange change) {
+            if (mounted) {
+              setState(() {
+                _currentUrl = change.url ?? "";
+              });
+            }
+          },
+          onNavigationRequest: (NavigationRequest request) {
+            return NavigationDecision.navigate;
+          }
+        ),
+      )
+      ..loadRequest(Uri.parse('https://m.youtube.com/results?search_query=muhammad+al+luhaidan'));
+  }
+
+  bool get _isVideoPage {
+    return _currentUrl.contains('watch?v=') || _currentUrl.contains('youtu.be') || _currentUrl.contains('/shorts/');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("Naviguer sur YouTube", style: TextStyle(color: Color(0xFF7EB8C9))),
+        backgroundColor: const Color(0xFF111111),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () => Navigator.pop(context),
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () => _controller.reload(),
+          )
+        ],
+      ),
+      body: WebViewWidget(controller: _controller),
+      // LE BOUTON MAGIQUE ! Il apparaît seulement quand tu es sur une vidéo.
+      floatingActionButton: _isVideoPage
+          ? FloatingActionButton.extended(
+              onPressed: () {
+                // Ouvre la fenêtre d'ajout pré-remplie et referme le navigateur si l'enregistrement réussit
+                showDialog(
+                  context: context,
+                  builder: (dialogContext) => FormDialog(
+                    db: widget.db,
+                    onSave: () {
+                      widget.onSave();
+                      Navigator.pop(context); // Ferme la page du navigateur
+                    },
+                    initialUrl: _currentUrl,
+                  )
+                );
+              },
+              backgroundColor: const Color(0xFF4A8FA3),
+              icon: const Icon(Icons.download, color: Colors.white),
+              label: const Text("Télécharger la vidéo", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            )
+          : null,
+    );
+  }
+}
+// ============================================================================
+
 
 class FormDialog extends StatefulWidget {
   final Map<String, dynamic>? rec;
   final VoidCallback onSave;
   final Database? db;
+  final String? initialUrl; // Permet de pré-remplir depuis le navigateur
   
-  const FormDialog({super.key, this.rec, required this.onSave, this.db});
+  const FormDialog({super.key, this.rec, required this.onSave, this.db, this.initialUrl});
   
   @override 
   State<FormDialog> createState() => _FormDialogState();
@@ -900,16 +1011,28 @@ class _FormDialogState extends State<FormDialog> {
   @override
   void initState() {
     super.initState();
+    
+    // Logique de sélection Local ou Youtube
+    bool defaultIsLocal = true;
+    if (widget.rec != null) {
+      defaultIsLocal = !(widget.rec!['fichier']?.toString().contains('youtu') ?? false);
+    } else if (widget.initialUrl != null && widget.initialUrl!.isNotEmpty) {
+      defaultIsLocal = false; // Si on vient du navigateur, on coche "YouTube" par défaut !
+    }
+    isLocal = defaultIsLocal;
+    
     if (widget.rec != null) {
       selectedNum = widget.rec!['sourate_num'];
       selectedName = widget.rec!['sourate_name'];
       isFull = widget.rec!['versets'] == "complet";
-      isLocal = !(widget.rec!['fichier']?.toString().contains('youtu') ?? false);
     }
     
     _year = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
     _file = TextEditingController(text: (widget.rec != null && isLocal) ? widget.rec!['fichier'] : "");
-    _ytUrl = TextEditingController(text: (widget.rec != null && !isLocal) ? widget.rec!['fichier'] : "");
+    
+    // Si on vient du navigateur, l'URL est déjà prête
+    _ytUrl = TextEditingController(text: widget.initialUrl ?? ((widget.rec != null && !isLocal) ? widget.rec!['fichier'] : ""));
+    
     _vStart = TextEditingController(); 
     _vEnd = TextEditingController();
   }
