@@ -111,26 +111,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    // 1. LE GESTIONNAIRE DE FIN DE PISTE INTELLIGENT (Sans Freeze)
     _player.positionStream.listen((pos) async {
       if (_player.currentIndex == 1 && !_isSwitchingTrack) {
         final dur = _player.duration;
         if (dur != null && dur.inMilliseconds > 0) {
-          
-          // Si on est à 400ms de la fin de la piste (avant que l'iPhone ne bascule tout seul)
           if (pos.inMilliseconds >= dur.inMilliseconds - 400) {
-            
-            if (loopMode == LoopModeState.one) return; // just_audio gère sa boucle tout seul
-            
+            if (loopMode == LoopModeState.one) return; 
             _isSwitchingTrack = true;
-
             if (loopMode == LoopModeState.off) {
-              // LECTURE DÉSACTIVÉE : On met pause et on rembobine au début (Ton idée !)
               await _player.pause();
               await _player.seek(Duration.zero, index: 1);
               _isSwitchingTrack = false;
             } else if (loopMode == LoopModeState.autoplay) {
-              // LECTURE ENCHAÎNÉE : On passe à la piste suivante 
               _playNext();
             }
           }
@@ -138,7 +130,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
     });
 
-    // 2. L'INTERCEPTEUR MANUEL : Gère UNIQUEMENT les clics de l'utilisateur sur Suivant/Précédent
     _player.currentIndexStream.listen((index) {
       if (_isSwitchingTrack || index == null || index == 1) return; 
       
@@ -160,14 +151,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
     final path = p.join(dir.path, 'luhaidan.db');
     _db = await openDatabase(
       path,
-      version: 2,
+      version: 3, // MISE A JOUR DB
       onCreate: (db, version) => db.execute(
-        'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, fichier TEXT, versets TEXT, annee_g INTEGER, thumbnail TEXT, duration TEXT)'
+        'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, annee_g INTEGER, fichier TEXT, versets TEXT, thumbnail TEXT, duration TEXT)'
       ),
       onUpgrade: (db, oldV, newV) {
         if (oldV < 2) {
           db.execute('ALTER TABLE recitations ADD COLUMN thumbnail TEXT');
           db.execute('ALTER TABLE recitations ADD COLUMN duration TEXT');
+        }
+        if (oldV < 3) {
+          try { db.execute('ALTER TABLE recitations ADD COLUMN annee_g INTEGER'); } catch (_) {}
         }
       }
     );
@@ -587,7 +581,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         child: _buildThumbnail(rec['thumbnail'])
                       ),
                       title: Text("${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}"),
-                      subtitle: Text("${rec['annee'] ?? '??'} H • Versets: ${rec['versets']}"),
+                      // CORRECTION : AFFICHAGE DES DEUX ANNÉES (H et G)
+                      subtitle: Text("${rec['annee'] ?? '??'} H / ${rec['annee_g'] ?? '??'} G • Versets: ${rec['versets']}"),
                       trailing: _activeDownloads.containsKey(rec['id'])
                           ? SizedBox(
                               width: 44, height: 44,
@@ -658,7 +653,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)
                     ),
                     Text(
-                      "${currentRecitation!['annee'] ?? '??'} H • Versets: ${currentRecitation!['versets']}", 
+                      "${currentRecitation!['annee'] ?? '??'} H / ${currentRecitation!['annee_g'] ?? '??'} G • Versets: ${currentRecitation!['versets']}", 
                       style: const TextStyle(fontSize: 12, color: Color(0xFF6A7A82))
                     ),
                   ],
@@ -943,6 +938,10 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(
         NavigationDelegate(
+          onPageFinished: (String url) {
+            // CORRECTION YOUTUBE : Supprime silencieusement les aperçus vidéos qui auto-play en plein écran
+            _controller.runJavaScript("document.querySelectorAll('ytm-inline-preview').forEach(e => e.remove());");
+          },
           onUrlChange: (UrlChange change) {
             if (mounted) {
               setState(() {
@@ -962,45 +961,65 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
     return _currentUrl.contains('watch?v=') || _currentUrl.contains('youtu.be') || _currentUrl.contains('/shorts/');
   }
 
+  // CORRECTION NAVIGATION : Gère le retour en arrière DANS la page web
+  Future<bool> _handleBack() async {
+    if (await _controller.canGoBack()) {
+      _controller.goBack();
+      return false; // Bloque la fermeture de l'écran global
+    }
+    return true; // Autorise la fermeture si on est tout au début de l'historique
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text("Naviguer sur YouTube", style: TextStyle(color: Color(0xFF7EB8C9))),
-        backgroundColor: const Color(0xFF111111),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: () => Navigator.pop(context),
-        ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: () => _controller.reload(),
-          )
-        ],
-      ),
-      body: WebViewWidget(controller: _controller),
-      floatingActionButton: _isVideoPage
-          ? FloatingActionButton.extended(
-              onPressed: () {
-                showDialog(
-                  context: context,
-                  builder: (dialogContext) => FormDialog(
-                    db: widget.db,
-                    onSave: () {
-                      widget.onSave();
-                      Navigator.pop(context); 
-                    },
-                    initialUrl: _currentUrl,
-                    onDownload: widget.onDownload, 
-                  )
-                );
-              },
-              backgroundColor: const Color(0xFF4A8FA3),
-              icon: const Icon(Icons.download, color: Colors.white),
-              label: const Text("Télécharger la vidéo", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+    // WillPopScope intercepte le bouton retour physique d'Android
+    return WillPopScope(
+      onWillPop: _handleBack,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text("Naviguer sur YouTube", style: TextStyle(color: Color(0xFF7EB8C9))),
+          backgroundColor: const Color(0xFF111111),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () async {
+              // Intercepte le clic sur la flèche en haut à gauche
+              if (await _controller.canGoBack()) {
+                _controller.goBack();
+              } else {
+                if (mounted) Navigator.pop(context);
+              }
+            },
+          ),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: () => _controller.reload(),
             )
-          : null,
+          ],
+        ),
+        body: WebViewWidget(controller: _controller),
+        floatingActionButton: _isVideoPage
+            ? FloatingActionButton.extended(
+                onPressed: () {
+                  showDialog(
+                    context: context,
+                    builder: (dialogContext) => FormDialog(
+                      db: widget.db,
+                      onSave: () {
+                        widget.onSave();
+                        Navigator.pop(context); 
+                      },
+                      initialUrl: _currentUrl,
+                      onDownload: widget.onDownload, 
+                    )
+                  );
+                },
+                backgroundColor: const Color(0xFF4A8FA3),
+                icon: const Icon(Icons.download, color: Colors.white),
+                label: const Text("Télécharger la vidéo", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              )
+            : null,
+      ),
     );
   }
 }
@@ -1021,7 +1040,7 @@ class FormDialog extends StatefulWidget {
 class _FormDialogState extends State<FormDialog> {
   int? selectedNum = 1;
   String? selectedName = "Al-Fatiha";
-  late TextEditingController _year, _file, _ytUrl, _vStart, _vEnd;
+  late TextEditingController _yearH, _yearG, _file, _ytUrl, _vStart, _vEnd;
   bool isLocal = true; 
   bool isFull = true;
 
@@ -1043,7 +1062,10 @@ class _FormDialogState extends State<FormDialog> {
       isFull = widget.rec!['versets'] == "complet";
     }
     
-    _year = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
+    // CORRECTION : Initialisation des DEUX variables d'années
+    _yearH = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
+    _yearG = TextEditingController(text: widget.rec?['annee_g']?.toString() ?? "");
+    
     _file = TextEditingController(text: (widget.rec != null && isLocal) ? widget.rec!['fichier'] : "");
     _ytUrl = TextEditingController(text: widget.initialUrl ?? ((widget.rec != null && !isLocal) ? widget.rec!['fichier'] : ""));
     
@@ -1056,6 +1078,26 @@ class _FormDialogState extends State<FormDialog> {
         _vStart.text = parts[0]; 
         _vEnd.text = parts[1]; 
       }
+    }
+  }
+
+  // MATHS : Conversion automatique H -> G
+  void _updateGregorian(String hText) {
+    if (hText.isEmpty) { _yearG.clear(); return; }
+    int? h = int.tryParse(hText);
+    if (h != null) {
+      int g = h - (h ~/ 33) + 622;
+      if (_yearG.text != g.toString()) _yearG.text = g.toString();
+    }
+  }
+
+  // MATHS : Conversion automatique G -> H
+  void _updateHijri(String gText) {
+    if (gText.isEmpty) { _yearH.clear(); return; }
+    int? g = int.tryParse(gText);
+    if (g != null) {
+      int h = g - 622 + ((g - 622) ~/ 32);
+      if (_yearH.text != h.toString()) _yearH.text = h.toString();
     }
   }
 
@@ -1080,11 +1122,30 @@ class _FormDialogState extends State<FormDialog> {
               },
             ),
             const SizedBox(height: 10),
-            TextField(
-              controller: _year, 
-              keyboardType: TextInputType.number, 
-              decoration: const InputDecoration(labelText: "Année (H)")
+            
+            // CORRECTION : Ligne contenant les DEUX années avec mise à jour auto
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _yearH, 
+                    keyboardType: TextInputType.number, 
+                    decoration: const InputDecoration(labelText: "Année (H)"),
+                    onChanged: _updateGregorian,
+                  )
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: TextField(
+                    controller: _yearG, 
+                    keyboardType: TextInputType.number, 
+                    decoration: const InputDecoration(labelText: "Année (G)"),
+                    onChanged: _updateHijri,
+                  )
+                ),
+              ]
             ),
+            
             const SizedBox(height: 10),
             Row(
               children: [
@@ -1176,7 +1237,8 @@ class _FormDialogState extends State<FormDialog> {
               final data = {
                 "sourate_num": selectedNum, 
                 "sourate_name": selectedName,
-                "annee": int.tryParse(_year.text), 
+                "annee": int.tryParse(_yearH.text), // Sauvegarde de l'année Hijri
+                "annee_g": int.tryParse(_yearG.text), // Sauvegarde de l'année Grégorienne
                 "fichier": isLocal ? _file.text : _ytUrl.text,
                 "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
                 "thumbnail": thumb, 
