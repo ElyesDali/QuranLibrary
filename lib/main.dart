@@ -113,6 +113,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   final AudioPlayer _player = AudioPlayer();
   Map<String, dynamic>? currentRecitation;
   
+  
   double volume = 0.8;
   LoopModeState loopMode = LoopModeState.off;
   int? selectedYearFilter;
@@ -127,34 +128,42 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Timer? _countdownTimer;
   DateTime? _timerEndTime;
   int _selectedTimerMinutes = 15;
-
+  int _lastPosition = 0; // NOUVEAU : Le radar de position
+  
   @override
   void initState() {
     super.initState();
     _initApp();
     _player.setVolume(volume);
 
+    // 1. Le radar mémorise la position de la piste en direct
+    _player.positionStream.listen((pos) {
+      if (_player.currentIndex == 1 && pos.inMilliseconds > 0) {
+        _lastPosition = pos.inMilliseconds;
+      }
+    });
+
+    // 2. Interception intelligente du changement de piste
     _player.currentIndexStream.listen((index) {
       if (_isSwitchingTrack || index == null || index == 1) return; 
       
       _isSwitchingTrack = true;
       _player.pause(); 
       
+      final dur = _player.duration?.inMilliseconds ?? 0;
+      // Si on était à moins d'1 seconde de la fin, c'est une fin "naturelle"
+      bool isNaturalEnd = (_lastPosition > 0 && dur > 0 && _lastPosition >= dur - 1000);
+
       if (index == 0) {
         _playPrevious();
       } else if (index == 2) {
-        _playNext();
-      }
-    });
-
-    _player.playerStateStream.listen((state) {
-      if (state.processingState == ProcessingState.completed) {
-        if (loopMode == LoopModeState.autoplay && !_isSwitchingTrack) {
-          _isSwitchingTrack = true;
+        if (loopMode == LoopModeState.off && isNaturalEnd) {
+          // Fin naturelle ET bouton gris -> On s'arrête net et on rembobine
+          _player.seek(Duration.zero, index: 1);
+          _isSwitchingTrack = false;
+        } else {
+          // L'utilisateur a cliqué "Suivant", ou le bouton Autoplay est bleu -> On enchaîne
           _playNext();
-        } else if (loopMode == LoopModeState.off) {
-          _player.pause();
-          _player.seek(Duration.zero, index: 1); 
         }
       }
     });
@@ -304,6 +313,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Future<void> _play(Map<String, dynamic> rec) async {
     _isSwitchingTrack = true;
+    _lastPosition = 0; // NOUVEAU : Reset du radar
     await _player.stop(); 
     
     setState(() {
@@ -812,7 +822,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         children: [
           const DrawerHeader(
             child: Center(
-              child: Text("LL", style: TextStyle(color: Color(0xFF7EB8C9), fontSize: 24, fontWeight: FontWeight.bold))
+              child: Text("Luhaidan Library", style: TextStyle(color: Color(0xFF7EB8C9), fontSize: 24, fontWeight: FontWeight.bold))
             )
           ),
           
