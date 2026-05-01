@@ -324,7 +324,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
     try {
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
-        final cleanUrl = path.split('?').first;
+        // CORRECTION MAJEURE ICI : On garde l'URL intacte, on ne coupe plus après le "?"
+        final cleanUrl = path; 
+        
         final dir = await getApplicationDocumentsDirectory();
         final localFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
 
@@ -341,7 +343,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
             
             _startDownload(rec['id'], cleanUrl, localFile); 
           } catch (e) {
-            throw Exception("Fichier non disponible hors-ligne");
+            // Affichage de la vraie erreur pour comprendre ce qui bloque si ça arrive
+            throw Exception("Erreur de connexion à YouTube ($e)");
           } finally {
             yt.close();
           }
@@ -809,7 +812,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         children: [
           const DrawerHeader(
             child: Center(
-              child: Text("MAMK", style: TextStyle(color: Color(0xFF7EB8C9), fontSize: 24, fontWeight: FontWeight.bold))
+              child: Text("LL", style: TextStyle(color: Color(0xFF7EB8C9), fontSize: 24, fontWeight: FontWeight.bold))
             )
           ),
           
@@ -959,7 +962,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
           }
         ),
       )
-      ..loadRequest(Uri.parse('https://m.youtube.com/results?search_query=muhammad+al+luhaidan'));
+      ..loadRequest(Uri.parse('https://m.youtube.com/'));
   }
 
   bool get _isVideoPage {
