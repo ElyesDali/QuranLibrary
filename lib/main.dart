@@ -151,18 +151,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
       _player.pause(); 
       
       final dur = _player.duration?.inMilliseconds ?? 0;
-      // Si on était à moins d'1 seconde de la fin, c'est une fin "naturelle"
+      // On vérifie si la piste s'est terminée naturellement (à moins d'une seconde de la fin)
       bool isNaturalEnd = (_lastPosition > 0 && dur > 0 && _lastPosition >= dur - 1000);
 
       if (index == 0) {
         _playPrevious();
       } else if (index == 2) {
+        // LA FAMEUSE UTILISATION DE LA VARIABLE : Si bouton gris ET fin naturelle -> On bloque !
         if (loopMode == LoopModeState.off && isNaturalEnd) {
-          // Fin naturelle ET bouton gris -> On s'arrête net et on rembobine
           _player.seek(Duration.zero, index: 1);
           _isSwitchingTrack = false;
         } else {
-          // L'utilisateur a cliqué "Suivant", ou le bouton Autoplay est bleu -> On enchaîne
+          // Si l'utilisateur a appuyé sur Suivant, ou si Autoplay est activé -> On enchaîne
           _playNext();
         }
       }
@@ -313,7 +313,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Future<void> _play(Map<String, dynamic> rec) async {
     _isSwitchingTrack = true;
-    _lastPosition = 0; // NOUVEAU : Reset du radar
+    _lastPosition = 0; // Reset du radar
     await _player.stop(); 
     
     setState(() {
@@ -334,9 +334,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
     try {
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
-        // CORRECTION MAJEURE ICI : On garde l'URL intacte, on ne coupe plus après le "?"
         final cleanUrl = path; 
-        
         final dir = await getApplicationDocumentsDirectory();
         final localFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
 
@@ -353,7 +351,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
             
             _startDownload(rec['id'], cleanUrl, localFile); 
           } catch (e) {
-            // Affichage de la vraie erreur pour comprendre ce qui bloque si ça arrive
             throw Exception("Erreur de connexion à YouTube ($e)");
           } finally {
             yt.close();
@@ -373,10 +370,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
       int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
       int nextIdx = (currIdx + 1) % displayedRecitations.length;
 
+      // LA SOLUTION D'OPTIMISATION : Des pistes silencieuses natives qui ne téléchargent RIEN
       var playlist = ConcatenatingAudioSource(children: [
-         AudioSource.uri(realUri, tag: _createMediaItem(displayedRecitations[prevIdx])),
+         SilenceAudioSource(duration: const Duration(milliseconds: 500), tag: _createMediaItem(displayedRecitations[prevIdx])),
          finalSource,                                                     
-         AudioSource.uri(realUri, tag: _createMediaItem(displayedRecitations[nextIdx])),
+         SilenceAudioSource(duration: const Duration(milliseconds: 500), tag: _createMediaItem(displayedRecitations[nextIdx])),
       ]);
 
       await _player.setAudioSource(playlist, initialIndex: 1);
@@ -384,9 +382,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red)
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
       }
     } finally {
       setState(() => _isDownloading = false);
