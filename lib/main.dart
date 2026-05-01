@@ -1149,74 +1149,76 @@ class _FormDialogState extends State<FormDialog> {
         ElevatedButton(
           style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
           onPressed: () async {
-            String thumb = widget.rec?['thumbnail'] ?? "";
-            String dur = widget.rec?['duration'] ?? "";
-            
-            if (!isLocal && _ytUrl.text.isNotEmpty) {
-              var yt = YoutubeExplode();
-              var video = await yt.videos.get(_ytUrl.text.split('?').first);
-              dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
+            // NOUVEAU : On englobe tout pour attraper les erreurs (plus de plantage silencieux)
+            try {
+              String thumb = widget.rec?['thumbnail'] ?? "";
+              String dur = widget.rec?['duration'] ?? "";
               
-              try {
-                 final dir = await getApplicationDocumentsDirectory();
-                 final thumbName = "thumb_yt_${video.id}.jpg";
-                 await Dio().download(video.thumbnails.highResUrl, p.join(dir.path, thumbName));
-                 thumb = thumbName;
-              } catch (_) { 
-                 thumb = video.thumbnails.standardResUrl; 
-              }
-              yt.close();
-            } else if (isLocal && _file.text.isNotEmpty) {
-              final dir = await getApplicationDocumentsDirectory();
-              final localFilePath = p.join(dir.path, _file.text);
-              
-              try {
-                final metadata = await MetadataRetriever.fromFile(File(localFilePath));
-                if (metadata.trackDuration != null) {
-                  final d = Duration(milliseconds: metadata.trackDuration!);
-                  dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
-                }
-                if (metadata.albumArt != null) {
-                  final thumbName = "thumb_${_file.text}.jpg";
-                  await File(p.join(dir.path, thumbName)).writeAsBytes(metadata.albumArt!);
-                  thumb = thumbName;
-                }
-              } catch (e) { 
-                debugPrint("Erreur metadata: $e"); 
-              }
-            }
-            
-            final data = {
-              "sourate_num": selectedNum, 
-              "sourate_name": selectedName,
-              "annee": int.tryParse(_year.text), 
-              "fichier": isLocal ? _file.text : _ytUrl.text,
-              "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
-              "thumbnail": thumb, 
-              "duration": dur,
-            };
-            
-            int recordId = widget.rec == null 
-                ? await widget.db!.insert('recitations', data) 
-                : widget.rec!['id'];
+              if (!isLocal && _ytUrl.text.isNotEmpty) {
+                var yt = YoutubeExplode();
+                // CORRECTION MAJEURE : On donne l'URL entière, YoutubeExplode est assez intelligent pour la lire
+                var video = await yt.videos.get(_ytUrl.text);
+                dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
                 
-            if (widget.rec != null) {
-              await widget.db!.update('recitations', data, where: 'id = ?', whereArgs: [recordId]);
-            }
-            
-            // CORRECTION : Déclenchement du vrai téléchargeur animé
-            if (!isLocal && _ytUrl.text.isNotEmpty) {
-              final cleanUrl = _ytUrl.text.split('?').first;
-              final dir = await getApplicationDocumentsDirectory();
-              final localAudioFile = File(p.join(dir.path, "yt_$recordId.mp4"));
-              if (!await localAudioFile.exists()) {
-                widget.onDownload?.call(recordId, cleanUrl, localAudioFile);
+                try {
+                   final dir = await getApplicationDocumentsDirectory();
+                   final thumbName = "thumb_yt_${video.id}.jpg";
+                   await Dio().download(video.thumbnails.highResUrl, p.join(dir.path, thumbName));
+                   thumb = thumbName;
+                } catch (_) { 
+                   thumb = video.thumbnails.standardResUrl; 
+                }
+                yt.close();
+              } else if (isLocal && _file.text.isNotEmpty) {
+                final dir = await getApplicationDocumentsDirectory();
+                final localFilePath = p.join(dir.path, _file.text);
+                try {
+                  final metadata = await MetadataRetriever.fromFile(File(localFilePath));
+                  if (metadata.trackDuration != null) {
+                    final d = Duration(milliseconds: metadata.trackDuration!);
+                    dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+                  }
+                  if (metadata.albumArt != null) {
+                    final thumbName = "thumb_${_file.text}.jpg";
+                    await File(p.join(dir.path, thumbName)).writeAsBytes(metadata.albumArt!);
+                    thumb = thumbName;
+                  }
+                } catch (e) { debugPrint("Erreur metadata: $e"); }
+              }
+              
+              final data = {
+                "sourate_num": selectedNum, 
+                "sourate_name": selectedName,
+                "annee": int.tryParse(_year.text), 
+                "fichier": isLocal ? _file.text : _ytUrl.text,
+                "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
+                "thumbnail": thumb, 
+                "duration": dur,
+              };
+              
+              int recordId = widget.rec == null ? await widget.db!.insert('recitations', data) : widget.rec!['id'];
+              if (widget.rec != null) await widget.db!.update('recitations', data, where: 'id = ?', whereArgs: [recordId]);
+              
+              if (!isLocal && _ytUrl.text.isNotEmpty) {
+                final cleanUrl = _ytUrl.text; // On garde l'URL pure
+                final dir = await getApplicationDocumentsDirectory();
+                final localAudioFile = File(p.join(dir.path, "yt_$recordId.mp4"));
+                if (!await localAudioFile.exists()) {
+                  // DÉCLENCHE ENFIN LA BARRE DE PROGRESSION !
+                  widget.onDownload?.call(recordId, cleanUrl, localAudioFile);
+                }
+              }
+              
+              widget.onSave(); 
+              if (mounted) Navigator.pop(context);
+
+            } catch (e) {
+              // Si le lien YouTube est invalide, tu auras un pop-up rouge au lieu de rien !
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : L'URL est invalide ou la vidéo est privée"), backgroundColor: Colors.red));
               }
             }
-            
-            widget.onSave(); 
-            if (mounted) Navigator.pop(context);
-          }, 
+          },
           child: const Text("Enregistrer", style: TextStyle(color: Colors.white))
         )
       ],
