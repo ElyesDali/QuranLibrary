@@ -104,9 +104,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Timer? _countdownTimer;
   DateTime? _timerEndTime;
   int _selectedTimerMinutes = 15;
-  
-  int _lastPosition = 0; 
-  int _lastDuration = 0; // Le radar mémorise la durée totale de la piste pour éviter les faux positifs
 
   @override
   void initState() {
@@ -114,35 +111,44 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    // 1. Le radar enregistre l'avancée et la durée de la vraie piste
-    _player.positionStream.listen((pos) {
-      if (_player.currentIndex == 1 && pos.inMilliseconds > 0) {
-        _lastPosition = pos.inMilliseconds;
-        _lastDuration = _player.duration?.inMilliseconds ?? 0;
+    // 1. LE GESTIONNAIRE DE FIN DE PISTE INTELLIGENT (Sans Freeze)
+    _player.positionStream.listen((pos) async {
+      if (_player.currentIndex == 1 && !_isSwitchingTrack) {
+        final dur = _player.duration;
+        if (dur != null && dur.inMilliseconds > 0) {
+          
+          // Si on est à 400ms de la fin de la piste (avant que l'iPhone ne bascule tout seul)
+          if (pos.inMilliseconds >= dur.inMilliseconds - 400) {
+            
+            if (loopMode == LoopModeState.one) return; // just_audio gère sa boucle tout seul
+            
+            _isSwitchingTrack = true;
+
+            if (loopMode == LoopModeState.off) {
+              // LECTURE DÉSACTIVÉE : On met pause et on rembobine au début (Ton idée !)
+              await _player.pause();
+              await _player.seek(Duration.zero, index: 1);
+              _isSwitchingTrack = false;
+            } else if (loopMode == LoopModeState.autoplay) {
+              // LECTURE ENCHAÎNÉE : On passe à la piste suivante 
+              _playNext();
+            }
+          }
+        }
       }
     });
 
-    // 2. Interception intelligente du changement d'index
+    // 2. L'INTERCEPTEUR MANUEL : Gère UNIQUEMENT les clics de l'utilisateur sur Suivant/Précédent
     _player.currentIndexStream.listen((index) {
       if (_isSwitchingTrack || index == null || index == 1) return; 
       
       _isSwitchingTrack = true;
       _player.pause(); 
       
-      // On vérifie si la piste s'est terminée naturellement (à moins d'une seconde de SA durée mémorisée)
-      bool isNaturalEnd = (_lastPosition > 0 && _lastDuration > 0 && _lastPosition >= _lastDuration - 1000);
-
       if (index == 0) {
         _playPrevious();
       } else if (index == 2) {
-        if (loopMode == LoopModeState.off && isNaturalEnd) {
-          // Fin naturelle ET bouton gris -> On bloque l'enchaînement et on rembobine
-          _player.seek(Duration.zero, index: 1);
-          _isSwitchingTrack = false;
-        } else {
-          // Bouton bleu OU clic manuel de l'utilisateur -> On enchaîne !
-          _playNext();
-        }
+        _playNext();
       }
     });
   }
@@ -223,7 +229,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return base;
   }
 
-  // NOUVEAU : Le générateur de pistes fantômes compatibles avec iOS
   AudioSource _buildDummySource(Uri uri, MediaItem mediaItem) {
     return ClippingAudioSource(
       child: AudioSource.uri(uri, tag: mediaItem), 
@@ -300,8 +305,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Future<void> _play(Map<String, dynamic> rec) async {
     _isSwitchingTrack = true;
-    _lastPosition = 0; 
-    _lastDuration = 0; // Remise à zéro du radar
     await _player.stop(); 
     
     setState(() {
