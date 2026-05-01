@@ -275,11 +275,27 @@ class _LibraryScreenState extends State<LibraryScreen> {
       if (await tempFile.exists() && await tempFile.length() > 500000) {
         if (await localFile.exists()) await localFile.delete(); 
         await tempFile.rename(localFile.path); 
+        
+        // NOUVEAU : POP-UP DE SUCCÈS
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("✅ Vidéo téléchargée et prête pour le hors-ligne !", style: TextStyle(color: Colors.white)), 
+              backgroundColor: Colors.green,
+              duration: Duration(seconds: 3),
+            )
+          );
+        }
       } else {
         throw Exception("Fichier corrompu.");
       }
     } catch (e) {
       debugPrint("Erreur téléchargement: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("❌ Échec du téléchargement : $e"), backgroundColor: Colors.red)
+        );
+      }
     } finally {
       yt.close();
       if (mounted) setState(() => _activeDownloads.remove(id)); 
@@ -895,7 +911,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
   void _showForm({Map<String, dynamic>? rec, String? initialUrl}) {
     showDialog(
       context: context, 
-      builder: (context) => FormDialog(rec: rec, onSave: _fetch, db: _db, initialUrl: initialUrl)
+      builder: (context) => FormDialog(
+        rec: rec, 
+        onSave: _fetch, 
+        db: _db, 
+        initialUrl: initialUrl,
+        // NOUVEAU : On donne au formulaire l'accès à la barre de progression
+        onDownload: (id, url, file) => _startDownload(id, url, file), 
+      )
     );
   }
 }
@@ -993,12 +1016,212 @@ class FormDialog extends StatefulWidget {
   final Map<String, dynamic>? rec;
   final VoidCallback onSave;
   final Database? db;
-  final String? initialUrl; // Permet de pré-remplir depuis le navigateur
+  final String? initialUrl;
+  final Function(int, String, File)? onDownload; // NOUVEAU
   
-  const FormDialog({super.key, this.rec, required this.onSave, this.db, this.initialUrl});
+  const FormDialog({super.key, this.rec, required this.onSave, this.db, this.initialUrl, this.onDownload});
   
   @override 
   State<FormDialog> createState() => _FormDialogState();
+}
+
+class _FormDialogState extends State<FormDialog> {
+  int? selectedNum = 1;
+  String? selectedName = "Al-Fatiha";
+  late TextEditingController _year, _file, _ytUrl, _vStart, _vEnd;
+  bool isLocal = true; 
+  bool isFull = true;
+
+  @override
+  void initState() {
+    super.initState();
+    
+    bool defaultIsLocal = true;
+    if (widget.rec != null) {
+      defaultIsLocal = !(widget.rec!['fichier']?.toString().contains('youtu') ?? false);
+    } else if (widget.initialUrl != null && widget.initialUrl!.isNotEmpty) {
+      defaultIsLocal = false; 
+    }
+    isLocal = defaultIsLocal;
+    
+    if (widget.rec != null) {
+      selectedNum = widget.rec!['sourate_num'];
+      selectedName = widget.rec!['sourate_name'];
+      isFull = widget.rec!['versets'] == "complet";
+    }
+    
+    _year = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
+    _file = TextEditingController(text: (widget.rec != null && isLocal) ? widget.rec!['fichier'] : "");
+    _ytUrl = TextEditingController(text: widget.initialUrl ?? ((widget.rec != null && !isLocal) ? widget.rec!['fichier'] : ""));
+    
+    _vStart = TextEditingController(); 
+    _vEnd = TextEditingController();
+    
+    // Remplir les champs si partiel
+    if (widget.rec != null && !isFull) {
+      List<String> parts = widget.rec!['versets'].split('-');
+      if (parts.length == 2) { 
+        _vStart.text = parts[0]; 
+        _vEnd.text = parts[1]; 
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: const Color(0xFF111111),
+      title: Text(widget.rec == null ? "Ajouter" : "Modifier", style: const TextStyle(color: Color(0xFF7EB8C9))),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            DropdownMenu<Map<String, dynamic>>(
+              initialSelection: widget.rec != null ? ALL_SURAHS.firstWhere((s) => s['num'] == widget.rec!['sourate_num']) : ALL_SURAHS[0],
+              width: 280,
+              label: const Text("Sourate"),
+              enableSearch: true,
+              dropdownMenuEntries: ALL_SURAHS.map((s) => DropdownMenuEntry(value: s, label: "${s['num']} - ${s['name']}")).toList(),
+              onSelected: (s) { 
+                selectedNum = s?['num']; 
+                selectedName = s?['name']; 
+              },
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _year, 
+              keyboardType: TextInputType.number, 
+              decoration: const InputDecoration(labelText: "Année (H)")
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Radio(value: true, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), 
+                const Text("Complet"),
+                Radio(value: false, groupValue: isFull, onChanged: (v) => setState(() => isFull = v!)), 
+                const Text("Partiel"),
+              ]
+            ),
+            
+            // CORRECTION : RESTAURATION DES CHAMPS DEBUT ET FIN
+            if (!isFull) Row(
+              children: [
+                Expanded(child: TextField(controller: _vStart, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Début"))),
+                const SizedBox(width: 10),
+                Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
+              ]
+            ),
+            const SizedBox(height: 10),
+            
+            Row(
+              children: [
+                Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), 
+                const Text("Local"),
+                Radio(value: false, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), 
+                const Text("YouTube"),
+              ]
+            ),
+            const SizedBox(height: 10),
+            if (isLocal) 
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[800], foregroundColor: Colors.white),
+                onPressed: () async {
+                  FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any); 
+                  if (result != null) {
+                    final file = result.files.single;
+                    final dir = await getApplicationDocumentsDirectory();
+                    await File(file.path!).copy(p.join(dir.path, file.name));
+                    setState(() => _file.text = file.name);
+                  }
+                }, 
+                child: const Text("Choisir fichier")
+              )
+            else 
+              TextField(
+                controller: _ytUrl, 
+                decoration: const InputDecoration(labelText: "Lien YouTube")
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text("Annuler")),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
+          onPressed: () async {
+            String thumb = widget.rec?['thumbnail'] ?? "";
+            String dur = widget.rec?['duration'] ?? "";
+            
+            if (!isLocal && _ytUrl.text.isNotEmpty) {
+              var yt = YoutubeExplode();
+              var video = await yt.videos.get(_ytUrl.text.split('?').first);
+              dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
+              
+              try {
+                 final dir = await getApplicationDocumentsDirectory();
+                 final thumbName = "thumb_yt_${video.id}.jpg";
+                 await Dio().download(video.thumbnails.highResUrl, p.join(dir.path, thumbName));
+                 thumb = thumbName;
+              } catch (_) { 
+                 thumb = video.thumbnails.standardResUrl; 
+              }
+              yt.close();
+            } else if (isLocal && _file.text.isNotEmpty) {
+              final dir = await getApplicationDocumentsDirectory();
+              final localFilePath = p.join(dir.path, _file.text);
+              
+              try {
+                final metadata = await MetadataRetriever.fromFile(File(localFilePath));
+                if (metadata.trackDuration != null) {
+                  final d = Duration(milliseconds: metadata.trackDuration!);
+                  dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+                }
+                if (metadata.albumArt != null) {
+                  final thumbName = "thumb_${_file.text}.jpg";
+                  await File(p.join(dir.path, thumbName)).writeAsBytes(metadata.albumArt!);
+                  thumb = thumbName;
+                }
+              } catch (e) { 
+                debugPrint("Erreur metadata: $e"); 
+              }
+            }
+            
+            final data = {
+              "sourate_num": selectedNum, 
+              "sourate_name": selectedName,
+              "annee": int.tryParse(_year.text), 
+              "fichier": isLocal ? _file.text : _ytUrl.text,
+              "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
+              "thumbnail": thumb, 
+              "duration": dur,
+            };
+            
+            int recordId = widget.rec == null 
+                ? await widget.db!.insert('recitations', data) 
+                : widget.rec!['id'];
+                
+            if (widget.rec != null) {
+              await widget.db!.update('recitations', data, where: 'id = ?', whereArgs: [recordId]);
+            }
+            
+            // CORRECTION : Déclenchement du vrai téléchargeur animé
+            if (!isLocal && _ytUrl.text.isNotEmpty) {
+              final cleanUrl = _ytUrl.text.split('?').first;
+              final dir = await getApplicationDocumentsDirectory();
+              final localAudioFile = File(p.join(dir.path, "yt_$recordId.mp4"));
+              if (!await localAudioFile.exists()) {
+                widget.onDownload?.call(recordId, cleanUrl, localAudioFile);
+              }
+            }
+            
+            widget.onSave(); 
+            if (mounted) Navigator.pop(context);
+          }, 
+          child: const Text("Enregistrer", style: TextStyle(color: Colors.white))
+        )
+      ],
+    );
+  }
 }
 
 class _FormDialogState extends State<FormDialog> {
