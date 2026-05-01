@@ -635,11 +635,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (_isDownloading) 
-            const Padding(
-              padding: EdgeInsets.only(bottom: 8.0), 
-              child: LinearProgressIndicator(color: Color(0xFF7EB8C9))
-            ),
+          
+          // FIX N°1 : On verrouille la hauteur de la barre de chargement à 12 pixels.
+          // Quand elle est invisible, l'espace reste vide et empêche le menu de sauter.
+          SizedBox(
+            height: 12,
+            child: _isDownloading 
+                ? const Padding(
+                    padding: EdgeInsets.only(bottom: 8.0), 
+                    child: LinearProgressIndicator(color: Color(0xFF7EB8C9))
+                  )
+                : null,
+          ),
             
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -672,11 +679,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         color: _timerEndTime != null ? const Color(0xFF7EB8C9) : Colors.grey,
                         size: 24
                       ),
-                      if (_timerEndTime != null)
-                        Text(
-                          _formatCountdown(_timerEndTime!.difference(DateTime.now())),
-                          style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 11, fontWeight: FontWeight.bold)
-                        )
+                      // FIX N°2 : On verrouille la hauteur du texte du minuteur
+                      SizedBox(
+                        height: 14,
+                        child: _timerEndTime != null
+                            ? Text(
+                                _formatCountdown(_timerEndTime!.difference(DateTime.now())),
+                                style: const TextStyle(color: Color(0xFF7EB8C9), fontSize: 11, fontWeight: FontWeight.bold)
+                              )
+                            : null,
+                      )
                     ],
                   ),
                 ),
@@ -752,11 +764,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   final playing = state?.playing ?? false;
                   
                   if (state?.processingState == ProcessingState.loading || state?.processingState == ProcessingState.buffering) {
-                    return Container(
-                      margin: const EdgeInsets.symmetric(horizontal: 8), 
-                      width: 52, 
-                      height: 52, 
-                      child: const CircularProgressIndicator(color: Color(0xFF7EB8C9))
+                    // FIX N°3 : Le rond de chargement a désormais exactement la même boîte (76x76 pixels) que le bouton Play (taille 60 + marges)
+                    return const SizedBox(
+                      width: 76, 
+                      height: 76, 
+                      child: Center(
+                        child: SizedBox(
+                          width: 48,
+                          height: 48,
+                          child: CircularProgressIndicator(color: Color(0xFF7EB8C9))
+                        )
+                      )
                     );
                   }
                   
