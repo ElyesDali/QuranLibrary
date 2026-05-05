@@ -104,6 +104,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Timer? _countdownTimer;
   DateTime? _timerEndTime;
   int _selectedTimerMinutes = 15;
+  
+  int _lastPosition = 0; 
+  int _lastDuration = 0; 
 
   @override
   void initState() {
@@ -111,35 +114,34 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    _player.positionStream.listen((pos) async {
+    // RADAR : Enregistre l'avancée de la piste pour savoir si elle s'est finie naturellement
+    _player.positionStream.listen((pos) {
       if (_player.currentIndex == 1 && !_isSwitchingTrack) {
-        final dur = _player.duration;
-        if (dur != null && dur.inMilliseconds > 0) {
-          if (pos.inMilliseconds >= dur.inMilliseconds - 400) {
-            if (loopMode == LoopModeState.one) return; 
-            _isSwitchingTrack = true;
-            if (loopMode == LoopModeState.off) {
-              await _player.pause();
-              await _player.seek(Duration.zero, index: 1);
-              _isSwitchingTrack = false;
-            } else if (loopMode == LoopModeState.autoplay) {
-              _playNext();
-            }
-          }
-        }
+        _lastPosition = pos.inMilliseconds;
+        _lastDuration = _player.duration?.inMilliseconds ?? 0;
       }
     });
 
-    _player.currentIndexStream.listen((index) {
+    // ÉCOUTEUR D'INDEX : Gère la fin de piste et les boutons AirPlay
+    _player.currentIndexStream.listen((index) async {
       if (_isSwitchingTrack || index == null || index == 1) return; 
       
       _isSwitchingTrack = true;
-      _player.pause(); 
+      await _player.pause(); // IMPORTANT : Pause au lieu de Stop pour AirPlay
       
+      bool isNaturalEnd = (_lastPosition > 0 && _lastDuration > 0 && _lastPosition >= _lastDuration - 1000);
+
       if (index == 0) {
         _playPrevious();
       } else if (index == 2) {
-        _playNext();
+        if (loopMode == LoopModeState.off && isNaturalEnd) {
+          // Fin naturelle SANS boucle : on rembobine. L'audio a joué à 100%.
+          await _player.seek(Duration.zero, index: 1);
+          _isSwitchingTrack = false;
+        } else {
+          // Bouton Suivant d'AirPlay OU Enchaînement auto
+          _playNext();
+        }
       }
     });
   }
@@ -151,7 +153,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     final path = p.join(dir.path, 'luhaidan.db');
     _db = await openDatabase(
       path,
-      version: 3, // MISE A JOUR DB
+      version: 3, 
       onCreate: (db, version) => db.execute(
         'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, annee_g INTEGER, fichier TEXT, versets TEXT, thumbnail TEXT, duration TEXT)'
       ),
@@ -299,7 +301,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Future<void> _play(Map<String, dynamic> rec) async {
     _isSwitchingTrack = true;
-    await _player.stop(); 
+    _lastPosition = 0; 
+    _lastDuration = 0; 
+    await _player.pause(); // FIX N°3 : Remplacement du stop() par pause()
     
     setState(() {
       currentRecitation = rec;
@@ -362,15 +366,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ]);
 
       await _player.setAudioSource(playlist, initialIndex: 1);
+      _isSwitchingTrack = false;
       _player.play();
 
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
       }
+      _isSwitchingTrack = false;
     } finally {
       setState(() => _isDownloading = false);
-      Future.delayed(const Duration(milliseconds: 300), () => _isSwitchingTrack = false);
     }
   }
 
@@ -581,7 +586,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         child: _buildThumbnail(rec['thumbnail'])
                       ),
                       title: Text("${rec['sourate_num'].toString().padLeft(3, '0')} - ${rec['sourate_name']}"),
-                      // CORRECTION : AFFICHAGE DES DEUX ANNÉES (H et G)
                       subtitle: Text("${rec['annee'] ?? '??'} H / ${rec['annee_g'] ?? '??'} G • Versets: ${rec['versets']}"),
                       trailing: _activeDownloads.containsKey(rec['id'])
                           ? SizedBox(
@@ -635,9 +639,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          
-          // FIX N°1 : On verrouille la hauteur de la barre de chargement à 12 pixels.
-          // Quand elle est invisible, l'espace reste vide et empêche le menu de sauter.
           SizedBox(
             height: 12,
             child: _isDownloading 
@@ -679,7 +680,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         color: _timerEndTime != null ? const Color(0xFF7EB8C9) : Colors.grey,
                         size: 24
                       ),
-                      // FIX N°2 : On verrouille la hauteur du texte du minuteur
                       SizedBox(
                         height: 14,
                         child: _timerEndTime != null
@@ -764,7 +764,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   final playing = state?.playing ?? false;
                   
                   if (state?.processingState == ProcessingState.loading || state?.processingState == ProcessingState.buffering) {
-                    // FIX N°3 : Le rond de chargement a désormais exactement la même boîte (76x76 pixels) que le bouton Play (taille 60 + marges)
                     return const SizedBox(
                       width: 76, 
                       height: 76, 
@@ -802,7 +801,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               IconButton(
                 icon: const Icon(Icons.stop, size: 30, color: Colors.grey), 
                 onPressed: () {
-                  _player.stop();
+                  _player.pause(); // FIX AirPlay : pause au lieu de stop
                   _player.seek(Duration.zero, index: 1);
                 }
               ),
@@ -821,7 +820,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         children: [
           const DrawerHeader(
             child: Center(
-              child: Text("MAMK", style: TextStyle(color: Color(0xFF7EB8C9), fontSize: 24, fontWeight: FontWeight.bold))
+              child: Text("Quran Library", style: TextStyle(color: Color(0xFF7EB8C9), fontSize: 24, fontWeight: FontWeight.bold))
             )
           ),
           
@@ -902,7 +901,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             title: const Text("Supprimer"), 
             onTap: () async {
               if (currentRecitation?['id'] == rec['id']) {
-                await _player.stop();
+                await _player.pause();
               }
               await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
               try {
@@ -957,8 +956,22 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageFinished: (String url) {
-            // CORRECTION YOUTUBE : Supprime silencieusement les aperçus vidéos qui auto-play en plein écran
-            _controller.runJavaScript("document.querySelectorAll('ytm-inline-preview').forEach(e => e.remove());");
+            // FIX N°4 : Un script puissant qui tourne en boucle pour tuer les pleins écrans YouTube
+            _controller.runJavaScript("""
+              const observer = new MutationObserver(() => {
+                document.querySelectorAll('video').forEach(v => {
+                  if (!v.hasAttribute('playsinline')) {
+                    v.setAttribute('playsinline', 'true');
+                    v.removeAttribute('autoplay');
+                  }
+                  if (v.webkitEnterInlineFullScreen) {
+                    v.webkitExitFullscreen();
+                  }
+                });
+                document.querySelectorAll('ytm-inline-preview').forEach(e => e.remove());
+              });
+              observer.observe(document.body, { childList: true, subtree: true });
+            """);
           },
           onUrlChange: (UrlChange change) {
             if (mounted) {
@@ -972,25 +985,23 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
           }
         ),
       )
-      ..loadRequest(Uri.parse('https://m.youtube.com/results?search_query=muhammad+al+luhaidan'));
+      ..loadRequest(Uri.parse('https://m.youtube.com/'));
   }
 
   bool get _isVideoPage {
     return _currentUrl.contains('watch?v=') || _currentUrl.contains('youtu.be') || _currentUrl.contains('/shorts/');
   }
 
-  // CORRECTION NAVIGATION : Gère le retour en arrière DANS la page web
   Future<bool> _handleBack() async {
     if (await _controller.canGoBack()) {
       _controller.goBack();
-      return false; // Bloque la fermeture de l'écran global
+      return false; 
     }
-    return true; // Autorise la fermeture si on est tout au début de l'historique
+    return true; 
   }
 
   @override
   Widget build(BuildContext context) {
-    // WillPopScope intercepte le bouton retour physique d'Android
     return WillPopScope(
       onWillPop: _handleBack,
       child: Scaffold(
@@ -1000,7 +1011,6 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
           leading: IconButton(
             icon: const Icon(Icons.arrow_back),
             onPressed: () async {
-              // Intercepte le clic sur la flèche en haut à gauche
               if (await _controller.canGoBack()) {
                 _controller.goBack();
               } else {
@@ -1058,7 +1068,9 @@ class FormDialog extends StatefulWidget {
 class _FormDialogState extends State<FormDialog> {
   int? selectedNum = 1;
   String? selectedName = "Al-Fatiha";
-  late TextEditingController _yearH, _yearG, _file, _ytUrl, _vStart, _vEnd;
+  
+  // FIX N°2 : Une seule variable pour la saisie intelligente de l'année
+  late TextEditingController _yearInput, _file, _ytUrl, _vStart, _vEnd;
   bool isLocal = true; 
   bool isFull = true;
 
@@ -1080,10 +1092,7 @@ class _FormDialogState extends State<FormDialog> {
       isFull = widget.rec!['versets'] == "complet";
     }
     
-    // CORRECTION : Initialisation des DEUX variables d'années
-    _yearH = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
-    _yearG = TextEditingController(text: widget.rec?['annee_g']?.toString() ?? "");
-    
+    _yearInput = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
     _file = TextEditingController(text: (widget.rec != null && isLocal) ? widget.rec!['fichier'] : "");
     _ytUrl = TextEditingController(text: widget.initialUrl ?? ((widget.rec != null && !isLocal) ? widget.rec!['fichier'] : ""));
     
@@ -1096,26 +1105,6 @@ class _FormDialogState extends State<FormDialog> {
         _vStart.text = parts[0]; 
         _vEnd.text = parts[1]; 
       }
-    }
-  }
-
-  // MATHS : Conversion automatique H -> G
-  void _updateGregorian(String hText) {
-    if (hText.isEmpty) { _yearG.clear(); return; }
-    int? h = int.tryParse(hText);
-    if (h != null) {
-      int g = h - (h ~/ 33) + 622;
-      if (_yearG.text != g.toString()) _yearG.text = g.toString();
-    }
-  }
-
-  // MATHS : Conversion automatique G -> H
-  void _updateHijri(String gText) {
-    if (gText.isEmpty) { _yearH.clear(); return; }
-    int? g = int.tryParse(gText);
-    if (g != null) {
-      int h = g - 622 + ((g - 622) ~/ 32);
-      if (_yearH.text != h.toString()) _yearH.text = h.toString();
     }
   }
 
@@ -1141,27 +1130,11 @@ class _FormDialogState extends State<FormDialog> {
             ),
             const SizedBox(height: 10),
             
-            // CORRECTION : Ligne contenant les DEUX années avec mise à jour auto
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _yearH, 
-                    keyboardType: TextInputType.number, 
-                    decoration: const InputDecoration(labelText: "Année (H)"),
-                    onChanged: _updateGregorian,
-                  )
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: TextField(
-                    controller: _yearG, 
-                    keyboardType: TextInputType.number, 
-                    decoration: const InputDecoration(labelText: "Année (G)"),
-                    onChanged: _updateHijri,
-                  )
-                ),
-              ]
+            // FIX N°2 : Un seul champ intelligent
+            TextField(
+              controller: _yearInput, 
+              keyboardType: TextInputType.number, 
+              decoration: const InputDecoration(labelText: "Année (ex: 1445 ou 2024)", hintStyle: TextStyle(color: Colors.grey, fontSize: 12))
             ),
             
             const SizedBox(height: 10),
@@ -1221,6 +1194,23 @@ class _FormDialogState extends State<FormDialog> {
               String thumb = widget.rec?['thumbnail'] ?? "";
               String dur = widget.rec?['duration'] ?? "";
               
+              // LOGIQUE DE CONVERSION DE L'ANNÉE
+              int? inputYear = int.tryParse(_yearInput.text);
+              int? anneeH;
+              int? anneeG;
+              
+              if (inputYear != null) {
+                if (inputYear > 1500) {
+                  // C'est du Grégorien
+                  anneeG = inputYear;
+                  anneeH = inputYear - 622 + ((inputYear - 622) ~/ 32);
+                } else {
+                  // C'est du Hégirien
+                  anneeH = inputYear;
+                  anneeG = inputYear - (inputYear ~/ 33) + 622;
+                }
+              }
+
               if (!isLocal && _ytUrl.text.isNotEmpty) {
                 var yt = YoutubeExplode();
                 var video = await yt.videos.get(_ytUrl.text);
@@ -1255,8 +1245,8 @@ class _FormDialogState extends State<FormDialog> {
               final data = {
                 "sourate_num": selectedNum, 
                 "sourate_name": selectedName,
-                "annee": int.tryParse(_yearH.text), // Sauvegarde de l'année Hijri
-                "annee_g": int.tryParse(_yearG.text), // Sauvegarde de l'année Grégorienne
+                "annee": anneeH, 
+                "annee_g": anneeG, 
                 "fichier": isLocal ? _file.text : _ytUrl.text,
                 "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
                 "thumbnail": thumb, 
