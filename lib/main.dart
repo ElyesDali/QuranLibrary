@@ -14,6 +14,7 @@ import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'package:flutter_media_metadata/flutter_media_metadata.dart';
 import 'package:dio/dio.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:archive/archive_io.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -23,6 +24,36 @@ Future<void> main() async {
     androidNotificationOngoing: true,
   );
   runApp(const LuhaidanApp());
+}
+
+class ProxyServer {
+  static HttpServer? _server;
+  static int? port;
+  
+  static Future<void> start() async {
+    if (_server != null) return;
+    _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    port = _server!.port;
+    _server!.listen((HttpRequest request) async {
+      try {
+        final ytUrl = request.uri.queryParameters['url'];
+        if (ytUrl != null) {
+          var yt = YoutubeExplode();
+          var manifest = await yt.videos.streamsClient.getManifest(ytUrl);
+          var streamInfo = manifest.muxed.withHighestBitrate();
+          yt.close();
+          request.response.redirect(streamInfo.url, status: HttpStatus.movedTemporarily);
+          return;
+        }
+      } catch (_) {
+        request.response.statusCode = 500;
+      } finally {
+        await request.response.close();
+      }
+    });
+  }
+
+  static String getProxyUrl(String originalUrl) => 'http://127.0.0.1:$port/?url=${Uri.encodeComponent(originalUrl)}';
 }
 
 const List<Map<String, dynamic>> ALL_SURAHS = [
@@ -90,6 +121,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   final AudioPlayer _player = AudioPlayer();
   Map<String, dynamic>? currentRecitation;
   
+  
   double volume = 0.8;
   LoopModeState loopMode = LoopModeState.off;
   int? selectedYearFilter;
@@ -108,40 +140,36 @@ class _LibraryScreenState extends State<LibraryScreen> {
   int _lastPosition = 0; 
   int _lastDuration = 0; 
 
+  int? _playingIndex;
+  int _lastPos = 0;
+  int _lastDuration = 0;
+
   @override
   void initState() {
     super.initState();
     _initApp();
     _player.setVolume(volume);
 
-    // RADAR : Enregistre l'avancée de la piste pour savoir si elle s'est finie naturellement
     _player.positionStream.listen((pos) {
-      if (_player.currentIndex == 1 && !_isSwitchingTrack) {
-        _lastPosition = pos.inMilliseconds;
-        _lastDuration = _player.duration?.inMilliseconds ?? 0;
-      }
+      _lastPos = pos.inMilliseconds;
+      _lastDuration = _player.duration?.inMilliseconds ?? 0;
     });
 
-    // ÉCOUTEUR D'INDEX : Gère la fin de piste et les boutons AirPlay
     _player.currentIndexStream.listen((index) async {
-      if (_isSwitchingTrack || index == null || index == 1) return; 
+      if (index == null || _isSwitchingTrack) return;
       
-      _isSwitchingTrack = true;
-      await _player.pause(); // IMPORTANT : Pause au lieu de Stop pour AirPlay
-      
-      bool isNaturalEnd = (_lastPosition > 0 && _lastDuration > 0 && _lastPosition >= _lastDuration - 1000);
+      bool isNaturalEnd = _playingIndex != null && index == _playingIndex! + 1 && _lastPos > 0 && _lastPos >= _lastDuration - 1000;
 
-      if (index == 0) {
-        _playPrevious();
-      } else if (index == 2) {
-        if (loopMode == LoopModeState.off && isNaturalEnd) {
-          // Fin naturelle SANS boucle : on rembobine. L'audio a joué à 100%.
-          await _player.seek(Duration.zero, index: 1);
-          _isSwitchingTrack = false;
-        } else {
-          // Bouton Suivant d'AirPlay OU Enchaînement auto
-          _playNext();
-        }
+      if (loopMode == LoopModeState.off && isNaturalEnd) {
+         // Fin naturelle, bouton gris -> Rembobinage
+         await _player.pause();
+         await _player.seek(Duration.zero, index: _playingIndex);
+         return;
+      }
+      
+      _playingIndex = index;
+      if (index < displayedRecitations.length) {
+         setState(() => currentRecitation = displayedRecitations[index]);
       }
     });
   }
@@ -149,11 +177,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Future<void> _initApp() async {
     final dir = await getApplicationDocumentsDirectory();
     _appDirPath = dir.path;
+    await ProxyServer.start(); // On lance le serveur AirPlay
 
     final path = p.join(dir.path, 'luhaidan.db');
     _db = await openDatabase(
       path,
-      version: 3, 
+      version: 3, // On passe en V3
       onCreate: (db, version) => db.execute(
         'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, annee_g INTEGER, fichier TEXT, versets TEXT, thumbnail TEXT, duration TEXT)'
       ),
@@ -180,14 +209,41 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   void _applyFilters() {
     setState(() {
-      if (selectedYearFilter == null) {
-        displayedRecitations = allRecitations;
-      } else if (selectedYearFilter == -1) {
-        displayedRecitations = allRecitations.where((r) => r['annee'] == null).toList();
-      } else {
-        displayedRecitations = allRecitations.where((r) => r['annee'] == selectedYearFilter).toList();
-      }
+      if (selectedYearFilter == null) displayedRecitations = allRecitations;
+      else if (selectedYearFilter == -1) displayedRecitations = allRecitations.where((r) => r['annee'] == null).toList();
+      else displayedRecitations = allRecitations.where((r) => r['annee'] == selectedYearFilter).toList();
     });
+    _updateFullPlaylist(); // NOUVEAU
+  }
+
+  Future<void> _updateFullPlaylist() async {
+    List<AudioSource> sources = [];
+    for (var rec in displayedRecitations) {
+      String path = rec['fichier'] ?? "";
+      Uri uri;
+      if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
+        final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
+        if (await localFile.exists() && await localFile.length() > 500000) {
+          uri = Uri.file(localFile.path);
+        } else {
+          uri = Uri.parse(ProxyServer.getProxyUrl(path)); // Passe par notre proxy AirPlay
+        }
+      } else {
+        uri = Uri.file(_resolvePath(path));
+      }
+      
+      final baseSource = AudioSource.uri(uri, tag: _createMediaItem(rec));
+      if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
+         final parts = rec['duration'].toString().split(':');
+         if (parts.length == 2) {
+           final dur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+           sources.add(ClippingAudioSource(child: baseSource, end: dur, tag: _createMediaItem(rec)));
+           continue;
+         }
+      }
+      sources.add(baseSource);
+    }
+    if (sources.isNotEmpty) await _player.setAudioSource(ConcatenatingAudioSource(children: sources));
   }
 
   String _resolvePath(String pathStr) {
@@ -300,82 +356,31 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _play(Map<String, dynamic> rec) async {
-    _isSwitchingTrack = true;
-    _lastPosition = 0; 
-    _lastDuration = 0; 
-    await _player.pause(); // FIX N°3 : Remplacement du stop() par pause()
+    int index = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
     
-    setState(() {
-      currentRecitation = rec;
-      _isDownloading = true; 
-    });
+    if (index != -1) {
+      _isSwitchingTrack = true;
+      
+      // 1. On met à jour l'interface instantanément pour afficher le lecteur en bas
+      setState(() {
+        currentRecitation = rec;
+        _playingIndex = index;
+      });
 
-    if (rec['fichier'] == null) {
-      _isSwitchingTrack = false;
-      setState(() => _isDownloading = false);
-      return;
-    }
-
-    String path = rec['fichier'];
-    final currentMediaItem = _createMediaItem(rec);
-    AudioSource finalSource;
-    Uri realUri;
-
-    try {
-      if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
-        final cleanUrl = path; 
-        final dir = await getApplicationDocumentsDirectory();
-        final localFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
-
-        if (await localFile.exists() && await localFile.length() > 500000) {
-           realUri = Uri.file(localFile.path);
-           finalSource = _buildSource(realUri, currentMediaItem);
-        } else {
-          var yt = YoutubeExplode();
-          try {
-            var manifest = await yt.videos.streamsClient.getManifest(cleanUrl).timeout(const Duration(seconds: 5));
-            var streamInfo = manifest.muxed.withHighestBitrate();
-            realUri = streamInfo.url;
-            finalSource = _buildSource(realUri, currentMediaItem);
-            
-            _startDownload(rec['id'], cleanUrl, localFile); 
-          } catch (e) {
-            throw Exception("Erreur de connexion à YouTube ($e)");
-          } finally {
-            yt.close();
-          }
+      try {
+        // 2. On saute au bon endroit dans la grande playlist déjà pré-chargée
+        await _player.seek(Duration.zero, index: index);
+        _player.play();
+      } catch (e) {
+        // 3. Le filet de sécurité si la lecture échoue (ex: pas de connexion)
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("❌ Erreur de lecture : $e"), backgroundColor: Colors.red)
+          );
         }
-      } else {
-        final file = File(_resolvePath(path));
-        if (await file.exists()) {
-          realUri = Uri.file(file.path);
-          finalSource = _buildSource(realUri, currentMediaItem);
-        } else {
-          throw Exception("Fichier local introuvable");
-        }
+      } finally {
+        _isSwitchingTrack = false;
       }
-
-      int currIdx = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
-      int prevIdx = (currIdx - 1 + displayedRecitations.length) % displayedRecitations.length;
-      int nextIdx = (currIdx + 1) % displayedRecitations.length;
-
-      var playlist = ConcatenatingAudioSource(children: [
-         _buildDummySource(realUri, _createMediaItem(displayedRecitations[prevIdx])),
-         finalSource,                                                     
-         _buildDummySource(realUri, _createMediaItem(displayedRecitations[nextIdx])),
-      ]);
-
-      await _player.setAudioSource(playlist, initialIndex: 1);
-      _isSwitchingTrack = false;
-      _player.play();
-
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
-      }
-      _isSwitchingTrack = false;
-    } finally {
-      setState(() => _isDownloading = false);
     }
   }
 
@@ -509,6 +514,48 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
   }
 
+Future<void> _exportLibrary() async {
+    try {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Création de la sauvegarde en cours...")));
+      final dir = await getApplicationDocumentsDirectory();
+      final encoder = ZipFileEncoder();
+      final zipPath = p.join(dir.path, "QuranLibrary_Backup.zip");
+      encoder.create(zipPath);
+      
+      final dbFile = File(p.join(dir.path, 'luhaidan.db'));
+      if (await dbFile.exists()) encoder.addFile(dbFile);
+      
+      final files = dir.listSync();
+      for (var f in files) {
+        if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) encoder.addFile(f);
+      }
+      encoder.close();
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Fichier QuranLibrary_Backup.zip créé dans l'app Fichiers !"), backgroundColor: Colors.green));
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur d'exportation : $e"), backgroundColor: Colors.red));
+    }
+  }
+
+  Future<void> _importLibrary() async {
+    try {
+      FilePickerResult? result = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['zip']);
+      if (result != null) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Restauration en cours... (Cela peut prendre du temps)")));
+        final zipFile = File(result.files.single.path!);
+        final dir = await getApplicationDocumentsDirectory();
+        
+        final inputStream = InputFileStream(zipFile.path);
+        final archive = ZipDecoder().decodeBuffer(inputStream);
+        extractArchiveToDisk(archive, dir.path);
+        
+        await _initApp(); 
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Bibliothèque restaurée avec succès !"), backgroundColor: Colors.green));
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de restauration : $e"), backgroundColor: Colors.red));
+    }
+  }
+  
   String _formatDuration(Duration d) {
     String twoDigits(int n) => n.toString().padLeft(2, "0");
     return "${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
@@ -826,13 +873,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
           
           ListTile(
             leading: const Icon(Icons.language, color: Color(0xFF7EB8C9)),
-            title: const Text("Navigateur YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
+            title: const Text("Recherche YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
             onTap: () {
               Navigator.pop(context); 
               Navigator.push(
                 context, 
                 MaterialPageRoute(
-                  builder: (context) => YoutubeBrowserScreen(
+                  builder: (context) => YoutubeSearchScreen(
                     db: _db, 
                     onSave: _fetch,
                     onDownload: (id, url, file) => _startDownload(id, url, file),
@@ -841,6 +888,27 @@ class _LibraryScreenState extends State<LibraryScreen> {
               );
             },
           ),
+          
+          const Divider(color: Colors.white24),
+          
+          // ---> VOICI LES DEUX BOUTONS DE SAUVEGARDE <---
+          ListTile(
+            leading: const Icon(Icons.upload_file, color: Colors.white70),
+            title: const Text("Exporter la bibliothèque"),
+            onTap: () { 
+              Navigator.pop(context); 
+              _exportLibrary(); 
+            }
+          ),
+          ListTile(
+            leading: const Icon(Icons.download_for_offline, color: Colors.white70),
+            title: const Text("Restaurer une sauvegarde"),
+            onTap: () { 
+              Navigator.pop(context); 
+              _importLibrary(); 
+            }
+          ),
+          // ----------------------------------------------
           
           const Divider(color: Colors.white24),
           
@@ -933,121 +1001,81 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 }
 
-class YoutubeBrowserScreen extends StatefulWidget {
+class YoutubeSearchScreen extends StatefulWidget {
   final Database? db;
   final VoidCallback onSave;
   final Function(int, String, File)? onDownload; 
 
-  const YoutubeBrowserScreen({super.key, required this.db, required this.onSave, this.onDownload});
+  const YoutubeSearchScreen({super.key, required this.db, required this.onSave, this.onDownload});
 
   @override
-  State<YoutubeBrowserScreen> createState() => _YoutubeBrowserScreenState();
+  State<YoutubeSearchScreen> createState() => _YoutubeSearchScreenState();
 }
 
-class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
-  late final WebViewController _controller;
-  String _currentUrl = "";
+class _YoutubeSearchScreenState extends State<YoutubeSearchScreen> {
+  final TextEditingController _searchController = TextEditingController();
+  final YoutubeExplode _yt = YoutubeExplode();
+  List<Video> _results = [];
+  bool _isLoading = false;
+
+  void _search() async {
+    if (_searchController.text.trim().isEmpty) return;
+    FocusScope.of(context).unfocus();
+    setState(() { _isLoading = true; _results = []; });
+    try {
+      var searchResults = await _yt.search.search(_searchController.text);
+      setState(() => _results = searchResults.toList());
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Erreur : $e"), backgroundColor: Colors.red));
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
 
   @override
-  void initState() {
-    super.initState();
-    _controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setNavigationDelegate(
-        NavigationDelegate(
-          onPageFinished: (String url) {
-            // FIX N°4 : Un script puissant qui tourne en boucle pour tuer les pleins écrans YouTube
-            _controller.runJavaScript("""
-              const observer = new MutationObserver(() => {
-                document.querySelectorAll('video').forEach(v => {
-                  if (!v.hasAttribute('playsinline')) {
-                    v.setAttribute('playsinline', 'true');
-                    v.removeAttribute('autoplay');
-                  }
-                  if (v.webkitEnterInlineFullScreen) {
-                    v.webkitExitFullscreen();
-                  }
-                });
-                document.querySelectorAll('ytm-inline-preview').forEach(e => e.remove());
-              });
-              observer.observe(document.body, { childList: true, subtree: true });
-            """);
-          },
-          onUrlChange: (UrlChange change) {
-            if (mounted) {
-              setState(() {
-                _currentUrl = change.url ?? "";
-              });
-            }
-          },
-          onNavigationRequest: (NavigationRequest request) {
-            return NavigationDecision.navigate;
-          }
-        ),
-      )
-      ..loadRequest(Uri.parse('https://m.youtube.com/'));
-  }
-
-  bool get _isVideoPage {
-    return _currentUrl.contains('watch?v=') || _currentUrl.contains('youtu.be') || _currentUrl.contains('/shorts/');
-  }
-
-  Future<bool> _handleBack() async {
-    if (await _controller.canGoBack()) {
-      _controller.goBack();
-      return false; 
-    }
-    return true; 
+  void dispose() {
+    _yt.close();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return WillPopScope(
-      onWillPop: _handleBack,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text("Naviguer sur YouTube", style: TextStyle(color: Color(0xFF7EB8C9))),
-          backgroundColor: const Color(0xFF111111),
-          leading: IconButton(
-            icon: const Icon(Icons.arrow_back),
-            onPressed: () async {
-              if (await _controller.canGoBack()) {
-                _controller.goBack();
-              } else {
-                if (mounted) Navigator.pop(context);
-              }
-            },
-          ),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.refresh),
-              onPressed: () => _controller.reload(),
-            )
-          ],
+    return Scaffold(
+      appBar: AppBar(
+        title: TextField(
+          controller: _searchController,
+          style: const TextStyle(color: Colors.white),
+          decoration: const InputDecoration(hintText: "Rechercher sur YouTube...", hintStyle: TextStyle(color: Colors.grey), border: InputBorder.none),
+          onSubmitted: (_) => _search(),
         ),
-        body: WebViewWidget(controller: _controller),
-        floatingActionButton: _isVideoPage
-            ? FloatingActionButton.extended(
-                onPressed: () {
+        backgroundColor: const Color(0xFF111111),
+        actions: [IconButton(icon: const Icon(Icons.search, color: Color(0xFF7EB8C9)), onPressed: _search)],
+      ),
+      body: _isLoading 
+        ? const Center(child: CircularProgressIndicator(color: Color(0xFF7EB8C9)))
+        : ListView.builder(
+            itemCount: _results.length,
+            itemBuilder: (context, i) {
+              final video = _results[i];
+              return ListTile(
+                leading: Image.network(video.thumbnails.mediumResUrl, width: 80, fit: BoxFit.cover),
+                title: Text(video.title, maxLines: 2, overflow: TextOverflow.ellipsis),
+                subtitle: Text(video.author, style: const TextStyle(color: Colors.grey)),
+                trailing: const Icon(Icons.download, color: Color(0xFF7EB8C9)),
+                onTap: () {
                   showDialog(
                     context: context,
                     builder: (dialogContext) => FormDialog(
                       db: widget.db,
-                      onSave: () {
-                        widget.onSave();
-                        Navigator.pop(context); 
-                      },
-                      initialUrl: _currentUrl,
+                      onSave: () { widget.onSave(); Navigator.pop(context); },
+                      initialUrl: video.url,
                       onDownload: widget.onDownload, 
                     )
                   );
                 },
-                backgroundColor: const Color(0xFF4A8FA3),
-                icon: const Icon(Icons.download, color: Colors.white),
-                label: const Text("Télécharger la vidéo", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-              )
-            : null,
-      ),
+              );
+            },
+          ),
     );
   }
 }
