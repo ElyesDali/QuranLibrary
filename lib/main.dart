@@ -150,21 +150,25 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _initApp();
     _player.setVolume(volume);
 
-    _player.positionStream.listen((pos) {
+    // 1. SURVEILLANCE DE LA POSITION (Interception avant le saut automatique)
+    _player.positionStream.listen((pos) async {
       _lastPos = pos.inMilliseconds;
       _lastDuration = _player.duration?.inMilliseconds ?? 0;
+      
+      // Si on est à la toute fin de la piste ET que l'enchaînement est désactivé
+      if (loopMode == LoopModeState.off && !_isSwitchingTrack && _lastDuration > 0) {
+        if (_lastPos >= _lastDuration - 300) {
+          _isSwitchingTrack = true;
+          await _player.pause(); // On stoppe la lecture
+          await _player.seek(Duration.zero, index: _playingIndex); // On rembobine sur la MÊME piste
+          _isSwitchingTrack = false;
+        }
+      }
     });
 
-    _player.currentIndexStream.listen((index) async {
+    // 2. SURVEILLANCE DE L'INDEX (Gère les clics manuels ou le mode Autoplay)
+    _player.currentIndexStream.listen((index) {
       if (index == null || _isSwitchingTrack) return;
-      
-      bool isNaturalEnd = _playingIndex != null && index == _playingIndex! + 1 && _lastPos > 0 && _lastPos >= _lastDuration - 1000;
-
-      if (loopMode == LoopModeState.off && isNaturalEnd) {
-         await _player.pause();
-         await _player.seek(Duration.zero, index: _playingIndex);
-         return;
-      }
       
       _playingIndex = index;
       if (index < displayedRecitations.length) {
@@ -598,9 +602,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
       final zipFile = File(result.files.single.path!);
       final dir = await getApplicationDocumentsDirectory();
       
-      // FIX : Extraction manuelle "intelligente" qui aplatit les dossiers
-      final inputStream = InputFileStream(zipFile.path);
-      final archive = ZipDecoder().decodeBuffer(inputStream);
+      // FIX ARCHIVE V4 : On lit les bytes directement en mémoire
+      final bytes = await zipFile.readAsBytes();
+      final archive = ZipDecoder().decodeBytes(bytes);
       
       for (var file in archive) {
         if (file.isFile) {
@@ -1049,34 +1053,40 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
   @override
   void initState() {
     super.initState();
-    _initApp();
-    _player.setVolume(volume);
-
-    // 1. SURVEILLANCE DE LA POSITION (Interception avant le saut automatique)
-    _player.positionStream.listen((pos) async {
-      _lastPos = pos.inMilliseconds;
-      _lastDuration = _player.duration?.inMilliseconds ?? 0;
-      
-      // Si on est à la toute fin de la piste ET que l'enchaînement est désactivé
-      if (loopMode == LoopModeState.off && !_isSwitchingTrack && _lastDuration > 0) {
-        if (_lastPos >= _lastDuration - 300) {
-          _isSwitchingTrack = true;
-          await _player.pause(); // On stoppe la lecture
-          await _player.seek(Duration.zero, index: _playingIndex); // On rembobine sur la MÊME piste
-          _isSwitchingTrack = false;
-        }
-      }
-    });
-
-    // 2. SURVEILLANCE DE L'INDEX (Gère les clics manuels ou le mode Autoplay)
-    _player.currentIndexStream.listen((index) {
-      if (index == null || _isSwitchingTrack) return;
-      
-      _playingIndex = index;
-      if (index < displayedRecitations.length) {
-         setState(() => currentRecitation = displayedRecitations[index]);
-      }
-    });
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageFinished: (String url) {
+            _controller.runJavaScript("""
+              const observer = new MutationObserver(() => {
+                document.querySelectorAll('video').forEach(v => {
+                  if (!v.hasAttribute('playsinline')) {
+                    v.setAttribute('playsinline', 'true');
+                    v.removeAttribute('autoplay');
+                  }
+                  if (v.webkitEnterInlineFullScreen) {
+                    v.webkitExitFullscreen();
+                  }
+                });
+                document.querySelectorAll('ytm-inline-preview').forEach(e => e.remove());
+              });
+              observer.observe(document.body, { childList: true, subtree: true });
+            """);
+          },
+          onUrlChange: (UrlChange change) {
+            if (mounted) {
+              setState(() {
+                _currentUrl = change.url ?? "";
+              });
+            }
+          },
+          onNavigationRequest: (NavigationRequest request) {
+            return NavigationDecision.navigate;
+          }
+        ),
+      )
+      ..loadRequest(Uri.parse('https://m.youtube.com/'));
   }
 
   bool get _isVideoPage {
