@@ -141,8 +141,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
   int _lastDuration = 0; 
 
   int? _playingIndex;
-  int _lastPos = 0;
-  int _lastDuration = 0;
 
   @override
   void initState() {
@@ -544,9 +542,8 @@ Future<void> _exportLibrary() async {
         final zipFile = File(result.files.single.path!);
         final dir = await getApplicationDocumentsDirectory();
         
-        final inputStream = InputFileStream(zipFile.path);
-        final archive = ZipDecoder().decodeBuffer(inputStream);
-        extractArchiveToDisk(archive, dir.path);
+        // LA CORRECTION EST ICI :
+        extractFileToDisk(zipFile.path, dir.path);
         
         await _initApp(); 
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Bibliothèque restaurée avec succès !"), backgroundColor: Colors.green));
@@ -555,7 +552,7 @@ Future<void> _exportLibrary() async {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de restauration : $e"), backgroundColor: Colors.red));
     }
   }
-  
+
   String _formatDuration(Duration d) {
     String twoDigits(int n) => n.toString().padLeft(2, "0");
     return "${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
