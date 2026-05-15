@@ -137,7 +137,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   DateTime? _timerEndTime;
   int _selectedTimerMinutes = 15;
   
-  int _lastPosition = 0; 
+  int _lastPos = 0; 
   int _lastDuration = 0; 
 
   int? _playingIndex;
