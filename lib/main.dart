@@ -539,71 +539,76 @@ class _LibraryScreenState extends State<LibraryScreen> {
   void _showLoading(String msg) {
     showDialog(
       context: context,
-      barrierDismissible: false,
+      barrierDismissible: false, // Empêche l'utilisateur de fermer la boîte en cliquant à côté
       builder: (c) => AlertDialog(
         backgroundColor: const Color(0xFF111111),
         content: Column(mainAxisSize: MainAxisSize.min, children: [
           const CircularProgressIndicator(color: Color(0xFF7EB8C9)),
           const SizedBox(height: 20),
-          Text(msg, style: const TextStyle(color: Colors.white)),
+          Text(msg, style: const TextStyle(color: Colors.white), textAlign: TextAlign.center),
         ]),
       )
     );
   }
 
   Future<void> _exportLibrary() async {
-    _showLoading("Création de la sauvegarde...");
+    _showLoading("Création de la sauvegarde en cours...\nL'application va se figer quelques secondes, ne la fermez pas.");
+    
+    // L'ASTUCE : On donne 500ms à l'iPhone pour afficher l'interface de chargement avant de bloquer le processeur avec le Zip.
+    await Future.delayed(const Duration(milliseconds: 500));
+
     try {
       final dir = await getApplicationDocumentsDirectory();
+      final encoder = ZipFileEncoder();
+      final zipPath = p.join(dir.path, "QuranLibrary_Backup.zip");
       
-      // Utilisation de compute pour éviter le freeze de l'application
-      await compute(_runExportTask, dir.path);
+      encoder.create(zipPath);
+      
+      final dbFile = File(p.join(dir.path, 'luhaidan.db'));
+      if (await dbFile.exists()) encoder.addFile(dbFile);
+      
+      final files = dir.listSync();
+      for (var f in files) {
+        if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) {
+          encoder.addFile(f);
+        }
+      }
+      encoder.close();
 
-      if (mounted) Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Sauvegarde terminée ! Retrouvez le .zip dans l'app Fichiers."), backgroundColor: Colors.green));
+      if (mounted) Navigator.pop(context); // On ferme la boîte de chargement
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Fichier QuranLibrary_Backup.zip créé dans l'app Fichiers !"), backgroundColor: Colors.green));
     } catch (e) {
       if (mounted) Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur d'exportation : $e"), backgroundColor: Colors.red));
     }
-  }
-
-  static void _runExportTask(String dirPath) {
-    final encoder = ZipFileEncoder();
-    encoder.create(p.join(dirPath, "QuranLibrary_Backup.zip"));
-    encoder.addFile(File(p.join(dirPath, 'luhaidan.db')));
-    final files = Directory(dirPath).listSync();
-    for (var f in files) {
-      if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) encoder.addFile(f);
-    }
-    encoder.close();
   }
 
   Future<void> _importLibrary() async {
-    FilePickerResult? res = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['zip']);
-    if (res == null) return;
+    FilePickerResult? result = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['zip']);
+    if (result == null) return;
 
-    _showLoading("Restauration en cours... Ne fermez pas l'app.");
+    _showLoading("Restauration en cours...\nL'application va se figer quelques secondes, ne la fermez pas.");
+    
+    // L'ASTUCE : On laisse l'interface s'afficher
+    await Future.delayed(const Duration(milliseconds: 500));
+
     try {
-      await _db?.close();
+      await _db?.close(); // Très important : on déconnecte la BDD pour pouvoir l'écraser
       
-      final zipPath = res.files.single.path!;
-      final dirPath = _appDirPath!;
+      final zipFile = File(result.files.single.path!);
+      final dir = await getApplicationDocumentsDirectory();
       
-      await compute(_runImportTask, {'zip': zipPath, 'dest': dirPath});
-
-      await _initApp();
+      extractFileToDisk(zipFile.path, dir.path); // Méthode directe 100% fiable
       
-      if (mounted) Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Importation réussie !"), backgroundColor: Colors.green));
+      await _initApp(); // Reconnecte la BDD et rafraîchit la liste
+      
+      if (mounted) Navigator.pop(context); // On ferme la boîte de chargement
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Bibliothèque restaurée avec succès !"), backgroundColor: Colors.green));
     } catch (e) {
       if (mounted) Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
-      await _initApp(); 
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de restauration : $e"), backgroundColor: Colors.red));
+      await _initApp(); // On relance l'app au cas où
     }
-  }
-
-  static void _runImportTask(Map<String, String> paths) {
-    extractFileToDisk(paths['zip']!, paths['dest']!);
   }
 
   @override
