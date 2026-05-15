@@ -553,8 +553,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Future<void> _exportLibrary() async {
     _showLoading("Création de la sauvegarde en cours...\nL'application va se figer quelques secondes, ne la fermez pas.");
-    
-    // L'ASTUCE : On donne 500ms à l'iPhone pour afficher l'interface de chargement avant de bloquer le processeur avec le Zip.
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
@@ -565,17 +563,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
       encoder.create(zipPath);
       
       final dbFile = File(p.join(dir.path, 'luhaidan.db'));
-      if (await dbFile.exists()) encoder.addFile(dbFile);
+      if (await dbFile.exists()) {
+        // FIX : On force le package à n'utiliser que le nom, sans l'arborescence iOS !
+        encoder.addFile(dbFile, 'luhaidan.db'); 
+      }
       
       final files = dir.listSync();
       for (var f in files) {
         if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) {
-          encoder.addFile(f);
+          // FIX : Même chose pour les vidéos et les miniatures
+          encoder.addFile(f, p.basename(f.path)); 
         }
       }
       encoder.close();
 
-      if (mounted) Navigator.pop(context); // On ferme la boîte de chargement
+      if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Fichier QuranLibrary_Backup.zip créé dans l'app Fichiers !"), backgroundColor: Colors.green));
     } catch (e) {
       if (mounted) Navigator.pop(context);
@@ -588,26 +590,37 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (result == null) return;
 
     _showLoading("Restauration en cours...\nL'application va se figer quelques secondes, ne la fermez pas.");
-    
-    // L'ASTUCE : On laisse l'interface s'afficher
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
-      await _db?.close(); // Très important : on déconnecte la BDD pour pouvoir l'écraser
+      await _db?.close(); // On déconnecte la BDD pour pouvoir l'écraser proprement
       
       final zipFile = File(result.files.single.path!);
       final dir = await getApplicationDocumentsDirectory();
       
-      extractFileToDisk(zipFile.path, dir.path); // Méthode directe 100% fiable
+      // FIX : Extraction manuelle "intelligente" qui aplatit les dossiers
+      final inputStream = InputFileStream(zipFile.path);
+      final archive = ZipDecoder().decodeBuffer(inputStream);
+      
+      for (var file in archive) {
+        if (file.isFile) {
+          // On récupère uniquement le nom final du fichier, en ignorant les dossiers fantômes
+          final filename = p.basename(file.name);
+          final outFile = File(p.join(dir.path, filename));
+          
+          final data = file.content as List<int>;
+          await outFile.writeAsBytes(data, flush: true);
+        }
+      }
       
       await _initApp(); // Reconnecte la BDD et rafraîchit la liste
       
-      if (mounted) Navigator.pop(context); // On ferme la boîte de chargement
+      if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Bibliothèque restaurée avec succès !"), backgroundColor: Colors.green));
     } catch (e) {
       if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de restauration : $e"), backgroundColor: Colors.red));
-      await _initApp(); // On relance l'app au cas où
+      await _initApp(); 
     }
   }
 
@@ -1036,40 +1049,34 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
   @override
   void initState() {
     super.initState();
-    _controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setNavigationDelegate(
-        NavigationDelegate(
-          onPageFinished: (String url) {
-            _controller.runJavaScript("""
-              const observer = new MutationObserver(() => {
-                document.querySelectorAll('video').forEach(v => {
-                  if (!v.hasAttribute('playsinline')) {
-                    v.setAttribute('playsinline', 'true');
-                    v.removeAttribute('autoplay');
-                  }
-                  if (v.webkitEnterInlineFullScreen) {
-                    v.webkitExitFullscreen();
-                  }
-                });
-                document.querySelectorAll('ytm-inline-preview').forEach(e => e.remove());
-              });
-              observer.observe(document.body, { childList: true, subtree: true });
-            """);
-          },
-          onUrlChange: (UrlChange change) {
-            if (mounted) {
-              setState(() {
-                _currentUrl = change.url ?? "";
-              });
-            }
-          },
-          onNavigationRequest: (NavigationRequest request) {
-            return NavigationDecision.navigate;
-          }
-        ),
-      )
-      ..loadRequest(Uri.parse('https://m.youtube.com/'));
+    _initApp();
+    _player.setVolume(volume);
+
+    // 1. SURVEILLANCE DE LA POSITION (Interception avant le saut automatique)
+    _player.positionStream.listen((pos) async {
+      _lastPos = pos.inMilliseconds;
+      _lastDuration = _player.duration?.inMilliseconds ?? 0;
+      
+      // Si on est à la toute fin de la piste ET que l'enchaînement est désactivé
+      if (loopMode == LoopModeState.off && !_isSwitchingTrack && _lastDuration > 0) {
+        if (_lastPos >= _lastDuration - 300) {
+          _isSwitchingTrack = true;
+          await _player.pause(); // On stoppe la lecture
+          await _player.seek(Duration.zero, index: _playingIndex); // On rembobine sur la MÊME piste
+          _isSwitchingTrack = false;
+        }
+      }
+    });
+
+    // 2. SURVEILLANCE DE L'INDEX (Gère les clics manuels ou le mode Autoplay)
+    _player.currentIndexStream.listen((index) {
+      if (index == null || _isSwitchingTrack) return;
+      
+      _playingIndex = index;
+      if (index < displayedRecitations.length) {
+         setState(() => currentRecitation = displayedRecitations[index]);
+      }
+    });
   }
 
   bool get _isVideoPage {
