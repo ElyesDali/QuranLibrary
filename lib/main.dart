@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart'; // Pour compute (optimisation)
 import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
@@ -20,10 +21,10 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await JustAudioBackground.init(
     androidNotificationChannelId: 'com.muhammad.luhaidan.app',
-    androidNotificationChannelName: 'Bibliothèque Luhaidan',
+    androidNotificationChannelName: 'Quran Library',
     androidNotificationOngoing: true,
   );
-  runApp(const LuhaidanApp());
+  runApp(const QuranLibraryApp());
 }
 
 class ProxyServer {
@@ -40,7 +41,10 @@ class ProxyServer {
         if (ytUrl != null) {
           var yt = YoutubeExplode();
           var manifest = await yt.videos.streamsClient.getManifest(ytUrl);
-          var streamInfo = manifest.muxed.withHighestBitrate();
+          var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
+          var streamInfo = mp4Muxed.isNotEmpty 
+              ? mp4Muxed.withHighestBitrate() 
+              : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
           yt.close();
           request.response.redirect(streamInfo.url, status: HttpStatus.movedTemporarily);
           return;
@@ -90,8 +94,8 @@ const List<Map<String, dynamic>> ALL_SURAHS = [
 
 enum LoopModeState { off, autoplay, one }
 
-class LuhaidanApp extends StatelessWidget {
-  const LuhaidanApp({super.key});
+class QuranLibraryApp extends StatelessWidget {
+  const QuranLibraryApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -121,7 +125,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
   final AudioPlayer _player = AudioPlayer();
   Map<String, dynamic>? currentRecitation;
   
-  
   double volume = 0.8;
   LoopModeState loopMode = LoopModeState.off;
   int? selectedYearFilter;
@@ -137,10 +140,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
   DateTime? _timerEndTime;
   int _selectedTimerMinutes = 15;
   
-  int _lastPos = 0; 
-  int _lastDuration = 0; 
-
   int? _playingIndex;
+  int _lastPos = 0;
+  int _lastDuration = 0;
 
   @override
   void initState() {
@@ -159,7 +161,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       bool isNaturalEnd = _playingIndex != null && index == _playingIndex! + 1 && _lastPos > 0 && _lastPos >= _lastDuration - 1000;
 
       if (loopMode == LoopModeState.off && isNaturalEnd) {
-         // Fin naturelle, bouton gris -> Rembobinage
          await _player.pause();
          await _player.seek(Duration.zero, index: _playingIndex);
          return;
@@ -175,12 +176,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Future<void> _initApp() async {
     final dir = await getApplicationDocumentsDirectory();
     _appDirPath = dir.path;
-    await ProxyServer.start(); // On lance le serveur AirPlay
+    await ProxyServer.start(); 
 
     final path = p.join(dir.path, 'luhaidan.db');
     _db = await openDatabase(
       path,
-      version: 3, // On passe en V3
+      version: 3, 
       onCreate: (db, version) => db.execute(
         'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, annee_g INTEGER, fichier TEXT, versets TEXT, thumbnail TEXT, duration TEXT)'
       ),
@@ -207,11 +208,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   void _applyFilters() {
     setState(() {
-      if (selectedYearFilter == null) displayedRecitations = allRecitations;
-      else if (selectedYearFilter == -1) displayedRecitations = allRecitations.where((r) => r['annee'] == null).toList();
-      else displayedRecitations = allRecitations.where((r) => r['annee'] == selectedYearFilter).toList();
+      if (selectedYearFilter == null) {
+        displayedRecitations = allRecitations;
+      } else if (selectedYearFilter == -1) {
+        displayedRecitations = allRecitations.where((r) => r['annee'] == null).toList();
+      } else {
+        displayedRecitations = allRecitations.where((r) => r['annee'] == selectedYearFilter).toList();
+      }
     });
-    _updateFullPlaylist(); // NOUVEAU
+    _updateFullPlaylist(); 
   }
 
   Future<void> _updateFullPlaylist() async {
@@ -224,7 +229,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         if (await localFile.exists() && await localFile.length() > 500000) {
           uri = Uri.file(localFile.path);
         } else {
-          uri = Uri.parse(ProxyServer.getProxyUrl(path)); // Passe par notre proxy AirPlay
+          uri = Uri.parse(ProxyServer.getProxyUrl(path)); 
         }
       } else {
         uri = Uri.file(_resolvePath(path));
@@ -263,28 +268,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
     return MediaItem(
       id: r['id'].toString(),
-      album: "Muhammad",
+      album: "Quran Library",
       title: "${r['sourate_num'].toString().padLeft(3, '0')} - ${r['sourate_name']}",
-      artist: "Muhammad Al-Luhaidan",
+      artist: "Muhammad",
       artUri: artUri,
       duration: exactDur,
-    );
-  }
-
-  AudioSource _buildSource(Uri uri, MediaItem mediaItem) {
-    final base = AudioSource.uri(uri, tag: mediaItem);
-    if (mediaItem.duration != null && mediaItem.duration!.inSeconds > 0) {
-      return ClippingAudioSource(child: base, end: mediaItem.duration, tag: mediaItem);
-    }
-    return base;
-  }
-
-  AudioSource _buildDummySource(Uri uri, MediaItem mediaItem) {
-    return ClippingAudioSource(
-      child: AudioSource.uri(uri, tag: mediaItem), 
-      start: Duration.zero, 
-      end: const Duration(milliseconds: 100), 
-      tag: mediaItem
     );
   }
 
@@ -337,6 +325,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             )
           );
         }
+        _updateFullPlaylist(); // Rafraîchir la liste de lecture
       } else {
         throw Exception("Fichier corrompu.");
       }
@@ -359,18 +348,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (index != -1) {
       _isSwitchingTrack = true;
       
-      // 1. On met à jour l'interface instantanément pour afficher le lecteur en bas
       setState(() {
         currentRecitation = rec;
         _playingIndex = index;
       });
 
       try {
-        // 2. On saute au bon endroit dans la grande playlist déjà pré-chargée
         await _player.seek(Duration.zero, index: index);
         _player.play();
       } catch (e) {
-        // 3. Le filet de sécurité si la lecture échoue (ex: pas de connexion)
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text("❌ Erreur de lecture : $e"), backgroundColor: Colors.red)
@@ -512,47 +498,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
   }
 
-Future<void> _exportLibrary() async {
-    try {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Création de la sauvegarde en cours...")));
-      final dir = await getApplicationDocumentsDirectory();
-      final encoder = ZipFileEncoder();
-      final zipPath = p.join(dir.path, "QuranLibrary_Backup.zip");
-      encoder.create(zipPath);
-      
-      final dbFile = File(p.join(dir.path, 'luhaidan.db'));
-      if (await dbFile.exists()) encoder.addFile(dbFile);
-      
-      final files = dir.listSync();
-      for (var f in files) {
-        if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) encoder.addFile(f);
-      }
-      encoder.close();
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Fichier QuranLibrary_Backup.zip créé dans l'app Fichiers !"), backgroundColor: Colors.green));
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur d'exportation : $e"), backgroundColor: Colors.red));
-    }
-  }
-
-  Future<void> _importLibrary() async {
-    try {
-      FilePickerResult? result = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['zip']);
-      if (result != null) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Restauration en cours... (Cela peut prendre du temps)")));
-        final zipFile = File(result.files.single.path!);
-        final dir = await getApplicationDocumentsDirectory();
-        
-        // LA CORRECTION EST ICI :
-        extractFileToDisk(zipFile.path, dir.path);
-        
-        await _initApp(); 
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Bibliothèque restaurée avec succès !"), backgroundColor: Colors.green));
-      }
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de restauration : $e"), backgroundColor: Colors.red));
-    }
-  }
-
   String _formatDuration(Duration d) {
     String twoDigits(int n) => n.toString().padLeft(2, "0");
     return "${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
@@ -589,11 +534,83 @@ Future<void> _exportLibrary() async {
     }
   }
 
+  // --- OPTIMISATION EXPORT/IMPORT ---
+
+  void _showLoading(String msg) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (c) => AlertDialog(
+        backgroundColor: const Color(0xFF111111),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const CircularProgressIndicator(color: Color(0xFF7EB8C9)),
+          const SizedBox(height: 20),
+          Text(msg, style: const TextStyle(color: Colors.white)),
+        ]),
+      )
+    );
+  }
+
+  Future<void> _exportLibrary() async {
+    _showLoading("Création de la sauvegarde...");
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      
+      // Utilisation de compute pour éviter le freeze de l'application
+      await compute(_runExportTask, dir.path);
+
+      if (mounted) Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Sauvegarde terminée ! Retrouvez le .zip dans l'app Fichiers."), backgroundColor: Colors.green));
+    } catch (e) {
+      if (mounted) Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
+    }
+  }
+
+  static void _runExportTask(String dirPath) {
+    final encoder = ZipFileEncoder();
+    encoder.create(p.join(dirPath, "QuranLibrary_Backup.zip"));
+    encoder.addFile(File(p.join(dirPath, 'luhaidan.db')));
+    final files = Directory(dirPath).listSync();
+    for (var f in files) {
+      if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) encoder.addFile(f);
+    }
+    encoder.close();
+  }
+
+  Future<void> _importLibrary() async {
+    FilePickerResult? res = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['zip']);
+    if (res == null) return;
+
+    _showLoading("Restauration en cours... Ne fermez pas l'app.");
+    try {
+      await _db?.close();
+      
+      final zipPath = res.files.single.path!;
+      final dirPath = _appDirPath!;
+      
+      await compute(_runImportTask, {'zip': zipPath, 'dest': dirPath});
+
+      await _initApp();
+      
+      if (mounted) Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Importation réussie !"), backgroundColor: Colors.green));
+    } catch (e) {
+      if (mounted) Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
+      await _initApp(); 
+    }
+  }
+
+  static void _runImportTask(Map<String, String> paths) {
+    extractFileToDisk(paths['zip']!, paths['dest']!);
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("مكتبة محمد اللحيدان", style: TextStyle(color: Color(0xFF7EB8C9))),
+        title: const Text("Quran Library", style: TextStyle(color: Color(0xFF7EB8C9))),
         backgroundColor: const Color(0xFF111111),
       ),
       drawer: _buildDrawer(),
@@ -764,7 +781,7 @@ Future<void> _exportLibrary() async {
                       max: maxDur,
                       onChanged: (v) => setState(() => _dragValue = v),
                       onChangeEnd: (v) {
-                        _player.seek(Duration(seconds: v.toInt()), index: 1);
+                        _player.seek(Duration(seconds: v.toInt()), index: _playingIndex);
                         setState(() => _dragValue = null);
                       },
                     ),
@@ -828,7 +845,7 @@ Future<void> _exportLibrary() async {
                     onPressed: () async {
                       if (showPlayIcon) {
                         if (state?.processingState == ProcessingState.completed) {
-                          await _player.seek(Duration.zero, index: 1);
+                          await _player.seek(Duration.zero, index: _playingIndex);
                         }
                         _player.play();
                       } else {
@@ -845,8 +862,8 @@ Future<void> _exportLibrary() async {
               IconButton(
                 icon: const Icon(Icons.stop, size: 30, color: Colors.grey), 
                 onPressed: () {
-                  _player.pause(); // FIX AirPlay : pause au lieu de stop
-                  _player.seek(Duration.zero, index: 1);
+                  _player.pause(); 
+                  _player.seek(Duration.zero, index: _playingIndex);
                 }
               ),
             ],
@@ -870,13 +887,13 @@ Future<void> _exportLibrary() async {
           
           ListTile(
             leading: const Icon(Icons.language, color: Color(0xFF7EB8C9)),
-            title: const Text("Recherche YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
+            title: const Text("Navigateur YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
             onTap: () {
               Navigator.pop(context); 
               Navigator.push(
                 context, 
                 MaterialPageRoute(
-                  builder: (context) => YoutubeSearchScreen(
+                  builder: (context) => YoutubeBrowserScreen(
                     db: _db, 
                     onSave: _fetch,
                     onDownload: (id, url, file) => _startDownload(id, url, file),
@@ -888,7 +905,6 @@ Future<void> _exportLibrary() async {
           
           const Divider(color: Colors.white24),
           
-          // ---> VOICI LES DEUX BOUTONS DE SAUVEGARDE <---
           ListTile(
             leading: const Icon(Icons.upload_file, color: Colors.white70),
             title: const Text("Exporter la bibliothèque"),
@@ -905,7 +921,6 @@ Future<void> _exportLibrary() async {
               _importLibrary(); 
             }
           ),
-          // ----------------------------------------------
           
           const Divider(color: Colors.white24),
           
@@ -998,81 +1013,120 @@ Future<void> _exportLibrary() async {
   }
 }
 
-class YoutubeSearchScreen extends StatefulWidget {
+class YoutubeBrowserScreen extends StatefulWidget {
   final Database? db;
   final VoidCallback onSave;
   final Function(int, String, File)? onDownload; 
 
-  const YoutubeSearchScreen({super.key, required this.db, required this.onSave, this.onDownload});
+  const YoutubeBrowserScreen({super.key, required this.db, required this.onSave, this.onDownload});
 
   @override
-  State<YoutubeSearchScreen> createState() => _YoutubeSearchScreenState();
+  State<YoutubeBrowserScreen> createState() => _YoutubeBrowserScreenState();
 }
 
-class _YoutubeSearchScreenState extends State<YoutubeSearchScreen> {
-  final TextEditingController _searchController = TextEditingController();
-  final YoutubeExplode _yt = YoutubeExplode();
-  List<Video> _results = [];
-  bool _isLoading = false;
-
-  void _search() async {
-    if (_searchController.text.trim().isEmpty) return;
-    FocusScope.of(context).unfocus();
-    setState(() { _isLoading = true; _results = []; });
-    try {
-      var searchResults = await _yt.search.search(_searchController.text);
-      setState(() => _results = searchResults.toList());
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Erreur : $e"), backgroundColor: Colors.red));
-    } finally {
-      setState(() => _isLoading = false);
-    }
-  }
+class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
+  late final WebViewController _controller;
+  String _currentUrl = "";
 
   @override
-  void dispose() {
-    _yt.close();
-    super.dispose();
+  void initState() {
+    super.initState();
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageFinished: (String url) {
+            _controller.runJavaScript("""
+              const observer = new MutationObserver(() => {
+                document.querySelectorAll('video').forEach(v => {
+                  if (!v.hasAttribute('playsinline')) {
+                    v.setAttribute('playsinline', 'true');
+                    v.removeAttribute('autoplay');
+                  }
+                  if (v.webkitEnterInlineFullScreen) {
+                    v.webkitExitFullscreen();
+                  }
+                });
+                document.querySelectorAll('ytm-inline-preview').forEach(e => e.remove());
+              });
+              observer.observe(document.body, { childList: true, subtree: true });
+            """);
+          },
+          onUrlChange: (UrlChange change) {
+            if (mounted) {
+              setState(() {
+                _currentUrl = change.url ?? "";
+              });
+            }
+          },
+          onNavigationRequest: (NavigationRequest request) {
+            return NavigationDecision.navigate;
+          }
+        ),
+      )
+      ..loadRequest(Uri.parse('https://m.youtube.com/'));
+  }
+
+  bool get _isVideoPage {
+    return _currentUrl.contains('watch?v=') || _currentUrl.contains('youtu.be') || _currentUrl.contains('/shorts/');
+  }
+
+  Future<bool> _handleBack() async {
+    if (await _controller.canGoBack()) {
+      _controller.goBack();
+      return false; 
+    }
+    return true; 
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: TextField(
-          controller: _searchController,
-          style: const TextStyle(color: Colors.white),
-          decoration: const InputDecoration(hintText: "Rechercher sur YouTube...", hintStyle: TextStyle(color: Colors.grey), border: InputBorder.none),
-          onSubmitted: (_) => _search(),
+    return WillPopScope(
+      onWillPop: _handleBack,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text("YouTube", style: TextStyle(color: Color(0xFF7EB8C9))),
+          backgroundColor: const Color(0xFF111111),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () async {
+              if (await _controller.canGoBack()) {
+                _controller.goBack();
+              } else {
+                if (mounted) Navigator.pop(context);
+              }
+            },
+          ),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: () => _controller.reload(),
+            )
+          ],
         ),
-        backgroundColor: const Color(0xFF111111),
-        actions: [IconButton(icon: const Icon(Icons.search, color: Color(0xFF7EB8C9)), onPressed: _search)],
-      ),
-      body: _isLoading 
-        ? const Center(child: CircularProgressIndicator(color: Color(0xFF7EB8C9)))
-        : ListView.builder(
-            itemCount: _results.length,
-            itemBuilder: (context, i) {
-              final video = _results[i];
-              return ListTile(
-                leading: Image.network(video.thumbnails.mediumResUrl, width: 80, fit: BoxFit.cover),
-                title: Text(video.title, maxLines: 2, overflow: TextOverflow.ellipsis),
-                subtitle: Text(video.author, style: const TextStyle(color: Colors.grey)),
-                trailing: const Icon(Icons.download, color: Color(0xFF7EB8C9)),
-                onTap: () {
+        body: WebViewWidget(controller: _controller),
+        floatingActionButton: _isVideoPage
+            ? FloatingActionButton.extended(
+                onPressed: () {
                   showDialog(
                     context: context,
                     builder: (dialogContext) => FormDialog(
                       db: widget.db,
-                      onSave: () { widget.onSave(); Navigator.pop(context); },
-                      initialUrl: video.url,
+                      onSave: () {
+                        widget.onSave();
+                        Navigator.pop(context); 
+                      },
+                      initialUrl: _currentUrl,
                       onDownload: widget.onDownload, 
                     )
                   );
                 },
-              );
-            },
-          ),
+                backgroundColor: const Color(0xFF4A8FA3),
+                icon: const Icon(Icons.download, color: Colors.white),
+                label: const Text("Télécharger la vidéo", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              )
+            : null,
+      ),
     );
   }
 }
@@ -1094,7 +1148,6 @@ class _FormDialogState extends State<FormDialog> {
   int? selectedNum = 1;
   String? selectedName = "Al-Fatiha";
   
-  // FIX N°2 : Une seule variable pour la saisie intelligente de l'année
   late TextEditingController _yearInput, _file, _ytUrl, _vStart, _vEnd;
   bool isLocal = true; 
   bool isFull = true;
@@ -1155,7 +1208,6 @@ class _FormDialogState extends State<FormDialog> {
             ),
             const SizedBox(height: 10),
             
-            // FIX N°2 : Un seul champ intelligent
             TextField(
               controller: _yearInput, 
               keyboardType: TextInputType.number, 
@@ -1219,18 +1271,15 @@ class _FormDialogState extends State<FormDialog> {
               String thumb = widget.rec?['thumbnail'] ?? "";
               String dur = widget.rec?['duration'] ?? "";
               
-              // LOGIQUE DE CONVERSION DE L'ANNÉE
               int? inputYear = int.tryParse(_yearInput.text);
               int? anneeH;
               int? anneeG;
               
               if (inputYear != null) {
                 if (inputYear > 1500) {
-                  // C'est du Grégorien
                   anneeG = inputYear;
                   anneeH = inputYear - 622 + ((inputYear - 622) ~/ 32);
                 } else {
-                  // C'est du Hégirien
                   anneeH = inputYear;
                   anneeG = inputYear - (inputYear ~/ 33) + 622;
                 }
