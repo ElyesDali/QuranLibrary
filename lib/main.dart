@@ -324,12 +324,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (sources.isNotEmpty) await _player.setAudioSource(ConcatenatingAudioSource(children: sources));
   }
 
-  String _resolvePath(String pathStr) {
-    if (pathStr.startsWith('http')) return pathStr;
-    if (pathStr.startsWith('/')) return pathStr; 
-    return _appDirPath != null ? p.join(_appDirPath!, pathStr) : pathStr;
-  }
-
   MediaItem _createMediaItem(Map<String, dynamic> r) {
     Duration? exactDur;
     if (r['duration'] != null && r['duration'].toString().contains(':')) {
@@ -361,28 +355,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (pathStr.startsWith('http')) return pathStr;
     if (pathStr.startsWith('/')) return pathStr; 
     return _appDirPath != null ? p.join(_appDirPath!, pathStr) : pathStr;
-  }
-
-  MediaItem _createMediaItem(Map<String, dynamic> r) {
-    Duration? exactDur;
-    // FIX CRITIQUE ici aussi
-    if (r['duration'] != null && r['duration'].toString().contains(':') && !r['duration'].toString().contains('--')) {
-      final parts = r['duration'].toString().split(':');
-      if (parts.length == 2) exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
-    }
-    Uri? artUri;
-    if (r['thumbnail'] != null && r['thumbnail'].toString().isNotEmpty) {
-      String resolved = _resolvePath(r['thumbnail'].toString());
-      artUri = resolved.startsWith('http') ? Uri.parse(resolved) : Uri.file(resolved);
-    }
-    return MediaItem(
-      id: r['id'].toString(),
-      album: "Muhammad",
-      title: "${r['sourate_num'].toString().padLeft(3, '0')} - ${r['sourate_name']}",
-      artist: "Muhammad Al-Luhaidan",
-      artUri: artUri,
-      duration: exactDur,
-    );
   }
 
   Future<void> _startDownload(int id, String cleanUrl, File localFile) async {
