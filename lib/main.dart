@@ -1665,7 +1665,7 @@ class _FormDialogState extends State<FormDialog> {
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
     
-    // --- 1. MOTEUR TIKTOK (TikWM) ---
+    // --- 1. MOTEUR TIKTOK (TikWM - 100% Fiable) ---
     if (targetUrl.contains('tiktok')) {
       try {
         final res = await Dio().post(
@@ -1681,56 +1681,50 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // --- 2. MOTEUR INSTAGRAM (API dédiées) ---
+    // --- 2. MOTEUR INSTAGRAM (API Bots WhatsApp - Ultra Résilients) ---
     if (targetUrl.contains('instagram')) {
       
-      // Serveur 1 : L'API cachée de SSSGram (ultra puissante)
+      // Serveur 1 : RyzenDesu (Mis à jour quotidiennement)
+      try {
+        final res = await Dio().get(
+          'https://api.ryzendesu.vip/api/downloader/igdl?url=$targetUrl',
+          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
+        );
+        if (res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) {
+          return res.data['data'][0]['url']; // Lien MP4
+        }
+      } catch (_) {}
+
+      // Serveur 2 : Widipe API (Serveur miroir très rapide)
+      try {
+        final res = await Dio().get(
+          'https://widipe.com/download/igdl?url=$targetUrl',
+          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
+        );
+        if (res.data != null && res.data['result'] != null && res.data['result'].isNotEmpty) {
+          return res.data['result'][0]['url']; // Lien MP4
+        }
+      } catch (_) {}
+
+      // Serveur 3 : SSSGram (Avec le masque complet d'un navigateur Mac)
       try {
         final res = await Dio().get(
           'https://api.sssgram.com/st-ins/ver1/info?url=$targetUrl',
-          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 8)),
+          options: Options(
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+              'Origin': 'https://www.sssgram.com',
+              'Referer': 'https://www.sssgram.com/'
+            },
+            validateStatus: (_) => true, 
+            sendTimeout: const Duration(seconds: 10)
+          ),
         );
         if (res.data != null && res.data['result'] != null && res.data['result']['videoList'] != null) {
           List videos = res.data['result']['videoList'];
           if (videos.isNotEmpty && videos[0]['videoUrl'] != null) {
-            return videos[0]['videoUrl']; // Lien direct MP4 Instagram
+            return videos[0]['videoUrl']; 
           }
-        }
-      } catch (_) {}
-
-      // Serveur 2 : API de secours communautaire indonésienne (très stable)
-      try {
-        final res = await Dio().get(
-          'https://api.siputzx.my.id/api/d/igdl?url=$targetUrl',
-          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 8)),
-        );
-        if (res.data != null && res.data['data'] != null) {
-          List videos = res.data['data'];
-          if (videos.isNotEmpty && videos[0]['url'] != null) {
-            return videos[0]['url']; // Lien direct MP4 Instagram
-          }
-        }
-      } catch (_) {}
-
-      // Serveur 3 : Cobalt en tout dernier recours
-      try {
-        final res = await Dio().post(
-          'https://api.cobalt.tools/',
-          options: Options(
-            headers: {
-              'Accept': 'application/json', 
-              'Content-Type': 'application/json',
-              'Origin': 'https://cobalt.tools',
-              'Referer': 'https://cobalt.tools/',
-              'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)'
-            },
-            validateStatus: (_) => true,
-            sendTimeout: const Duration(seconds: 5),
-          ),
-          data: jsonEncode({"url": targetUrl})
-        );
-        if (res.statusCode == 200 && res.data != null && res.data['url'] != null) {
-          return res.data['url'];
         }
       } catch (_) {}
     }
