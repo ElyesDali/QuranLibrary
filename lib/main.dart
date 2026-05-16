@@ -400,11 +400,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
         tempFile.path,
         options: Options(
           headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Referer': 'https://cobalt.tools/',
-            'Accept': '*/*'
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
           },
-          receiveTimeout: const Duration(seconds: 30), // FIX DU GEL À 0% : Annule si la co saute
+          receiveTimeout: const Duration(seconds: 30),
+          followRedirects: true, // Très important pour TikTok
         ),
         onReceiveProgress: (received, total) {
           if (total != -1) {
@@ -423,7 +422,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         },
       );
       
-      if (await tempFile.exists() && await tempFile.length() > 50000) { // Tolérance baissée pour les petits Reels
+      if (await tempFile.exists() && await tempFile.length() > 50000) { 
         if (await localFile.exists()) await localFile.delete(); 
         await tempFile.rename(localFile.path); 
         
@@ -464,7 +463,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             const SnackBar(content: Text("✅ Vidéo prête pour le hors-ligne !", style: TextStyle(color: Colors.white)), backgroundColor: Colors.green, duration: Duration(seconds: 3))
           );
         }
-        _fetch(); // Met à jour l'UI avec les nouvelles infos
+        _fetch(); 
         _updateFullPlaylist(); 
       } else {
         throw Exception("Fichier corrompu ou illisible.");
@@ -475,10 +474,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
          try { await tempFile.delete(); } catch (_) {}
       }
       
-      // FIX PISTE FANTÔME 100% GARANTI
       if (!await localFile.exists()) {
           await _db?.delete('recitations', where: 'id = ?', whereArgs: [id]);
-          if (mounted) _fetch(); // On force le rafraîchissement de la liste
+          if (mounted) _fetch(); 
       }
 
       if (mounted) {
@@ -1666,11 +1664,28 @@ class _FormDialogState extends State<FormDialog> {
 // --- EXTRACTEUR MULTI-SERVEURS BLINDÉ ---
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
-    // Le premier est l'officiel (V11), les autres sont des miroirs de secours
+    // --- 1. MOTEUR TIKTOK (Dédié et 100% fiable via TikWM) ---
+    if (targetUrl.contains('tiktok')) {
+      try {
+        final res = await Dio().post(
+          'https://www.tikwm.com/api/',
+          data: FormData.fromMap({'url': targetUrl, 'hd': 1}), // Demande la qualité HD
+          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
+        );
+        if (res.data != null && res.data['data'] != null && res.data['data']['play'] != null) {
+          String finalUrl = res.data['data']['play'];
+          if (finalUrl.startsWith('//')) finalUrl = 'https:$finalUrl';
+          return finalUrl; // Lien MP4 direct
+        }
+      } catch (_) {}
+    }
+
+    // --- 2. MOTEUR INSTAGRAM (Cobalt avec déguisement iPhone) ---
     final instances = [
-      'https://api.cobalt.tools/',
-      'https://cobalt-api.ayo.tf/',
-      'https://coapi.kelig.me/api/json',
+      'https://api.cobalt.tools',
+      'https://coapi.kelig.me',
+      'https://cobalt.q0.wtf',
+      'https://cobalt-api.ayo.tf/api/json',
       'https://ca.haloz.at/api/json',
     ];
     
@@ -1682,22 +1697,21 @@ class MediaExtractor {
             headers: {
               'Accept': 'application/json', 
               'Content-Type': 'application/json',
-              'Origin': 'https://cobalt.tools',
-              'Referer': 'https://cobalt.tools/',
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+              // Le déguisement iPhone pour passer le pare-feu
+              'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
             },
-            validateStatus: (status) => status != null && status < 500,
-            sendTimeout: const Duration(seconds: 10), // Ne reste pas bloqué plus de 10s
-            receiveTimeout: const Duration(seconds: 10),
+            validateStatus: (_) => true,
+            sendTimeout: const Duration(seconds: 5), // Ne perd pas de temps si le serveur est bloqué
+            receiveTimeout: const Duration(seconds: 5),
           ),
           data: jsonEncode({"url": targetUrl})
         );
         
         if (response.statusCode == 200 && response.data != null && response.data['url'] != null) {
-          return response.data['url'];
+          return response.data['url']; // Lien MP4 direct
         }
       } catch (e) {
-        continue; // Passe au serveur suivant si celui-ci plante
+        continue; // Passe au serveur suivant
       }
     }
     return null; // Tous les serveurs ont échoué
