@@ -41,19 +41,13 @@ class ProxyServer {
         final ytUrl = request.uri.queryParameters['url'];
         if (ytUrl != null) {
           if (ytUrl.contains('instagram') || ytUrl.contains('tiktok')) {
-            // FIX COBALT V11 : En-têtes obligatoires anti-bots
-            final response = await Dio().post(
-              'https://api.cobalt.tools/',
-              options: Options(headers: {
-                'Accept': 'application/json', 
-                'Content-Type': 'application/json',
-                'Origin': 'https://cobalt.tools',
-                'Referer': 'https://cobalt.tools/',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-              }),
-              data: {"url": ytUrl}
-            );
-            request.response.redirect(Uri.parse(response.data['url']), status: HttpStatus.movedTemporarily);
+            // L'APPEL AU NOUVEAU RÉSEAU DE SERVEURS
+            final streamUrl = await MediaExtractor.getDownloadUrl(ytUrl);
+            if (streamUrl != null) {
+              request.response.redirect(Uri.parse(streamUrl), status: HttpStatus.movedTemporarily);
+            } else {
+              request.response.statusCode = 404;
+            }
             return;
           } else {
             var yt = YoutubeExplode();
@@ -300,7 +294,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
       Uri uri;
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
         final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
-        if (await localFile.exists() && await localFile.length() > 500000) {
+        // L'abaissement du seuil à 100000 garantit que les petits réels Insta sont bien validés.
+        if (await localFile.exists() && await localFile.length() > 100000) { 
           uri = Uri.file(localFile.path);
         } else {
           uri = Uri.parse(ProxyServer.getProxyUrl(path)); 
@@ -311,18 +306,55 @@ class _LibraryScreenState extends State<LibraryScreen> {
       
       final baseSource = AudioSource.uri(uri, tag: _createMediaItem(rec));
       
-      // FIX CRITIQUE : Le !rec...contains('--') empêche le crash mathématique
-      if (rec['duration'] != null && rec['duration'].toString().contains(':') && !rec['duration'].toString().contains('--')) {
-         final parts = rec['duration'].toString().split(':');
-         if (parts.length == 2) {
-           final dur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
-           sources.add(ClippingAudioSource(child: baseSource, end: dur, tag: _createMediaItem(rec)));
-           continue;
+      // FIX CRITIQUE : Le Try/Catch protège l'application de tout crash lié à un format inattendu.
+      if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
+         try {
+           final parts = rec['duration'].toString().split(':');
+           if (parts.length == 2) {
+             final dur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+             sources.add(ClippingAudioSource(child: baseSource, end: dur, tag: _createMediaItem(rec)));
+             continue;
+           }
+         } catch (_) {
+           // Si la durée n'est pas mathématiquement lisible, on ajoute la piste par défaut sans erreur.
          }
       }
       sources.add(baseSource);
     }
     if (sources.isNotEmpty) await _player.setAudioSource(ConcatenatingAudioSource(children: sources));
+  }
+
+  String _resolvePath(String pathStr) {
+    if (pathStr.startsWith('http')) return pathStr;
+    if (pathStr.startsWith('/')) return pathStr; 
+    return _appDirPath != null ? p.join(_appDirPath!, pathStr) : pathStr;
+  }
+
+  MediaItem _createMediaItem(Map<String, dynamic> r) {
+    Duration? exactDur;
+    if (r['duration'] != null && r['duration'].toString().contains(':')) {
+      // Le même bouclier s'applique ici pour le lecteur en arrière-plan
+      try {
+        final parts = r['duration'].toString().split(':');
+        if (parts.length == 2) {
+           exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+        }
+      } catch (_) {}
+    }
+    
+    Uri? artUri;
+    if (r['thumbnail'] != null && r['thumbnail'].toString().isNotEmpty) {
+      String resolved = _resolvePath(r['thumbnail'].toString());
+      artUri = resolved.startsWith('http') ? Uri.parse(resolved) : Uri.file(resolved);
+    }
+    return MediaItem(
+      id: r['id'].toString(),
+      album: "Muhammad",
+      title: "${r['sourate_num'].toString().padLeft(3, '0')} - ${r['sourate_name']}",
+      artist: "Muhammad",
+      artUri: artUri,
+      duration: exactDur,
+    );
   }
 
   String _resolvePath(String pathStr) {
@@ -358,25 +390,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
     
     setState(() => _activeDownloads[id] = 0.0);
     YoutubeExplode? yt;
-    final tempFile = File("${localFile.path}.tmp"); // Déclaré ici pour le catch
+    final tempFile = File("${localFile.path}.tmp"); 
     
     try {
-      String downloadUrl = cleanUrl;
+      String downloadUrl = "";
       
-      // FIX COBALT V11 pour le téléchargement physique
       if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
-        final response = await Dio().post(
-          'https://api.cobalt.tools/',
-          options: Options(headers: {
-            'Accept': 'application/json', 
-            'Content-Type': 'application/json',
-            'Origin': 'https://cobalt.tools',
-            'Referer': 'https://cobalt.tools/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-          }),
-          data: {"url": cleanUrl}
-        );
-        downloadUrl = response.data['url'];
+        // L'APPEL AU NOUVEAU RÉSEAU DE SERVEURS
+        final extracted = await MediaExtractor.getDownloadUrl(cleanUrl);
+        if (extracted == null) throw Exception("Tous les serveurs d'extraction ont rejeté le lien (vidéo privée ou expirée).");
+        downloadUrl = extracted;
       } else {
         yt = YoutubeExplode();
         var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
@@ -448,11 +471,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text("✅ Vidéo prête pour le hors-ligne !", style: TextStyle(color: Colors.white)), 
-              backgroundColor: Colors.green,
-              duration: Duration(seconds: 3),
-            )
+            const SnackBar(content: Text("✅ Vidéo prête pour le hors-ligne !", style: TextStyle(color: Colors.white)), backgroundColor: Colors.green, duration: Duration(seconds: 3))
           );
         }
         _updateFullPlaylist(); 
@@ -461,15 +480,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
     } catch (e) {
       debugPrint("Erreur téléchargement: $e");
-      
-      // L'ANTI-POLLUTION : On supprime le fichier .tmp corrompu si l'API a refusé le lien
       if (await tempFile.exists()) {
          try { await tempFile.delete(); } catch (_) {}
       }
-      
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("❌ Erreur API : Impossible d'extraire la vidéo (Privée ou lien invalide)."), backgroundColor: Colors.red)
+          const SnackBar(content: Text("❌ Erreur API : Impossible d'extraire la vidéo (Privée ou indisponible)."), backgroundColor: Colors.red)
         );
       }
     } finally {
@@ -1646,5 +1662,39 @@ class _FormDialogState extends State<FormDialog> {
         )
       ],
     );
+  }
+}
+
+// --- NOUVEL EXTRACTEUR MULTI-SERVEURS ---
+class MediaExtractor {
+  static Future<String?> getDownloadUrl(String targetUrl) async {
+    // Liste de serveurs miroirs Cobalt communautaires (sans sécurité stricte)
+    final instances = [
+      'https://cobalt-api.ayo.tf/',
+      'https://coapi.kelig.me/api/json',
+      'https://ca.haloz.at/api/json',
+      'https://cblt.fariz.dev/api/json',
+      'https://api.cobalt.tacohitbox.com/api/json',
+    ];
+    
+    for (String instance in instances) {
+      try {
+        final response = await Dio().post(
+          instance,
+          options: Options(
+            headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
+            validateStatus: (status) => status != null && status < 500, // Ne crash pas Dio sur une erreur 400
+          ),
+          data: jsonEncode({"url": targetUrl})
+        );
+        
+        if (response.statusCode == 200 && response.data != null && response.data['url'] != null) {
+          return response.data['url'];
+        }
+      } catch (e) {
+        continue; // On passe au serveur suivant silencieusement
+      }
+    }
+    return null; // Si absolument tous les serveurs sont hors-ligne
   }
 }
