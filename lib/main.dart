@@ -39,15 +39,27 @@ class ProxyServer {
       try {
         final ytUrl = request.uri.queryParameters['url'];
         if (ytUrl != null) {
-          var yt = YoutubeExplode();
-          var manifest = await yt.videos.streamsClient.getManifest(ytUrl);
-          var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
-          var streamInfo = mp4Muxed.isNotEmpty 
-              ? mp4Muxed.withHighestBitrate() 
-              : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-          yt.close();
-          request.response.redirect(streamInfo.url, status: HttpStatus.movedTemporarily);
-          return;
+          // --- NOUVEAUTÉ : Support d'Instagram et TikTok à la volée ! ---
+          if (ytUrl.contains('instagram') || ytUrl.contains('tiktok')) {
+            final response = await Dio().post(
+              'https://api.cobalt.tools/api/json',
+              options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}),
+              data: {"url": ytUrl}
+            );
+            request.response.redirect(Uri.parse(response.data['url']), status: HttpStatus.movedTemporarily);
+            return;
+          } else {
+            // --- YouTube Classique ---
+            var yt = YoutubeExplode();
+            var manifest = await yt.videos.streamsClient.getManifest(ytUrl);
+            var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
+            var streamInfo = mp4Muxed.isNotEmpty 
+                ? mp4Muxed.withHighestBitrate() 
+                : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+            yt.close();
+            request.response.redirect(streamInfo.url, status: HttpStatus.movedTemporarily);
+            return;
+          }
         }
       } catch (_) {
         request.response.statusCode = 500;
@@ -254,7 +266,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
     for (var rec in displayedRecitations) {
       String path = rec['fichier'] ?? "";
       Uri uri;
-      if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts')) {
+      
+      // FIX : Ajout des mots-clés instagram et tiktok
+      if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
         final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
         if (await localFile.exists() && await localFile.length() > 500000) {
           uri = Uri.file(localFile.path);
@@ -310,20 +324,35 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (_activeDownloads.containsKey(id)) return; 
     
     setState(() => _activeDownloads[id] = 0.0);
-    var yt = YoutubeExplode();
+    YoutubeExplode? yt;
     
     try {
-      var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-      var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
-      var streamInfo = mp4Muxed.isNotEmpty 
-          ? mp4Muxed.withHighestBitrate() 
-          : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+      String downloadUrl = cleanUrl;
+      
+      // --- NOUVEAUTÉ : Extraction IG / TikTok via Cobalt ---
+      if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
+        final response = await Dio().post(
+          'https://api.cobalt.tools/api/json',
+          options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}),
+          data: {"url": cleanUrl}
+        );
+        downloadUrl = response.data['url'];
+      } else {
+        // --- YouTube Classique ---
+        yt = YoutubeExplode();
+        var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
+        var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
+        var streamInfo = mp4Muxed.isNotEmpty 
+            ? mp4Muxed.withHighestBitrate() 
+            : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+        downloadUrl = streamInfo.url.toString();
+      }
       
       final tempFile = File("${localFile.path}.tmp");
       int lastUpdateValue = 0;
       
       await Dio().download(
-        streamInfo.url.toString(),
+        downloadUrl,
         tempFile.path,
         onReceiveProgress: (received, total) {
           if (total != -1) {
@@ -342,32 +371,54 @@ class _LibraryScreenState extends State<LibraryScreen> {
         },
       );
       
-      if (await tempFile.exists() && await tempFile.length() > 500000) {
+      if (await tempFile.exists() && await tempFile.length() > 100000) {
         if (await localFile.exists()) await localFile.delete(); 
         await tempFile.rename(localFile.path); 
+        
+        // --- NOUVEAUTÉ : Générer miniature et durée APRES le téléchargement (IG/TikTok) ---
+        if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
+          try {
+             final metadata = await MetadataRetriever.fromFile(localFile);
+             String newDur = "--:--";
+             if (metadata.trackDuration != null) {
+                final d = Duration(milliseconds: metadata.trackDuration!);
+                newDur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+             }
+             String newThumb = "";
+             if (metadata.albumArt != null) {
+                newThumb = "thumb_yt_$id.jpg";
+                final thumbFile = File(p.join(localFile.parent.path, newThumb));
+                await thumbFile.writeAsBytes(metadata.albumArt!);
+             }
+             if (newDur != "--:--" || newThumb.isNotEmpty) {
+                await _db?.update('recitations', {'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
+                _fetch(); // Met à jour l'interface avec la nouvelle miniature !
+             }
+          } catch (_) {}
+        }
         
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text("✅ Vidéo téléchargée et prête pour le hors-ligne !", style: TextStyle(color: Colors.white)), 
+              content: Text("✅ Vidéo prête pour le hors-ligne !", style: TextStyle(color: Colors.white)), 
               backgroundColor: Colors.green,
               duration: Duration(seconds: 3),
             )
           );
         }
-        _updateFullPlaylist(); // Rafraîchir la liste de lecture
+        _updateFullPlaylist(); 
       } else {
-        throw Exception("Fichier corrompu.");
+        throw Exception("Fichier corrompu ou illisible.");
       }
     } catch (e) {
       debugPrint("Erreur téléchargement: $e");
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("❌ Échec du téléchargement : $e"), backgroundColor: Colors.red)
+          SnackBar(content: Text("❌ Échec de l'extraction : $e"), backgroundColor: Colors.red)
         );
       }
     } finally {
-      yt.close();
+      yt?.close();
       if (mounted) setState(() => _activeDownloads.remove(id)); 
     }
   }
@@ -1294,20 +1345,23 @@ class _FormDialogState extends State<FormDialog> {
   String? selectedName = "Al-Fatiha";
   
   late TextEditingController _yearInput, _file, _ytUrl, _vStart, _vEnd;
-  bool isLocal = true; 
+  String _sourceType = "local"; // NOUVEAU : Gère 4 états
   bool isFull = true;
 
   @override
   void initState() {
     super.initState();
     
-    bool defaultIsLocal = true;
+    // Auto-détection du lien
     if (widget.rec != null) {
-      defaultIsLocal = !(widget.rec!['fichier']?.toString().contains('youtu') ?? false);
+      String f = widget.rec!['fichier']?.toString() ?? "";
+      if (f.contains('youtu')) _sourceType = "youtube";
+      else if (f.contains('instagram')) _sourceType = "instagram";
+      else if (f.contains('tiktok')) _sourceType = "tiktok";
+      else _sourceType = "local";
     } else if (widget.initialUrl != null && widget.initialUrl!.isNotEmpty) {
-      defaultIsLocal = false; 
+      _sourceType = "youtube"; 
     }
-    isLocal = defaultIsLocal;
     
     if (widget.rec != null) {
       selectedNum = widget.rec!['sourate_num'];
@@ -1316,8 +1370,8 @@ class _FormDialogState extends State<FormDialog> {
     }
     
     _yearInput = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
-    _file = TextEditingController(text: (widget.rec != null && isLocal) ? widget.rec!['fichier'] : "");
-    _ytUrl = TextEditingController(text: widget.initialUrl ?? ((widget.rec != null && !isLocal) ? widget.rec!['fichier'] : ""));
+    _file = TextEditingController(text: (widget.rec != null && _sourceType == "local") ? widget.rec!['fichier'] : "");
+    _ytUrl = TextEditingController(text: widget.initialUrl ?? ((widget.rec != null && _sourceType != "local") ? widget.rec!['fichier'] : ""));
     
     _vStart = TextEditingController(); 
     _vEnd = TextEditingController();
@@ -1375,17 +1429,47 @@ class _FormDialogState extends State<FormDialog> {
                 Expanded(child: TextField(controller: _vEnd, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "Fin"))),
               ]
             ),
-            const SizedBox(height: 10),
-            Row(
+            const SizedBox(height: 15),
+
+            // --- NOUVEAUTÉ : Les 4 puces de sélection rapides ---
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              alignment: WrapAlignment.center,
               children: [
-                Radio(value: true, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), 
-                const Text("Local"),
-                Radio(value: false, groupValue: isLocal, onChanged: (v) => setState(() => isLocal = v!)), 
-                const Text("YouTube"),
+                ChoiceChip(
+                  label: const Text("Local", style: TextStyle(fontSize: 12)), 
+                  selected: _sourceType == "local", 
+                  onSelected: (v) => setState(() => _sourceType = "local"),
+                  selectedColor: const Color(0xFF4A8FA3),
+                  showCheckmark: false,
+                ),
+                ChoiceChip(
+                  label: const Text("YouTube", style: TextStyle(fontSize: 12)), 
+                  selected: _sourceType == "youtube", 
+                  onSelected: (v) => setState(() => _sourceType = "youtube"),
+                  selectedColor: const Color(0xFF4A8FA3),
+                  showCheckmark: false,
+                ),
+                ChoiceChip(
+                  label: const Text("Instagram", style: TextStyle(fontSize: 12)), 
+                  selected: _sourceType == "instagram", 
+                  onSelected: (v) => setState(() => _sourceType = "instagram"),
+                  selectedColor: const Color(0xFF4A8FA3),
+                  showCheckmark: false,
+                ),
+                ChoiceChip(
+                  label: const Text("TikTok", style: TextStyle(fontSize: 12)), 
+                  selected: _sourceType == "tiktok", 
+                  onSelected: (v) => setState(() => _sourceType = "tiktok"),
+                  selectedColor: const Color(0xFF4A8FA3),
+                  showCheckmark: false,
+                ),
               ]
             ),
-            const SizedBox(height: 10),
-            if (isLocal) 
+
+            const SizedBox(height: 15),
+            if (_sourceType == "local") 
               ElevatedButton(
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.grey[800], foregroundColor: Colors.white),
                 onPressed: () async {
@@ -1397,12 +1481,16 @@ class _FormDialogState extends State<FormDialog> {
                     setState(() => _file.text = file.name);
                   }
                 }, 
-                child: const Text("Choisir fichier")
+                child: const Text("Choisir un fichier .mp4 / .mp3")
               )
             else 
               TextField(
                 controller: _ytUrl, 
-                decoration: const InputDecoration(labelText: "Lien YouTube")
+                decoration: InputDecoration(
+                  labelText: _sourceType == "youtube" 
+                    ? "Lien YouTube" 
+                    : (_sourceType == "instagram" ? "Lien du Reel (Instagram)" : "Lien de la vidéo (TikTok)")
+                )
               ),
           ],
         ),
@@ -1430,7 +1518,8 @@ class _FormDialogState extends State<FormDialog> {
                 }
               }
 
-              if (!isLocal && _ytUrl.text.isNotEmpty) {
+              // --- Logique de récupération initiale ---
+              if (_sourceType == "youtube" && _ytUrl.text.isNotEmpty) {
                 var yt = YoutubeExplode();
                 var video = await yt.videos.get(_ytUrl.text);
                 dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
@@ -1444,7 +1533,12 @@ class _FormDialogState extends State<FormDialog> {
                    thumb = video.thumbnails.standardResUrl; 
                 }
                 yt.close();
-              } else if (isLocal && _file.text.isNotEmpty) {
+              } 
+              else if ((_sourceType == "instagram" || _sourceType == "tiktok") && _ytUrl.text.isNotEmpty) {
+                dur = "--:--"; 
+                thumb = ""; 
+              } 
+              else if (_sourceType == "local" && _file.text.isNotEmpty) {
                 final dir = await getApplicationDocumentsDirectory();
                 final localFilePath = p.join(dir.path, _file.text);
                 try {
@@ -1466,7 +1560,7 @@ class _FormDialogState extends State<FormDialog> {
                 "sourate_name": selectedName,
                 "annee": anneeH, 
                 "annee_g": anneeG, 
-                "fichier": isLocal ? _file.text : _ytUrl.text,
+                "fichier": _sourceType == "local" ? _file.text : _ytUrl.text,
                 "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
                 "thumbnail": thumb, 
                 "duration": dur,
@@ -1475,7 +1569,7 @@ class _FormDialogState extends State<FormDialog> {
               int recordId = widget.rec == null ? await widget.db!.insert('recitations', data) : widget.rec!['id'];
               if (widget.rec != null) await widget.db!.update('recitations', data, where: 'id = ?', whereArgs: [recordId]);
               
-              if (!isLocal && _ytUrl.text.isNotEmpty) {
+              if (_sourceType != "local" && _ytUrl.text.isNotEmpty) {
                 final cleanUrl = _ytUrl.text;
                 final dir = await getApplicationDocumentsDirectory();
                 final localAudioFile = File(p.join(dir.path, "yt_$recordId.mp4"));
