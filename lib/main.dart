@@ -41,13 +41,15 @@ class ProxyServer {
         final ytUrl = request.uri.queryParameters['url'];
         if (ytUrl != null) {
           if (ytUrl.contains('instagram') || ytUrl.contains('tiktok')) {
-            // FIX COBALT V11 : Nouvelle adresse racine et en-têtes stricts
+            // FIX COBALT V11 : En-têtes obligatoires anti-bots
             final response = await Dio().post(
               'https://api.cobalt.tools/',
               options: Options(headers: {
                 'Accept': 'application/json', 
                 'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                'Origin': 'https://cobalt.tools',
+                'Referer': 'https://cobalt.tools/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
               }),
               data: {"url": ytUrl}
             );
@@ -238,7 +240,44 @@ class _LibraryScreenState extends State<LibraryScreen> {
         }
       }
     );
-    _fetch();
+    await _fetch();
+    await _cleanupOrphans(); // L'aspirateur automatique est lancé ici !
+  }
+
+  // --- L'ASPIRATEUR AUTOMATIQUE ---
+  Future<void> _cleanupOrphans() async {
+    if (_appDirPath == null) return;
+    final dir = Directory(_appDirPath!);
+    final files = dir.listSync();
+    
+    // On dresse la liste des fichiers officiellement enregistrés dans l'application
+    Set<String> validFiles = {'luhaidan.db', 'luhaidan.db-wal', 'luhaidan.db-shm'};
+    for (var rec in allRecitations) {
+      if (rec['fichier'] != null) validFiles.add(p.basename(rec['fichier']));
+      if (rec['thumbnail'] != null) validFiles.add(p.basename(rec['thumbnail']));
+      validFiles.add("yt_${rec['id']}.mp4");
+      validFiles.add("thumb_yt_${rec['id']}.jpg");
+    }
+    
+    // On détruit tout ce qui n'est pas sur la liste (Les .tmp, les vieilles vidéos, etc.)
+    for (var f in files) {
+      if (f is File) {
+        final basename = p.basename(f.path);
+        if (basename.endsWith('.tmp')) {
+          try { await f.delete(); } catch (_) {}
+        } else if ((basename.endsWith('.mp4') || basename.endsWith('.jpg') || basename.endsWith('.mp3')) && !validFiles.contains(basename)) {
+          try { await f.delete(); } catch (_) {}
+        }
+      }
+    }
+  }
+
+  Future<void> _fetch() async {
+    final res = await _db?.query('recitations', orderBy: 'sourate_num ASC');
+    setState(() {
+      allRecitations = res ?? [];
+      _applyFilters();
+    });
   }
 
   Future<void> _fetch() async {
@@ -327,6 +366,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     
     setState(() => _activeDownloads[id] = 0.0);
     YoutubeExplode? yt;
+    final tempFile = File("${localFile.path}.tmp"); // Déclaré ici pour le catch
     
     try {
       String downloadUrl = cleanUrl;
@@ -338,7 +378,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
           options: Options(headers: {
             'Accept': 'application/json', 
             'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            'Origin': 'https://cobalt.tools',
+            'Referer': 'https://cobalt.tools/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
           }),
           data: {"url": cleanUrl}
         );
@@ -353,7 +395,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
         downloadUrl = streamInfo.url.toString();
       }
       
-      final tempFile = File("${localFile.path}.tmp");
       int lastUpdateValue = 0;
       
       await Dio().download(
@@ -380,7 +421,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
         if (await localFile.exists()) await localFile.delete(); 
         await tempFile.rename(localFile.path); 
         
-        // --- NOUVEAUTÉ : CAPTURE DE LA MINIATURE VIDÉO ---
         if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
           try {
              final metadata = await MetadataRetriever.fromFile(localFile);
@@ -407,7 +447,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
              if (newDur != "--:--" || newThumb.isNotEmpty) {
                 await _db?.update('recitations', {'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
-                _fetch(); // Rafraîchit l'écran pour afficher la miniature fraîchement prise
+                _fetch(); 
              }
           } catch (e) {
              debugPrint("Erreur métadonnées: $e");
@@ -429,9 +469,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
     } catch (e) {
       debugPrint("Erreur téléchargement: $e");
+      
+      // L'ANTI-POLLUTION : On supprime le fichier .tmp corrompu si l'API a refusé le lien
+      if (await tempFile.exists()) {
+         try { await tempFile.delete(); } catch (_) {}
+      }
+      
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("❌ Échec de l'extraction : $e"), backgroundColor: Colors.red)
+          const SnackBar(content: Text("❌ Erreur API : Impossible d'extraire la vidéo (Privée ou lien invalide)."), backgroundColor: Colors.red)
         );
       }
     } finally {
