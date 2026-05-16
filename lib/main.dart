@@ -149,27 +149,53 @@ class _LibraryScreenState extends State<LibraryScreen> {
     super.initState();
     _initApp();
     _player.setVolume(volume);
+    _player.setLoopMode(LoopMode.off); // FIX : On force la boucle native à OFF
 
-    // 1. SURVEILLANCE DE LA POSITION (Interception avant le saut automatique)
-    _player.positionStream.listen((pos) async {
+    // 1. SURVEILLANCE SIMPLE (Ne coupe plus l'audio !)
+    _player.positionStream.listen((pos) {
       _lastPos = pos.inMilliseconds;
       _lastDuration = _player.duration?.inMilliseconds ?? 0;
-      
-      // Si on est à la toute fin de la piste ET que l'enchaînement est désactivé
-      if (loopMode == LoopModeState.off && !_isSwitchingTrack && _lastDuration > 0) {
-        if (_lastPos >= _lastDuration - 300) {
-          _isSwitchingTrack = true;
-          await _player.pause(); // On stoppe la lecture
-          await _player.seek(Duration.zero, index: _playingIndex); // On rembobine sur la MÊME piste
-          _isSwitchingTrack = false;
+    });
+
+    // 2. FIX : GESTION DU TOUT DERNIER FICHIER DE LA PLAYLIST
+    _player.playerStateStream.listen((state) async {
+      if (state.processingState == ProcessingState.completed) {
+        if (loopMode == LoopModeState.off) {
+          await _player.pause();
+          await _player.seek(Duration.zero, index: _playingIndex); // Reste sur la piste à 0
+        } else if (loopMode == LoopModeState.one) {
+          await _player.pause();
+          await Future.delayed(const Duration(milliseconds: 200)); // Délai doux
+          await _player.seek(Duration.zero, index: _playingIndex);
+          _player.play();
         }
       }
     });
 
-    // 2. SURVEILLANCE DE L'INDEX (Gère les clics manuels ou le mode Autoplay)
-    _player.currentIndexStream.listen((index) {
+    // 3. FIX : GESTION DES SAUTS (La piste actuelle se termine)
+    _player.currentIndexStream.listen((index) async {
       if (index == null || _isSwitchingTrack) return;
       
+      // Si l'audio a naturellement basculé sur la piste suivante
+      if (_playingIndex != null && index == _playingIndex! + 1) {
+         if (loopMode == LoopModeState.off) {
+            _isSwitchingTrack = true;
+            await _player.pause();
+            await _player.seek(Duration.zero, index: _playingIndex); // REVIENT A 0 SUR L'ACTUELLE
+            _isSwitchingTrack = false;
+            return; 
+         } else if (loopMode == LoopModeState.one) {
+            _isSwitchingTrack = true;
+            await _player.pause();
+            await Future.delayed(const Duration(milliseconds: 200)); // DELAI DE 200ms AVANT BOUCLE
+            await _player.seek(Duration.zero, index: _playingIndex); // REVIENT A 0 SUR L'ACTUELLE
+            _player.play();
+            _isSwitchingTrack = false;
+            return; 
+         }
+      }
+      
+      // Sinon (Lecture automatique classique, ou bouton manuel pressé)
       _playingIndex = index;
       if (index < displayedRecitations.length) {
          setState(() => currentRecitation = displayedRecitations[index]);
@@ -390,12 +416,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
         loopMode = LoopModeState.autoplay;
       } else if (loopMode == LoopModeState.autoplay) {
         loopMode = LoopModeState.one;
-        _player.setLoopMode(LoopMode.one);
       } else {
         loopMode = LoopModeState.off;
-        _player.setLoopMode(LoopMode.off);
       }
-      if (loopMode != LoopModeState.one) _player.setLoopMode(LoopMode.off);
+      _player.setLoopMode(LoopMode.off); // FIX : Toujours désactivé nativement
     });
   }
 
@@ -560,6 +584,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
+      // FIX SQLITE : On ferme la BDD pour forcer l'écriture du cache (WAL)
+      await _db?.close(); 
+      
       final dir = await getApplicationDocumentsDirectory();
       final encoder = ZipFileEncoder();
       final zipPath = p.join(dir.path, "QuranLibrary_Backup.zip");
@@ -568,24 +595,26 @@ class _LibraryScreenState extends State<LibraryScreen> {
       
       final dbFile = File(p.join(dir.path, 'luhaidan.db'));
       if (await dbFile.exists()) {
-        // FIX : On force le package à n'utiliser que le nom, sans l'arborescence iOS !
         encoder.addFile(dbFile, 'luhaidan.db'); 
       }
       
       final files = dir.listSync();
       for (var f in files) {
         if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) {
-          // FIX : Même chose pour les vidéos et les miniatures
           encoder.addFile(f, p.basename(f.path)); 
         }
       }
       encoder.close();
+
+      // On rouvre la BDD pour pouvoir continuer d'utiliser l'app
+      await _initApp(); 
 
       if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Fichier QuranLibrary_Backup.zip créé dans l'app Fichiers !"), backgroundColor: Colors.green));
     } catch (e) {
       if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur d'exportation : $e"), backgroundColor: Colors.red));
+      await _initApp();
     }
   }
 
@@ -597,18 +626,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
-      await _db?.close(); // On déconnecte la BDD pour pouvoir l'écraser proprement
+      await _player.pause(); // Libère les verrous sur les fichiers MP4
+      await _db?.close(); // Déconnecte la BDD
       
-      final zipFile = File(result.files.single.path!);
       final dir = await getApplicationDocumentsDirectory();
       
-      // FIX ARCHIVE V4 : On lit les bytes directement en mémoire
+      // FIX SQLITE : Détruit totalement l'ancienne BDD et ses fichiers caches (-wal, -shm)
+      await deleteDatabase(p.join(dir.path, 'luhaidan.db')); 
+      
+      final zipFile = File(result.files.single.path!);
       final bytes = await zipFile.readAsBytes();
       final archive = ZipDecoder().decodeBytes(bytes);
       
       for (var file in archive) {
         if (file.isFile) {
-          // On récupère uniquement le nom final du fichier, en ignorant les dossiers fantômes
           final filename = p.basename(file.name);
           final outFile = File(p.join(dir.path, filename));
           
@@ -617,7 +648,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
         }
       }
       
-      await _initApp(); // Reconnecte la BDD et rafraîchit la liste
+      // Reconnecte la nouvelle BDD et rafraîchit la liste d'affichage
+      await _initApp(); 
       
       if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Bibliothèque restaurée avec succès !"), backgroundColor: Colors.green));
