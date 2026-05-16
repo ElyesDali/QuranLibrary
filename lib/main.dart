@@ -16,6 +16,7 @@ import 'package:flutter_media_metadata/flutter_media_metadata.dart';
 import 'package:dio/dio.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:archive/archive_io.dart';
+import 'package:video_thumbnail/video_thumbnail.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -39,23 +40,23 @@ class ProxyServer {
       try {
         final ytUrl = request.uri.queryParameters['url'];
         if (ytUrl != null) {
-          // --- NOUVEAUTÉ : Support d'Instagram et TikTok à la volée ! ---
           if (ytUrl.contains('instagram') || ytUrl.contains('tiktok')) {
+            // FIX COBALT V11 : Nouvelle adresse racine et en-têtes stricts
             final response = await Dio().post(
-              'https://api.cobalt.tools/api/json',
-              options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}),
+              'https://api.cobalt.tools/',
+              options: Options(headers: {
+                'Accept': 'application/json', 
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+              }),
               data: {"url": ytUrl}
             );
             request.response.redirect(Uri.parse(response.data['url']), status: HttpStatus.movedTemporarily);
             return;
           } else {
-            // --- YouTube Classique ---
             var yt = YoutubeExplode();
             var manifest = await yt.videos.streamsClient.getManifest(ytUrl);
-            var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
-            var streamInfo = mp4Muxed.isNotEmpty 
-                ? mp4Muxed.withHighestBitrate() 
-                : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
+            var streamInfo = manifest.muxed.withHighestBitrate();
             yt.close();
             request.response.redirect(streamInfo.url, status: HttpStatus.movedTemporarily);
             return;
@@ -266,8 +267,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     for (var rec in displayedRecitations) {
       String path = rec['fichier'] ?? "";
       Uri uri;
-      
-      // FIX : Ajout des mots-clés instagram et tiktok
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
         final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
         if (await localFile.exists() && await localFile.length() > 500000) {
@@ -280,7 +279,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
       
       final baseSource = AudioSource.uri(uri, tag: _createMediaItem(rec));
-      if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
+      
+      // FIX CRITIQUE : Le !rec...contains('--') empêche le crash mathématique
+      if (rec['duration'] != null && rec['duration'].toString().contains(':') && !rec['duration'].toString().contains('--')) {
          final parts = rec['duration'].toString().split(':');
          if (parts.length == 2) {
            final dur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
@@ -301,7 +302,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   MediaItem _createMediaItem(Map<String, dynamic> r) {
     Duration? exactDur;
-    if (r['duration'] != null && r['duration'].toString().contains(':')) {
+    // FIX CRITIQUE ici aussi
+    if (r['duration'] != null && r['duration'].toString().contains(':') && !r['duration'].toString().contains('--')) {
       final parts = r['duration'].toString().split(':');
       if (parts.length == 2) exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
     }
@@ -312,9 +314,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
     return MediaItem(
       id: r['id'].toString(),
-      album: "Quran Library",
+      album: "Muhammad",
       title: "${r['sourate_num'].toString().padLeft(3, '0')} - ${r['sourate_name']}",
-      artist: "Muhammad",
+      artist: "Muhammad Al-Luhaidan",
       artUri: artUri,
       duration: exactDur,
     );
@@ -329,16 +331,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
     try {
       String downloadUrl = cleanUrl;
       
-      // --- NOUVEAUTÉ : Extraction IG / TikTok via Cobalt ---
+      // FIX COBALT V11 pour le téléchargement physique
       if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
         final response = await Dio().post(
-          'https://api.cobalt.tools/api/json',
-          options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}),
+          'https://api.cobalt.tools/',
+          options: Options(headers: {
+            'Accept': 'application/json', 
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+          }),
           data: {"url": cleanUrl}
         );
         downloadUrl = response.data['url'];
       } else {
-        // --- YouTube Classique ---
         yt = YoutubeExplode();
         var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
         var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
@@ -375,7 +380,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         if (await localFile.exists()) await localFile.delete(); 
         await tempFile.rename(localFile.path); 
         
-        // --- NOUVEAUTÉ : Générer miniature et durée APRES le téléchargement (IG/TikTok) ---
+        // --- NOUVEAUTÉ : CAPTURE DE LA MINIATURE VIDÉO ---
         if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
           try {
              final metadata = await MetadataRetriever.fromFile(localFile);
@@ -384,17 +389,29 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 final d = Duration(milliseconds: metadata.trackDuration!);
                 newDur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
              }
-             String newThumb = "";
-             if (metadata.albumArt != null) {
-                newThumb = "thumb_yt_$id.jpg";
-                final thumbFile = File(p.join(localFile.parent.path, newThumb));
-                await thumbFile.writeAsBytes(metadata.albumArt!);
+             
+             String newThumb = "thumb_yt_$id.jpg";
+             final thumbData = await VideoThumbnail.thumbnailData(
+               video: localFile.path,
+               imageFormat: ImageFormat.JPEG,
+               maxWidth: 300, 
+               quality: 50,
+             );
+             
+             if (thumbData != null) {
+               final thumbFile = File(p.join(localFile.parent.path, newThumb));
+               await thumbFile.writeAsBytes(thumbData);
+             } else {
+               newThumb = ""; 
              }
+
              if (newDur != "--:--" || newThumb.isNotEmpty) {
                 await _db?.update('recitations', {'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
-                _fetch(); // Met à jour l'interface avec la nouvelle miniature !
+                _fetch(); // Rafraîchit l'écran pour afficher la miniature fraîchement prise
              }
-          } catch (_) {}
+          } catch (e) {
+             debugPrint("Erreur métadonnées: $e");
+          }
         }
         
         if (mounted) {
