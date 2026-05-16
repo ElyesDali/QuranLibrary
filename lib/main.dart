@@ -626,33 +626,68 @@ class _LibraryScreenState extends State<LibraryScreen> {
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
-      await _player.pause(); // Libère les verrous sur les fichiers MP4
-      await _db?.close(); // Déconnecte la BDD
-      
+      // 1. Dézipper dans un dossier temporaire sécurisé
+      final zipFile = File(result.files.single.path!);
       final dir = await getApplicationDocumentsDirectory();
       
-      // FIX SQLITE : Détruit totalement l'ancienne BDD et ses fichiers caches (-wal, -shm)
-      await deleteDatabase(p.join(dir.path, 'luhaidan.db')); 
+      final tempDir = Directory(p.join(dir.path, 'temp_restore'));
+      if (await tempDir.exists()) {
+        await tempDir.delete(recursive: true);
+      }
+      await tempDir.create();
+
+      extractFileToDisk(zipFile.path, tempDir.path);
+
+      // 2. MODE ASPIRATEUR : Chercher la base de données partout dans les sous-dossiers
+      File? extractedDb;
+      List<File> extractedMedia = [];
       
-      final zipFile = File(result.files.single.path!);
-      final bytes = await zipFile.readAsBytes();
-      final archive = ZipDecoder().decodeBytes(bytes);
-      
-      for (var file in archive) {
-        if (file.isFile) {
-          final filename = p.basename(file.name);
-          final outFile = File(p.join(dir.path, filename));
-          
-          final data = file.content as List<int>;
-          await outFile.writeAsBytes(data, flush: true);
+      final entities = tempDir.listSync(recursive: true);
+      for (var entity in entities) {
+        if (entity is File) {
+          final name = p.basename(entity.path);
+          if (name == 'luhaidan.db') {
+            extractedDb = entity;
+          } else if (name.endsWith('.mp4') || name.endsWith('.jpg')) {
+            extractedMedia.add(entity);
+          }
         }
       }
+
+      // Si le fichier zip ne contient pas de base de données, on annule tout
+      if (extractedDb == null) {
+        throw Exception("Fichier luhaidan.db introuvable dans la sauvegarde.");
+      }
+
+      // 3. Stopper l'audio et détruire la base de données actuelle (et son cache WAL)
+      await _player.stop();
+      await _db?.close();
+      _db = null; 
       
-      // Reconnecte la nouvelle BDD et rafraîchit la liste d'affichage
+      final realDbPath = p.join(dir.path, 'luhaidan.db');
+      await deleteDatabase(realDbPath); // Supprime la DB et le cache
+      
+      // 4. Placer la nouvelle base de données au bon endroit
+      await extractedDb.copy(realDbPath);
+
+      // 5. Restaurer les fichiers médias à la racine
+      for (var mediaFile in extractedMedia) {
+        final newPath = p.join(dir.path, p.basename(mediaFile.path));
+        if (await File(newPath).exists()) {
+           await File(newPath).delete(); // Écrase si le fichier existe déjà
+        }
+        await mediaFile.copy(newPath);
+      }
+
+      // 6. Nettoyer le dossier temporaire
+      await tempDir.delete(recursive: true);
+
+      // 7. Relancer l'application pour afficher les données
       await _initApp(); 
-      
+
       if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Bibliothèque restaurée avec succès !"), backgroundColor: Colors.green));
+      
     } catch (e) {
       if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de restauration : $e"), backgroundColor: Colors.red));
@@ -1020,35 +1055,89 @@ class _LibraryScreenState extends State<LibraryScreen> {
     showModalBottomSheet(
       context: context, 
       backgroundColor: const Color(0xFF111111), 
-      builder: (context) => Wrap(
+      builder: (bottomSheetContext) => Wrap(
         children: [
           ListTile(
             leading: const Icon(Icons.edit, color: Color(0xFF7EB8C9)), 
             title: const Text("Modifier"), 
             onTap: () { 
-              Navigator.pop(context); 
+              Navigator.pop(bottomSheetContext); 
               _showForm(rec: rec); 
             }
           ),
           ListTile(
             leading: const Icon(Icons.delete, color: Colors.red), 
             title: const Text("Supprimer"), 
-            onTap: () async {
-              if (currentRecitation?['id'] == rec['id']) {
-                await _player.pause();
-              }
-              await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
-              try {
-                final dir = await getApplicationDocumentsDirectory();
-                final f = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
-                if (await f.exists()) await f.delete();
-              } catch (_) {}
-              
-              _fetch(); 
-              if (mounted) Navigator.pop(context);
+            onTap: () {
+              Navigator.pop(bottomSheetContext); // Ferme le menu du bas
+              _confirmDelete(rec); // Ouvre la boîte de confirmation
             }
           ),
         ]
+      )
+    );
+  }
+
+  // NOUVELLE FONCTION : Confirmation et Nettoyage Extrême
+  void _confirmDelete(Map<String, dynamic> rec) {
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: const Color(0xFF111111),
+        title: const Text("Confirmer la suppression", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
+        content: Text("Voulez-vous vraiment supprimer « ${rec['sourate_name']} » ?\n\nCette action supprimera également les fichiers médias associés de votre téléphone pour libérer de l'espace."),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text("Annuler", style: TextStyle(color: Colors.grey))
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () async {
+              Navigator.pop(dialogContext); // Ferme la boîte de confirmation
+
+              // 1. FIX DU FANTÔME : Si c'est la piste en cours de lecture
+              if (currentRecitation?['id'] == rec['id']) {
+                await _player.stop(); // On coupe le son brutalement
+                setState(() {
+                  currentRecitation = null; // On fait disparaître le lecteur de l'interface
+                  _playingIndex = null;
+                });
+              }
+
+              // 2. SUPPRESSION DE LA BASE DE DONNÉES
+              await _db?.delete('recitations', where: 'id = ?', whereArgs: [rec['id']]);
+
+              // 3. NETTOYAGE PHYSIQUE ANTI-DOUBLONS (Fichiers & Miniatures)
+              try {
+                final dir = await getApplicationDocumentsDirectory();
+                
+                // A. Supprimer la vidéo YouTube (si existante)
+                final ytFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
+                if (await ytFile.exists()) await ytFile.delete();
+
+                // B. Supprimer le fichier vidéo Local (si existant)
+                String fileStr = rec['fichier'] ?? "";
+                if (!fileStr.contains('youtu') && fileStr.isNotEmpty) {
+                  final localFile = File(p.join(dir.path, fileStr));
+                  if (await localFile.exists()) await localFile.delete();
+                }
+
+                // C. Supprimer la miniature associée (si elle est téléchargée localement)
+                String thumbStr = rec['thumbnail'] ?? "";
+                if (thumbStr.isNotEmpty && !thumbStr.startsWith('http')) {
+                  final thumbFile = File(p.join(dir.path, thumbStr));
+                  if (await thumbFile.exists()) await thumbFile.delete();
+                }
+              } catch (e) {
+                debugPrint("Erreur lors de la suppression des fichiers : $e");
+              }
+
+              // 4. RAFRAÎCHIR L'INTERFACE ET LA PLAYLIST AIRPLAY
+              _fetch(); 
+            }
+          )
+        ],
       )
     );
   }
