@@ -398,11 +398,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
       await Dio().download(
         downloadUrl,
         tempFile.path,
-        // FIX 0% : On force les serveurs d'Instagram/TikTok à accepter le téléchargement
-        options: Options(headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          'Referer': 'https://cobalt.tools/'
-        }),
+        options: Options(
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer': 'https://cobalt.tools/',
+            'Accept': '*/*'
+          },
+          receiveTimeout: const Duration(seconds: 30), // FIX DU GEL À 0% : Annule si la co saute
+        ),
         onReceiveProgress: (received, total) {
           if (total != -1) {
             int percentage = ((received / total) * 100).toInt();
@@ -420,7 +423,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         },
       );
       
-      if (await tempFile.exists() && await tempFile.length() > 100000) {
+      if (await tempFile.exists() && await tempFile.length() > 50000) { // Tolérance baissée pour les petits Reels
         if (await localFile.exists()) await localFile.delete(); 
         await tempFile.rename(localFile.path); 
         
@@ -450,7 +453,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
              if (newDur != "--:--" || newThumb.isNotEmpty) {
                 await _db?.update('recitations', {'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
-                _fetch(); 
              }
           } catch (e) {
              debugPrint("Erreur métadonnées: $e");
@@ -462,6 +464,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             const SnackBar(content: Text("✅ Vidéo prête pour le hors-ligne !", style: TextStyle(color: Colors.white)), backgroundColor: Colors.green, duration: Duration(seconds: 3))
           );
         }
+        _fetch(); // Met à jour l'UI avec les nouvelles infos
         _updateFullPlaylist(); 
       } else {
         throw Exception("Fichier corrompu ou illisible.");
@@ -472,16 +475,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
          try { await tempFile.delete(); } catch (_) {}
       }
       
-      // FIX PISTE FANTÔME : Si le téléchargement foire, on supprime la ligne vide de la BDD !
-      final localAudioFile = File(p.join(_appDirPath!, "yt_$id.mp4"));
-      if (!await localAudioFile.exists()) {
+      // FIX PISTE FANTÔME 100% GARANTI
+      if (!await localFile.exists()) {
           await _db?.delete('recitations', where: 'id = ?', whereArgs: [id]);
-          _fetch();
+          if (mounted) _fetch(); // On force le rafraîchissement de la liste
       }
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("❌ Impossible d'extraire la vidéo (Privée ou indisponible)."), backgroundColor: Colors.red)
+          SnackBar(content: Text("❌ Erreur de téléchargement : Impossible d'accéder au serveur."), backgroundColor: Colors.red, duration: const Duration(seconds: 4))
         );
       }
     } finally {
@@ -1692,5 +1694,46 @@ class MediaExtractor {
       }
     }
     return null; // Si absolument tous les serveurs sont hors-ligne
+  }
+}
+
+// --- EXTRACTEUR MULTI-SERVEURS BLINDÉ ---
+class MediaExtractor {
+  static Future<String?> getDownloadUrl(String targetUrl) async {
+    // Le premier est l'officiel (V11), les autres sont des miroirs de secours
+    final instances = [
+      'https://api.cobalt.tools/',
+      'https://cobalt-api.ayo.tf/',
+      'https://coapi.kelig.me/api/json',
+      'https://ca.haloz.at/api/json',
+    ];
+    
+    for (String instance in instances) {
+      try {
+        final response = await Dio().post(
+          instance,
+          options: Options(
+            headers: {
+              'Accept': 'application/json', 
+              'Content-Type': 'application/json',
+              'Origin': 'https://cobalt.tools',
+              'Referer': 'https://cobalt.tools/',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            },
+            validateStatus: (status) => status != null && status < 500,
+            sendTimeout: const Duration(seconds: 10), // Ne reste pas bloqué plus de 10s
+            receiveTimeout: const Duration(seconds: 10),
+          ),
+          data: jsonEncode({"url": targetUrl})
+        );
+        
+        if (response.statusCode == 200 && response.data != null && response.data['url'] != null) {
+          return response.data['url'];
+        }
+      } catch (e) {
+        continue; // Passe au serveur suivant si celui-ci plante
+      }
+    }
+    return null; // Tous les serveurs ont échoué
   }
 }
