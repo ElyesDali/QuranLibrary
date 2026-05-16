@@ -1664,56 +1664,77 @@ class _FormDialogState extends State<FormDialog> {
 // --- EXTRACTEUR MULTI-SERVEURS BLINDÉ ---
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
-    // --- 1. MOTEUR TIKTOK (Dédié et 100% fiable via TikWM) ---
+    
+    // --- 1. MOTEUR TIKTOK (TikWM) ---
     if (targetUrl.contains('tiktok')) {
       try {
         final res = await Dio().post(
           'https://www.tikwm.com/api/',
-          data: FormData.fromMap({'url': targetUrl, 'hd': 1}), // Demande la qualité HD
+          data: FormData.fromMap({'url': targetUrl, 'hd': 1}),
           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
         );
         if (res.data != null && res.data['data'] != null && res.data['data']['play'] != null) {
           String finalUrl = res.data['data']['play'];
           if (finalUrl.startsWith('//')) finalUrl = 'https:$finalUrl';
-          return finalUrl; // Lien MP4 direct
+          return finalUrl; 
         }
       } catch (_) {}
     }
 
-    // --- 2. MOTEUR INSTAGRAM (Cobalt avec déguisement iPhone) ---
-    final instances = [
-      'https://api.cobalt.tools',
-      'https://coapi.kelig.me',
-      'https://cobalt.q0.wtf',
-      'https://cobalt-api.ayo.tf/api/json',
-      'https://ca.haloz.at/api/json',
-    ];
-    
-    for (String instance in instances) {
+    // --- 2. MOTEUR INSTAGRAM (API dédiées) ---
+    if (targetUrl.contains('instagram')) {
+      
+      // Serveur 1 : L'API cachée de SSSGram (ultra puissante)
       try {
-        final response = await Dio().post(
-          instance,
+        final res = await Dio().get(
+          'https://api.sssgram.com/st-ins/ver1/info?url=$targetUrl',
+          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 8)),
+        );
+        if (res.data != null && res.data['result'] != null && res.data['result']['videoList'] != null) {
+          List videos = res.data['result']['videoList'];
+          if (videos.isNotEmpty && videos[0]['videoUrl'] != null) {
+            return videos[0]['videoUrl']; // Lien direct MP4 Instagram
+          }
+        }
+      } catch (_) {}
+
+      // Serveur 2 : API de secours communautaire indonésienne (très stable)
+      try {
+        final res = await Dio().get(
+          'https://api.siputzx.my.id/api/d/igdl?url=$targetUrl',
+          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 8)),
+        );
+        if (res.data != null && res.data['data'] != null) {
+          List videos = res.data['data'];
+          if (videos.isNotEmpty && videos[0]['url'] != null) {
+            return videos[0]['url']; // Lien direct MP4 Instagram
+          }
+        }
+      } catch (_) {}
+
+      // Serveur 3 : Cobalt en tout dernier recours
+      try {
+        final res = await Dio().post(
+          'https://api.cobalt.tools/',
           options: Options(
             headers: {
               'Accept': 'application/json', 
               'Content-Type': 'application/json',
-              // Le déguisement iPhone pour passer le pare-feu
-              'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
+              'Origin': 'https://cobalt.tools',
+              'Referer': 'https://cobalt.tools/',
+              'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)'
             },
             validateStatus: (_) => true,
-            sendTimeout: const Duration(seconds: 5), // Ne perd pas de temps si le serveur est bloqué
-            receiveTimeout: const Duration(seconds: 5),
+            sendTimeout: const Duration(seconds: 5),
           ),
           data: jsonEncode({"url": targetUrl})
         );
-        
-        if (response.statusCode == 200 && response.data != null && response.data['url'] != null) {
-          return response.data['url']; // Lien MP4 direct
+        if (res.statusCode == 200 && res.data != null && res.data['url'] != null) {
+          return res.data['url'];
         }
-      } catch (e) {
-        continue; // Passe au serveur suivant
-      }
+      } catch (_) {}
     }
-    return null; // Tous les serveurs ont échoué
+
+    return null; // Si absolument tous les serveurs échouent
   }
 }
