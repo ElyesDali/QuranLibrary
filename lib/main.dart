@@ -280,14 +280,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
     });
   }
 
-  Future<void> _fetch() async {
-    final res = await _db?.query('recitations', orderBy: 'sourate_num ASC');
-    setState(() {
-      allRecitations = res ?? [];
-      _applyFilters();
-    });
-  }
-
   void _applyFilters() {
     setState(() {
       if (selectedYearFilter == null) {
