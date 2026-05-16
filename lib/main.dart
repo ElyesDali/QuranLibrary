@@ -1135,7 +1135,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
               // 4. RAFRAÎCHIR L'INTERFACE ET LA PLAYLIST AIRPLAY
               _fetch(); 
-            }
+            },
+            // LA LIGNE MANQUANTE EST JUSTE ICI :
+            child: const Text("Supprimer", style: TextStyle(color: Colors.white)) 
           )
         ],
       )
