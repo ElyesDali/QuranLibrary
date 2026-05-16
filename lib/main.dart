@@ -1663,40 +1663,6 @@ class _FormDialogState extends State<FormDialog> {
   }
 }
 
-// --- NOUVEL EXTRACTEUR MULTI-SERVEURS ---
-class MediaExtractor {
-  static Future<String?> getDownloadUrl(String targetUrl) async {
-    // Liste de serveurs miroirs Cobalt communautaires (sans sécurité stricte)
-    final instances = [
-      'https://cobalt-api.ayo.tf/',
-      'https://coapi.kelig.me/api/json',
-      'https://ca.haloz.at/api/json',
-      'https://cblt.fariz.dev/api/json',
-      'https://api.cobalt.tacohitbox.com/api/json',
-    ];
-    
-    for (String instance in instances) {
-      try {
-        final response = await Dio().post(
-          instance,
-          options: Options(
-            headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
-            validateStatus: (status) => status != null && status < 500, // Ne crash pas Dio sur une erreur 400
-          ),
-          data: jsonEncode({"url": targetUrl})
-        );
-        
-        if (response.statusCode == 200 && response.data != null && response.data['url'] != null) {
-          return response.data['url'];
-        }
-      } catch (e) {
-        continue; // On passe au serveur suivant silencieusement
-      }
-    }
-    return null; // Si absolument tous les serveurs sont hors-ligne
-  }
-}
-
 // --- EXTRACTEUR MULTI-SERVEURS BLINDÉ ---
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
