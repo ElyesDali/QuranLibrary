@@ -294,7 +294,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       Uri uri;
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
         final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
-        // L'abaissement du seuil à 100000 garantit que les petits réels Insta sont bien validés.
         if (await localFile.exists() && await localFile.length() > 100000) { 
           uri = Uri.file(localFile.path);
         } else {
@@ -306,7 +305,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       
       final baseSource = AudioSource.uri(uri, tag: _createMediaItem(rec));
       
-      // FIX CRITIQUE : Le Try/Catch protège l'application de tout crash lié à un format inattendu.
       if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
          try {
            final parts = rec['duration'].toString().split(':');
@@ -315,13 +313,27 @@ class _LibraryScreenState extends State<LibraryScreen> {
              sources.add(ClippingAudioSource(child: baseSource, end: dur, tag: _createMediaItem(rec)));
              continue;
            }
-         } catch (_) {
-           // Si la durée n'est pas mathématiquement lisible, on ajoute la piste par défaut sans erreur.
-         }
+         } catch (_) {}
       }
       sources.add(baseSource);
     }
-    if (sources.isNotEmpty) await _player.setAudioSource(ConcatenatingAudioSource(children: sources));
+
+    if (sources.isNotEmpty) {
+      // FIX : Mémoriser la lecture en cours pour ne pas repartir à zéro !
+      int? savedIndex = _playingIndex;
+      Duration savedPos = _player.position;
+      bool wasPlaying = _player.playing;
+
+      final newPlaylist = ConcatenatingAudioSource(children: sources);
+
+      if (savedIndex != null && savedIndex < sources.length) {
+        // On insère la nouvelle playlist mais on force le lecteur à rester sur la piste actuelle
+        await _player.setAudioSource(newPlaylist, initialIndex: savedIndex, initialPosition: savedPos);
+        if (wasPlaying) _player.play();
+      } else {
+        await _player.setAudioSource(newPlaylist);
+      }
+    }
   }
 
   MediaItem _createMediaItem(Map<String, dynamic> r) {
@@ -368,9 +380,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
       String downloadUrl = "";
       
       if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
-        // L'APPEL AU NOUVEAU RÉSEAU DE SERVEURS
         final extracted = await MediaExtractor.getDownloadUrl(cleanUrl);
-        if (extracted == null) throw Exception("Tous les serveurs d'extraction ont rejeté le lien (vidéo privée ou expirée).");
+        if (extracted == null) throw Exception("Tous les serveurs ont rejeté le lien.");
         downloadUrl = extracted;
       } else {
         yt = YoutubeExplode();
@@ -387,6 +398,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
       await Dio().download(
         downloadUrl,
         tempFile.path,
+        // FIX 0% : On force les serveurs d'Instagram/TikTok à accepter le téléchargement
+        options: Options(headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Referer': 'https://cobalt.tools/'
+        }),
         onReceiveProgress: (received, total) {
           if (total != -1) {
             int percentage = ((received / total) * 100).toInt();
@@ -455,9 +471,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
       if (await tempFile.exists()) {
          try { await tempFile.delete(); } catch (_) {}
       }
+      
+      // FIX PISTE FANTÔME : Si le téléchargement foire, on supprime la ligne vide de la BDD !
+      final localAudioFile = File(p.join(_appDirPath!, "yt_$id.mp4"));
+      if (!await localAudioFile.exists()) {
+          await _db?.delete('recitations', where: 'id = ?', whereArgs: [id]);
+          _fetch();
+      }
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("❌ Erreur API : Impossible d'extraire la vidéo (Privée ou indisponible)."), backgroundColor: Colors.red)
+          const SnackBar(content: Text("❌ Impossible d'extraire la vidéo (Privée ou indisponible)."), backgroundColor: Colors.red)
         );
       }
     } finally {
