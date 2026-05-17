@@ -1673,10 +1673,22 @@ class _FormDialogState extends State<FormDialog> {
 // --- EXTRACTEUR MULTI-SERVEURS BLINDÉ ---
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
-    // 0. NETTOYAGE CRITIQUE DU LIEN (Enlève les traceurs IG)
-    String cleanUrl = targetUrl;
+    // 0. NETTOYAGE ET NORMALISATION DU LIEN
+    String cleanUrl = targetUrl.trim();
+    
+    // Correction de la majuscule éventuelle sur "Https"
+    if (cleanUrl.toLowerCase().startsWith('http')) {
+      cleanUrl = cleanUrl.replaceFirst(RegExp(r'^https?', caseSensitive: false), 'https');
+    }
+
+    // Suppression des traceurs Instagram (?igsh=)
     if (cleanUrl.contains('?')) {
       cleanUrl = cleanUrl.split('?').first;
+    }
+    
+    // Suppression du slash final éventuel qui fait parfois bugger les API
+    if (cleanUrl.endsWith('/')) {
+      cleanUrl = cleanUrl.substring(0, cleanUrl.length - 1);
     }
 
     // 1. MOTEUR TIKTOK (TikWM)
@@ -1695,9 +1707,46 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // 2. MOTEUR INSTAGRAM (Cobalt + API de secours indonésiennes)
+    // 2. MOTEUR INSTAGRAM
     if (cleanUrl.contains('instagram')) {
-      // Serveur 1 : Cobalt Officiel 
+      
+      // Serveur 1 : Siputzx (Très stable)
+      try {
+         final res = await Dio().get(
+           'https://api.siputzx.my.id/api/d/igdl',
+           queryParameters: {'url': cleanUrl}, // FIX CRITIQUE : Encodage parfait de l'URL !
+           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
+         );
+         if (res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
+            return res.data['data'][0]['url'];
+         }
+      } catch (_) {}
+
+      // Serveur 2 : RyzenDesu (Extrêmement rapide)
+      try {
+         final res = await Dio().get(
+           'https://api.ryzendesu.vip/api/downloader/igdl',
+           queryParameters: {'url': cleanUrl}, // FIX CRITIQUE
+           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
+         );
+         if (res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
+            return res.data['data'][0]['url'];
+         }
+      } catch (_) {}
+      
+      // Serveur 3 : Vreden (Secours)
+      try {
+         final res = await Dio().get(
+           'https://api.vreden.web.id/api/igdownload',
+           queryParameters: {'url': cleanUrl}, // FIX CRITIQUE
+           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
+         );
+         if (res.data != null && res.data['result'] != null && res.data['result'] is List && res.data['result'].isNotEmpty) {
+            return res.data['result'][0]['url'];
+         }
+      } catch (_) {}
+
+      // Serveur 4 : Cobalt (Ultime secours)
       try {
          final res = await Dio().post(
             'https://api.cobalt.tools/',
@@ -1710,30 +1759,8 @@ class MediaExtractor {
          );
          if (res.data != null && res.data['url'] != null) return res.data['url'];
       } catch (_) {}
-
-      // Serveur 2 : Siputzx (Très stable)
-      try {
-         final res = await Dio().get(
-           'https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl',
-           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
-         );
-         if (res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
-            return res.data['data'][0]['url'];
-         }
-      } catch (_) {}
-
-      // Serveur 3 : RyzenDesu
-      try {
-         final res = await Dio().get(
-           'https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl',
-           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
-         );
-         if (res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
-            return res.data['data'][0]['url'];
-         }
-      } catch (_) {}
     }
 
-    return null; // Si absolument tout échoue ou si compte privé
+    return null; // Si absolument tous les serveurs échouent
   }
 }
