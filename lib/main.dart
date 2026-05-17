@@ -1670,7 +1670,7 @@ class _FormDialogState extends State<FormDialog> {
   }
 }
 
-// --- EXTRACTEUR MULTI-SERVEURS BLINDÉ ---
+// --- EXTRACTEUR MULTI-SERVEURS (MODE DIAGNOSTIC) ---
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
     // 0. NETTOYAGE ET NORMALISATION DU LIEN
@@ -1691,6 +1691,10 @@ class MediaExtractor {
       cleanUrl = cleanUrl.substring(0, cleanUrl.length - 1);
     }
 
+    // L'astuce ultime : Remplacer /reel/ par /p/ pour tromper les vieux robots
+    String igApiUrl = cleanUrl.replaceAll('/reel/', '/p/');
+    String debugLog = "";
+
     // 1. MOTEUR TIKTOK (TikWM)
     if (cleanUrl.contains('tiktok')) {
       try {
@@ -1710,57 +1714,56 @@ class MediaExtractor {
     // 2. MOTEUR INSTAGRAM
     if (cleanUrl.contains('instagram')) {
       
-      // Serveur 1 : Siputzx (Très stable)
-      try {
-         final res = await Dio().get(
-           'https://api.siputzx.my.id/api/d/igdl',
-           queryParameters: {'url': cleanUrl}, // FIX CRITIQUE : Encodage parfait de l'URL !
-           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
-         );
-         if (res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
-            return res.data['data'][0]['url'];
-         }
-      } catch (_) {}
-
-      // Serveur 2 : RyzenDesu (Extrêmement rapide)
-      try {
-         final res = await Dio().get(
-           'https://api.ryzendesu.vip/api/downloader/igdl',
-           queryParameters: {'url': cleanUrl}, // FIX CRITIQUE
-           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
-         );
-         if (res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
-            return res.data['data'][0]['url'];
-         }
-      } catch (_) {}
-      
-      // Serveur 3 : Vreden (Secours)
-      try {
-         final res = await Dio().get(
-           'https://api.vreden.web.id/api/igdownload',
-           queryParameters: {'url': cleanUrl}, // FIX CRITIQUE
-           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
-         );
-         if (res.data != null && res.data['result'] != null && res.data['result'] is List && res.data['result'].isNotEmpty) {
-            return res.data['result'][0]['url'];
-         }
-      } catch (_) {}
-
-      // Serveur 4 : Cobalt (Ultime secours)
+      // Serveur 1 : Cobalt Communautaire (ayo.tf)
       try {
          final res = await Dio().post(
-            'https://api.cobalt.tools/',
-            options: Options(
-               headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
-               validateStatus: (_) => true,
-               sendTimeout: const Duration(seconds: 10)
-            ),
-            data: {"url": cleanUrl}
+           'https://cobalt-api.ayo.tf/',
+           options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
+           data: {"url": cleanUrl}
          );
-         if (res.data != null && res.data['url'] != null) return res.data['url'];
-      } catch (_) {}
+         if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
+         debugLog += "[C1:${res.statusCode}] ";
+      } catch (e) { debugLog += "[C1:Err] "; }
+
+      // Serveur 2 : Cobalt Officiel (api.cobalt.tools)
+      try {
+         final res = await Dio().post(
+           'https://api.cobalt.tools/',
+           options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
+           data: {"url": cleanUrl}
+         );
+         if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
+         debugLog += "[C2:${res.statusCode}] ";
+      } catch (e) { debugLog += "[C2:Err] "; }
+
+      // Serveur 3 : Siputzx (Sans le queryParameters de Dio pour éviter le sur-encodage du lien)
+      try {
+         final res = await Dio().get(
+           'https://api.siputzx.my.id/api/d/igdl?url=$igApiUrl',
+           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
+         );
+         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
+            return res.data['data'][0]['url'];
+         }
+         debugLog += "[Sip:${res.statusCode}] ";
+      } catch (e) { debugLog += "[Sip:Err] "; }
+
+      // Serveur 4 : RyzenDesu
+      try {
+         final res = await Dio().get(
+           'https://api.ryzendesu.vip/api/downloader/igdl?url=$igApiUrl',
+           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
+         );
+         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
+            return res.data['data'][0]['url'];
+         }
+         debugLog += "[Ryz:${res.statusCode}] ";
+      } catch (e) { debugLog += "[Ryz:Err] "; }
+
+      // Si on arrive ici, c'est que TOUT a échoué. On déclenche l'erreur avec les codes de diagnostic !
+      throw Exception("Diag IG: $debugLog");
     }
 
-    return null; // Si absolument tous les serveurs échouent
+    return null; // Si aucun réseau ne correspond (ou compte privé inattendu)
   }
 }
