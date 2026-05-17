@@ -18,6 +18,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 import 'package:archive/archive_io.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 import 'video_editor_screen.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();

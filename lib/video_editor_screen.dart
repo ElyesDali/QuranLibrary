@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:video_editor/video_editor.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
-import 'package:ffmpeg_helper/ffmpeg_helper.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
@@ -104,29 +103,14 @@ class _VideoEditorScreenState extends State<VideoEditorScreen> {
       final duration = end - start;
 
       // Commande FFmpeg : Coupe ultra-rapide sans perte de qualité (-c copy)
-      // On utilise FFMpegHelper.runCommand
-      final FFMpegCommand command = FFMpegCommand(
-        inputs: [
-          FFMpegInput(
-            filepath: widget.videoFile.path,
-          )
-        ],
-        args: [
-           CustomArgument(['-y']), // Overwrite output file
-           CustomArgument(['-ss', '${start.inMilliseconds / 1000}']), // Start time
-           CustomArgument(['-t', '${duration.inMilliseconds / 1000}']), // Duration
-           CustomArgument(['-c', 'copy']), // Codec copy
-        ],
-        outputFilepath: targetPath,
-      );
+      final command = "-y -ss ${start.inMilliseconds / 1000} -i '${widget.videoFile.path}' -t ${duration.inMilliseconds / 1000} -c copy '$targetPath'";
 
-      final FFMpegSession session = await FFMpegHelper.instance.runAsync(command);
-      
-      // On attend la fin de l'exécution
-      final sessionState = await session.getSessionState();
-
-      if (sessionState == FFMpegSessionState.completed) {
+      await FFmpegKit.execute(command).then((session) async {
+        final returnCode = await session.getReturnCode();
+        if (ReturnCode.isSuccess(returnCode)) {
+          
           await _clearDraft(); 
+          
           // Succès ! On renvoie le fichier coupé et les métadonnées à main.dart
           if (mounted) {
             Navigator.pop(context, {
@@ -134,10 +118,10 @@ class _VideoEditorScreenState extends State<VideoEditorScreen> {
               'metadata': widget.recitationData
             });
           }
-      } else {
-        throw Exception("Échec de la découpe vidéo. État : $sessionState");
-      }
-
+        } else {
+          throw Exception("Échec de la découpe vidéo.");
+        }
+      });
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
