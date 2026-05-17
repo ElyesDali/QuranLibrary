@@ -6,6 +6,8 @@ import 'package:path/path.dart' as p;
 import 'package:ffmpeg_helper/ffmpeg_helper.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 
 class VideoEditorScreen extends StatefulWidget {
   final File videoFile;
