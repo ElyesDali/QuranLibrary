@@ -98,10 +98,9 @@ class _VideoEditorScreenState extends State<VideoEditorScreen> {
       final targetPath = p.join(dir.path, "export_${DateTime.now().millisecondsSinceEpoch}.mp4");
       
       // On récupère les temps exacts des poignées de rognage
-      final start = _controller.minCrop;
-      final end = _controller.maxCrop;
+      final start = _controller.startTrim; // <-- CORRECTION ICI
+      final end = _controller.endTrim;     // <-- CORRECTION ICI
       final duration = end - start;
-
       // Commande FFmpeg : Coupe ultra-rapide sans perte de qualité (-c copy)
       final command = "-y -ss ${start.inMilliseconds / 1000} -i '${widget.videoFile.path}' -t ${duration.inMilliseconds / 1000} -c copy '$targetPath'";
 
