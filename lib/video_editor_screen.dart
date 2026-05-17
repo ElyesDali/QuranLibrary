@@ -3,8 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:video_editor/video_editor.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
-import 'package:ffmpeg_kit_flutter_min_gpl/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_min_gpl/return_code.dart';
+import 'package:ffmpeg_kit_flutter_min/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_min/return_code.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 

@@ -7,7 +7,7 @@ import Foundation
 
 import audio_service
 import audio_session
-import ffmpeg_kit_flutter_min_gpl
+import ffmpeg_kit_flutter_min
 import file_picker
 import file_selector_macos
 import flutter_media_metadata
