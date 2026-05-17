@@ -381,7 +381,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       
       if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
         final extracted = await MediaExtractor.getDownloadUrl(cleanUrl);
-        if (extracted == null) throw Exception("Tous les serveurs ont rejeté le lien.");
+        if (extracted == null) throw Exception("Impossible de trouver la vidéo (Lien privé ou invalide).");
         downloadUrl = extracted;
       } else {
         yt = YoutubeExplode();
@@ -401,9 +401,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
         options: Options(
           headers: {
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
+            // CRITIQUE : AUCUN REFERER ICI. On laisse Instagram penser qu'on navigue normalement.
           },
           receiveTimeout: const Duration(seconds: 30),
-          followRedirects: true, // Très important pour TikTok
+          followRedirects: true, 
         ),
         onReceiveProgress: (received, total) {
           if (total != -1) {
@@ -479,9 +480,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
           if (mounted) _fetch(); 
       }
 
+      // AFFICHAGE DYNAMIQUE DE L'ERREUR
+      String errorMsg = e.toString();
+      if (errorMsg.contains("Exception:")) {
+         errorMsg = errorMsg.split("Exception:").last.trim();
+      } else {
+         errorMsg = "Échec (${errorMsg.split('\n')[0]})"; 
+      }
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("❌ Erreur de téléchargement : Impossible d'accéder au serveur."), backgroundColor: Colors.red, duration: const Duration(seconds: 4))
+          SnackBar(content: Text("❌ $errorMsg"), backgroundColor: Colors.red, duration: const Duration(seconds: 6))
         );
       }
     } finally {
@@ -1664,14 +1673,19 @@ class _FormDialogState extends State<FormDialog> {
 // --- EXTRACTEUR MULTI-SERVEURS BLINDÉ ---
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
-    
-    // --- 1. MOTEUR TIKTOK (TikWM - 100% Fiable) ---
-    if (targetUrl.contains('tiktok')) {
+    // 0. NETTOYAGE CRITIQUE DU LIEN (Enlève les traceurs IG)
+    String cleanUrl = targetUrl;
+    if (cleanUrl.contains('?')) {
+      cleanUrl = cleanUrl.split('?').first;
+    }
+
+    // 1. MOTEUR TIKTOK (TikWM)
+    if (cleanUrl.contains('tiktok')) {
       try {
         final res = await Dio().post(
           'https://www.tikwm.com/api/',
-          data: FormData.fromMap({'url': targetUrl, 'hd': 1}),
-          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
+          data: FormData.fromMap({'url': cleanUrl, 'hd': 1}),
+          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)),
         );
         if (res.data != null && res.data['data'] != null && res.data['data']['play'] != null) {
           String finalUrl = res.data['data']['play'];
@@ -1681,54 +1695,45 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // --- 2. MOTEUR INSTAGRAM (API Bots WhatsApp - Ultra Résilients) ---
-    if (targetUrl.contains('instagram')) {
-      
-      // Serveur 1 : RyzenDesu (Mis à jour quotidiennement)
+    // 2. MOTEUR INSTAGRAM (Cobalt + API de secours indonésiennes)
+    if (cleanUrl.contains('instagram')) {
+      // Serveur 1 : Cobalt Officiel 
       try {
-        final res = await Dio().get(
-          'https://api.ryzendesu.vip/api/downloader/igdl?url=$targetUrl',
-          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
-        );
-        if (res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) {
-          return res.data['data'][0]['url']; // Lien MP4
-        }
+         final res = await Dio().post(
+            'https://api.cobalt.tools/',
+            options: Options(
+               headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
+               validateStatus: (_) => true,
+               sendTimeout: const Duration(seconds: 10)
+            ),
+            data: {"url": cleanUrl}
+         );
+         if (res.data != null && res.data['url'] != null) return res.data['url'];
       } catch (_) {}
 
-      // Serveur 2 : Widipe API (Serveur miroir très rapide)
+      // Serveur 2 : Siputzx (Très stable)
       try {
-        final res = await Dio().get(
-          'https://widipe.com/download/igdl?url=$targetUrl',
-          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
-        );
-        if (res.data != null && res.data['result'] != null && res.data['result'].isNotEmpty) {
-          return res.data['result'][0]['url']; // Lien MP4
-        }
+         final res = await Dio().get(
+           'https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl',
+           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
+         );
+         if (res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
+            return res.data['data'][0]['url'];
+         }
       } catch (_) {}
 
-      // Serveur 3 : SSSGram (Avec le masque complet d'un navigateur Mac)
+      // Serveur 3 : RyzenDesu
       try {
-        final res = await Dio().get(
-          'https://api.sssgram.com/st-ins/ver1/info?url=$targetUrl',
-          options: Options(
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-              'Origin': 'https://www.sssgram.com',
-              'Referer': 'https://www.sssgram.com/'
-            },
-            validateStatus: (_) => true, 
-            sendTimeout: const Duration(seconds: 10)
-          ),
-        );
-        if (res.data != null && res.data['result'] != null && res.data['result']['videoList'] != null) {
-          List videos = res.data['result']['videoList'];
-          if (videos.isNotEmpty && videos[0]['videoUrl'] != null) {
-            return videos[0]['videoUrl']; 
-          }
-        }
+         final res = await Dio().get(
+           'https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl',
+           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
+         );
+         if (res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
+            return res.data['data'][0]['url'];
+         }
       } catch (_) {}
     }
 
-    return null; // Si absolument tous les serveurs échouent
+    return null; // Si absolument tout échoue ou si compte privé
   }
 }
