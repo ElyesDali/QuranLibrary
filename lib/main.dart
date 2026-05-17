@@ -17,6 +17,7 @@ import 'package:dio/dio.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:archive/archive_io.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
+import 'video_editor_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1102,6 +1103,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
           ),
           
           ListTile(
+              leading: const Icon(Icons.movie_edit, color: Color(0xFF7EB8C9)),
+              title: const Text("Éditeur Vidéo", style: TextStyle(color: Colors.white)),
+              onTap: () {
+                Navigator.pop(context); // Ferme le menu latéral
+                _showVideoEditorMenu(); // Ouvre ton nouveau menu d'édition
+              },
+            ),
+
+          const Divider(color: Colors.white24),
+
+          ListTile(
             leading: const Icon(Icons.language, color: Color(0xFF7EB8C9)),
             title: const Text("Navigateur YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
             onTap: () {
@@ -1280,8 +1292,179 @@ class _LibraryScreenState extends State<LibraryScreen> {
         db: _db, 
         initialUrl: initialUrl,
         onDownload: (id, url, file) => _startDownload(id, url, file),
+        onEdit: _launchEditorAndSave, // NOUVEAU : On connecte l'éditeur au formulaire !
       )
     );
+  }
+
+  // --- LANCEUR ET SAUVEGARDE DE L'ÉDITEUR ---
+  Future<void> _launchEditorAndSave(File videoFile, Map<String, dynamic> metadata) async {
+    final result = await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => VideoEditorScreen(videoFile: videoFile, recitationData: metadata),
+      ),
+    );
+
+    // Si on a un retour, c'est que FFmpeg a réussi son export !
+    if (result != null && result is Map) {
+      File editedFile = result['file'];
+      Map<String, dynamic> meta = result['metadata'];
+
+      final dir = await getApplicationDocumentsDirectory();
+      
+      if (meta.containsKey('id') && meta['id'] != null) {
+        // CAS 1 : MODIFICATION (On écrase l'originale avec la version coupée)
+        int id = meta['id'];
+        String originalFileName = meta['fichier'] ?? "yt_$id.mp4"; 
+        File finalDest = File(p.join(dir.path, originalFileName));
+        
+        if (await finalDest.exists()) await finalDest.delete();
+        await editedFile.copy(finalDest.path);
+        
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Récitation modifiée avec succès !"), backgroundColor: Colors.green));
+      } else {
+        // CAS 2 : NOUVELLE VIDÉO (On crée une nouvelle entrée BDD)
+        String newFileName = "local_${DateTime.now().millisecondsSinceEpoch}.mp4";
+        File finalDest = File(p.join(dir.path, newFileName));
+        await editedFile.copy(finalDest.path);
+        
+        meta['fichier'] = newFileName;
+        await _db?.insert('recitations', meta);
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Nouvelle vidéo enregistrée et rognée !"), backgroundColor: Colors.green));
+      }
+      
+      _fetch(); // Met à jour la liste à l'écran
+      _updateFullPlaylist();
+
+      // Nettoyage des fichiers temporaires pour libérer l'iPhone
+      if (await editedFile.exists()) await editedFile.delete();
+      if (meta.containsKey('id')) {
+        final tempEdit = File(p.join(dir.path, "temp_edit_${meta['id']}.mp4"));
+        if (await tempEdit.exists()) await tempEdit.delete();
+      }
+    }
+  }
+
+  // --- NOUVEAU MENU : ÉDITEUR VIDÉO ---
+  Future<void> _showVideoEditorMenu() async {
+    final prefs = await SharedPreferences.getInstance();
+    final hasDraft = prefs.getString('draft_video_path') != null;
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF111111),
+      builder: (sheetContext) => Wrap(
+        children: [
+          if (hasDraft)
+            ListTile(
+              leading: const Icon(Icons.restore, color: Colors.orange),
+              title: const Text("Reprendre le brouillon en cours"),
+              onTap: () async {
+                Navigator.pop(sheetContext);
+                final draftPath = prefs.getString('draft_video_path');
+                final draftMetaStr = prefs.getString('draft_metadata');
+                if (draftPath != null && File(draftPath).existsSync()) {
+                    Map<String, dynamic> meta = draftMetaStr != null ? jsonDecode(draftMetaStr) : {};
+                    _launchEditorAndSave(File(draftPath), meta);
+                } else {
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Brouillon introuvable.")));
+                }
+           },
+            ),
+          ListTile(
+            leading: const Icon(Icons.video_file, color: Color(0xFF7EB8C9)),
+            title: const Text("Importer une nouvelle vidéo"),
+            onTap: () {
+             Navigator.pop(sheetContext);
+             _showForm(); // Réutilise ton formulaire existant !
+           },
+          ),
+          ListTile(
+            leading: const Icon(Icons.edit, color: Colors.green),
+            title: const Text("Modifier une récitation existante"),
+            onTap: () {
+              Navigator.pop(sheetContext);
+              _showRecitationPickerForEditor();
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  // --- SÉLECTEUR DE RÉCITATIONS POUR L'ÉDITEUR ---
+  void _showRecitationPickerForEditor() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF111111),
+      isScrollControlled: true,
+      builder: (ctx) => FractionallySizedBox(
+        heightFactor: 0.8, // Prend 80% de l'écran pour bien voir la liste
+        child: Column(
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16.0),
+              child: Text("Choisir la récitation à modifier", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+            ),
+            Expanded(
+              child: ListView.builder(
+                itemCount: allRecitations.length,
+                itemBuilder: (context, index) {
+                  final rec = allRecitations[index];
+                  String path = rec['fichier'] ?? "";
+                  // On filtre pour ne garder que ce qui est potentiellement une vidéo
+                  if (!path.endsWith('.mp4') && !path.contains('yt_')) return const SizedBox.shrink();
+                  
+                  return ListTile(
+                    leading: const Icon(Icons.movie, color: Colors.grey),
+                    title: Text("${rec['sourate_num']} - ${rec['sourate_name']}", style: const TextStyle(color: Colors.white)),
+                    subtitle: Text(rec['duration'] ?? "", style: const TextStyle(color: Colors.grey)),
+                    onTap: () async {
+                      Navigator.pop(ctx);
+                      _prepareExistingVideoForEditor(rec);
+                    },
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // --- CRÉATION DE LA COPIE DE TRAVAIL NON-DESTRUCTIVE ---
+  Future<void> _prepareExistingVideoForEditor(Map<String, dynamic> rec) async {
+    _showLoading("Préparation de la copie de travail...");
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      File originalFile;
+      
+      // On localise le fichier source
+      String path = rec['fichier'] ?? "";
+      if (path.contains('youtube.com') || path.contains('instagram') || path.contains('tiktok')) {
+        originalFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
+      } else {
+        originalFile = File(p.join(dir.path, path));
+      }
+
+      if (!await originalFile.exists()) throw Exception("Le fichier vidéo original est introuvable.");
+
+      // On crée la COPIE (temp_edit_ID.mp4) pour ne pas casser la piste actuelle
+      final tempFile = File(p.join(dir.path, "temp_edit_${rec['id']}.mp4"));
+      if (await tempFile.exists()) await tempFile.delete();
+      await originalFile.copy(tempFile.path);
+
+      if (mounted) Navigator.pop(context); // Ferme le chargement
+
+      // SUCCÈS : On lance l'éditeur avec la copie fraîchement créée
+      _launchEditorAndSave(tempFile, rec);
+
+    } catch (e) {
+      if (mounted) Navigator.pop(context); // Ferme le chargement
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
+    }
   }
 }
 
@@ -1408,9 +1591,10 @@ class FormDialog extends StatefulWidget {
   final VoidCallback onSave;
   final Database? db;
   final String? initialUrl; 
-  final Function(int, String, File)? onDownload; 
+  final Function(int, String, File)? onDownload;
+  final Function(File, Map<String, dynamic>)? onEdit; // <-- LIGNE AJOUTÉE
   
-  const FormDialog({super.key, this.rec, required this.onSave, this.db, this.initialUrl, this.onDownload});
+  const FormDialog({super.key, this.rec, required this.onSave, this.db, this.initialUrl, this.onDownload, this.onEdit});
   
   @override 
   State<FormDialog> createState() => _FormDialogState();
@@ -1572,7 +1756,48 @@ class _FormDialogState extends State<FormDialog> {
         ),
       ),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text("Annuler")),
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text("Annuler", style: TextStyle(color: Colors.grey))),
+        
+        // Le bouton s'affiche UNIQUEMENT si on vient de choisir un fichier vidéo local
+        if (_sourceType == "local" && _file.text.isNotEmpty && (_file.text.endsWith('.mp4') || _file.text.endsWith('.mov')))
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+            onPressed: () async {
+              // 1. On prépare les métadonnées saisies
+              int? inputYear = int.tryParse(_yearInput.text);
+              int? anneeH, anneeG;
+              if (inputYear != null) {
+                if (inputYear > 1500) {
+                  anneeG = inputYear;
+                  anneeH = inputYear - 622 + ((inputYear - 622) ~/ 32);
+                } else {
+                  anneeH = inputYear;
+                  anneeG = inputYear - (inputYear ~/ 33) + 622;
+                }
+              }
+              
+              final meta = {
+                if (widget.rec != null) "id": widget.rec!['id'], // Vital si c'est une modification
+                "sourate_num": selectedNum, 
+                "sourate_name": selectedName,
+                "annee": anneeH, 
+                "annee_g": anneeG, 
+                "fichier": _file.text,
+                "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
+              };
+
+              // 2. On localise la vidéo et on ferme le formulaire
+              final dir = await getApplicationDocumentsDirectory();
+              final videoFile = File(p.join(dir.path, _file.text));
+              
+              if (mounted) Navigator.pop(context);
+              
+              // 3. On lance l'éditeur !
+              widget.onEdit?.call(videoFile, meta);
+            }, 
+            child: const Text("Rogner", style: TextStyle(color: Colors.white))
+          ),
+
         ElevatedButton(
           style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
           onPressed: () async {
