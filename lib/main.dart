@@ -1902,7 +1902,7 @@ class _FormDialogState extends State<FormDialog> {
   }
 }
 
-// --- EXTRACTEUR INSTAGRAM SHADOW ---
+// --- EXTRACTEUR MULTI-SERVEURS BLINDÉ (ARMADA) ---
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
     String cleanUrl = targetUrl.trim();
@@ -1916,38 +1916,55 @@ class MediaExtractor {
     if (cleanUrl.contains('tiktok')) {
       try {
         final res = await Dio().post('https://www.tikwm.com/api/', data: FormData.fromMap({'url': cleanUrl, 'hd': 1}), options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)));
-        if (res.data != null && res.data['data'] != null && res.data['data']['play'] != null) return res.data['data']['play'].toString().startsWith('//') ? 'https:${res.data['data']['play']}' : res.data['data']['play']; 
+        if (res.data != null && res.data['data'] != null && res.data['data']['play'] != null) {
+           String playUrl = res.data['data']['play'].toString();
+           return playUrl.startsWith('//') ? 'https:$playUrl' : playUrl;
+        }
       } catch (_) {}
     }
 
-    // Moteur Instagram
+    // Moteur Instagram : L'Armada Cobalt (Contournement Cloudflare)
     if (cleanUrl.contains('instagram')) {
-      // 1. Cobalt v7 (Nouvelle structure)
-      try {
-         final res = await Dio().post('https://api.cobalt.tools/',
-           options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)),
-           data: {"url": cleanUrl, "vCodec": "h264"}
-         );
-         if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
-      } catch (_) {}
+      
+      // Liste des serveurs miroirs. Si l'un se fait bloquer par Cloudflare, on passe au suivant.
+      final cobaltMirrors = [
+        'https://api.cobalt.tools/', // Officiel
+        'https://cobalt.canarduc.dev/', // Miroir FR
+        'https://co.wuk.sh/api/json', // Instance privée ultra-robuste
+        'https://api.cobalt.zipline.daneeskrip.dev/',
+        'https://cobalt.tcr.gg/',
+        'https://api.cobalt.bgn.tools/'
+      ];
 
-      // 2. Wuk (Instance privée Cobalt)
-      try {
-         final res = await Dio().post('https://co.wuk.sh/api/json',
-           options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)),
-           data: {"url": cleanUrl, "vCodec": "h264"}
-         );
-         if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
-      } catch (_) {}
+      for (String mirror in cobaltMirrors) {
+         try {
+           final res = await Dio().post(
+             mirror.endsWith('json') ? mirror : (mirror.endsWith('/') ? mirror : '$mirror/'), // Gère les formats d'URL
+             options: Options(
+                headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, 
+                validateStatus: (_) => true, 
+                sendTimeout: const Duration(seconds: 8) // On teste vite pour ne pas faire attendre l'utilisateur
+             ),
+             data: {"url": cleanUrl, "vCodec": "h264"}
+           );
+           
+           if (res.statusCode == 200 && res.data != null && res.data['url'] != null) {
+              return res.data['url']; // Succès ! On a percé Cloudflare.
+           }
+         } catch (_) {
+           continue; // Serveur bloqué, on passe au suivant silencieusement
+         }
+      }
 
-      // 3. Winoa (Scraper privé)
+      // Ultime secours (Scraper sans Cobalt)
       try {
-         final res = await Dio().get('https://api.winoa.me/ig/reel?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)));
+         final res = await Dio().get('https://api.winoa.me/ig/reel?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
          if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
       } catch (_) {}
       
-      throw Exception("Toutes les API Proxy ont échoué ou ont été bloquées par Cloudflare.");
+      throw Exception("L'Armada a échoué. Réessayez dans 1 minute (Blocage IP temporaire).");
     }
+
     return null;
   }
 }
