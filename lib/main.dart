@@ -162,10 +162,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _player.setVolume(volume);
     _player.setLoopMode(LoopMode.off); // FIX : On force la boucle native à OFF
 
-    // 1. SURVEILLANCE SIMPLE (Ne coupe plus l'audio !)
-    _player.positionStream.listen((pos) {
-      _lastPos = pos.inMilliseconds;
-      _lastDuration = _player.duration?.inMilliseconds ?? 0;
+    // --- CORRECTIF ANTI-FUITE (BOUCLE) ---
+    _player.positionStream.listen((position) {
+      final duration = _player.duration;
+      // Si la boucle "Repeat 1" est activée et que la durée est connue...
+      if (duration != null && _player.loopMode == LoopMode.one) {
+        // Si on est à moins de 250 millisecondes de la fin de la récitation
+        if (duration.inMilliseconds - position.inMilliseconds < 250) {
+          _player.seek(Duration.zero); // On force le retour à zéro avant le bug d'Apple !
+        }
+      }
     });
 
     // 2. FIX : GESTION DU TOUT DERNIER FICHIER DE LA PLAYLIST
@@ -1896,100 +1902,52 @@ class _FormDialogState extends State<FormDialog> {
   }
 }
 
-// --- EXTRACTEUR MULTI-SERVEURS (MODE DIAGNOSTIC) ---
+// --- EXTRACTEUR INSTAGRAM SHADOW ---
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
-    // 0. NETTOYAGE ET NORMALISATION DU LIEN
     String cleanUrl = targetUrl.trim();
-    
-    // Correction de la majuscule éventuelle sur "Https"
     if (cleanUrl.toLowerCase().startsWith('http')) {
       cleanUrl = cleanUrl.replaceFirst(RegExp(r'^https?', caseSensitive: false), 'https');
     }
+    if (cleanUrl.contains('?')) cleanUrl = cleanUrl.split('?').first;
+    if (cleanUrl.endsWith('/')) cleanUrl = cleanUrl.substring(0, cleanUrl.length - 1);
 
-    // Suppression des traceurs Instagram (?igsh=)
-    if (cleanUrl.contains('?')) {
-      cleanUrl = cleanUrl.split('?').first;
-    }
-    
-    // Suppression du slash final éventuel qui fait parfois bugger les API
-    if (cleanUrl.endsWith('/')) {
-      cleanUrl = cleanUrl.substring(0, cleanUrl.length - 1);
-    }
-
-    // L'astuce ultime : Remplacer /reel/ par /p/ pour tromper les vieux robots
-    String igApiUrl = cleanUrl.replaceAll('/reel/', '/p/');
-    String debugLog = "";
-
-    // 1. MOTEUR TIKTOK (TikWM)
+    // Moteur TikTok
     if (cleanUrl.contains('tiktok')) {
       try {
-        final res = await Dio().post(
-          'https://www.tikwm.com/api/',
-          data: FormData.fromMap({'url': cleanUrl, 'hd': 1}),
-          options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)),
-        );
-        if (res.data != null && res.data['data'] != null && res.data['data']['play'] != null) {
-          String finalUrl = res.data['data']['play'];
-          if (finalUrl.startsWith('//')) finalUrl = 'https:$finalUrl';
-          return finalUrl; 
-        }
+        final res = await Dio().post('https://www.tikwm.com/api/', data: FormData.fromMap({'url': cleanUrl, 'hd': 1}), options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)));
+        if (res.data != null && res.data['data'] != null && res.data['data']['play'] != null) return res.data['data']['play'].toString().startsWith('//') ? 'https:${res.data['data']['play']}' : res.data['data']['play']; 
       } catch (_) {}
     }
 
-    // 2. MOTEUR INSTAGRAM
+    // Moteur Instagram
     if (cleanUrl.contains('instagram')) {
+      // 1. Cobalt v7 (Nouvelle structure)
+      try {
+         final res = await Dio().post('https://api.cobalt.tools/',
+           options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)),
+           data: {"url": cleanUrl, "vCodec": "h264"}
+         );
+         if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
+      } catch (_) {}
+
+      // 2. Wuk (Instance privée Cobalt)
+      try {
+         final res = await Dio().post('https://co.wuk.sh/api/json',
+           options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)),
+           data: {"url": cleanUrl, "vCodec": "h264"}
+         );
+         if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
+      } catch (_) {}
+
+      // 3. Winoa (Scraper privé)
+      try {
+         final res = await Dio().get('https://api.winoa.me/ig/reel?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)));
+         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
+      } catch (_) {}
       
-      // Serveur 1 : Cobalt Communautaire (ayo.tf)
-      try {
-         final res = await Dio().post(
-           'https://cobalt-api.ayo.tf/',
-           options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
-           data: {"url": cleanUrl}
-         );
-         if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
-         debugLog += "[C1:${res.statusCode}] ";
-      } catch (e) { debugLog += "[C1:Err] "; }
-
-      // Serveur 2 : Cobalt Officiel (api.cobalt.tools)
-      try {
-         final res = await Dio().post(
-           'https://api.cobalt.tools/',
-           options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
-           data: {"url": cleanUrl}
-         );
-         if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
-         debugLog += "[C2:${res.statusCode}] ";
-      } catch (e) { debugLog += "[C2:Err] "; }
-
-      // Serveur 3 : Siputzx (Sans le queryParameters de Dio pour éviter le sur-encodage du lien)
-      try {
-         final res = await Dio().get(
-           'https://api.siputzx.my.id/api/d/igdl?url=$igApiUrl',
-           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
-         );
-         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
-            return res.data['data'][0]['url'];
-         }
-         debugLog += "[Sip:${res.statusCode}] ";
-      } catch (e) { debugLog += "[Sip:Err] "; }
-
-      // Serveur 4 : RyzenDesu
-      try {
-         final res = await Dio().get(
-           'https://api.ryzendesu.vip/api/downloader/igdl?url=$igApiUrl',
-           options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10))
-         );
-         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'] is List && res.data['data'].isNotEmpty) {
-            return res.data['data'][0]['url'];
-         }
-         debugLog += "[Ryz:${res.statusCode}] ";
-      } catch (e) { debugLog += "[Ryz:Err] "; }
-
-      // Si on arrive ici, c'est que TOUT a échoué. On déclenche l'erreur avec les codes de diagnostic !
-      throw Exception("Diag IG: $debugLog");
+      throw Exception("Toutes les API Proxy ont échoué ou ont été bloquées par Cloudflare.");
     }
-
-    return null; // Si aucun réseau ne correspond (ou compte privé inattendu)
+    return null;
   }
 }
