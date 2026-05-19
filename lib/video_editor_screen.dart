@@ -30,12 +30,12 @@ class _VideoEditorScreenState extends State<VideoEditorScreen> {
   @override
   void initState() {
     super.initState();
-    // BUG FIX : Plus de maxDuration ! C'est ce qui faisait glitcher le curseur et crasher les longues vidéos.
     _controller = VideoEditorController.file(
       widget.videoFile,
       minDuration: const Duration(seconds: 1),
+      maxThumbnailQuality: 10, // <-- AJOUTE CETTE LIGNE ICI POUR SAUVER LA RAM
       trimStyle: TrimSliderStyle(
-        positionLineColor: Colors.red, // Barre de lecture en rouge pour la précision
+        positionLineColor: Colors.red,
         positionLineWidth: 3,
         lineColor: Colors.grey.withOpacity(0.5),
         onTrimmingColor: const Color(0xFF7EB8C9),

@@ -134,6 +134,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   List<dynamic> allRecitations = [];
   List<dynamic> displayedRecitations = [];
   final AudioPlayer _player = AudioPlayer();
+  StreamSubscription? _positionSubscription; // NOUVEAU : Le garde-fou de la mémoire
   Map<String, dynamic>? currentRecitation;
   
   double volume = 0.8;
@@ -162,14 +163,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _player.setVolume(volume);
     _player.setLoopMode(LoopMode.off); // FIX : On force la boucle native à OFF
 
-    // --- CORRECTIF ANTI-FUITE (BOUCLE) ---
-    _player.positionStream.listen((position) {
+    // --- CORRECTIF ANTI-FUITE (BOUCLE) AVEC GESTION DE MÉMOIRE ---
+    _positionSubscription?.cancel(); // On détruit l'ancien s'il existe !
+    _positionSubscription = _player.positionStream.listen((position) {
       final duration = _player.duration;
-      // Si la boucle "Repeat 1" est activée et que la durée est connue...
       if (duration != null && _player.loopMode == LoopMode.one) {
-        // Si on est à moins de 250 millisecondes de la fin de la récitation
         if (duration.inMilliseconds - position.inMilliseconds < 250) {
-          _player.seek(Duration.zero); // On force le retour à zéro avant le bug d'Apple !
+          _player.seek(Duration.zero);
         }
       }
     });
@@ -219,6 +219,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
     });
   }
+  
+  @override
+  void dispose() {
+    _positionSubscription?.cancel(); // Tue l'écouteur de boucle
+    _sleepTimer?.cancel();
+    _countdownTimer?.cancel();
+    _player.dispose(); // Tue le lecteur audio
+    super.dispose();
+  }
+
+  Future<void> _initApp() async {
 
   Future<void> _initApp() async {
     final dir = await getApplicationDocumentsDirectory();
@@ -327,7 +338,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
 
     if (sources.isNotEmpty) {
-      // FIX : Mémoriser la lecture en cours pour ne pas repartir à zéro !
+      // 1. On récupère la dernière piste écoutée dans la mémoire du téléphone
+      final prefs = await SharedPreferences.getInstance();
+      int lastId = prefs.getInt('last_played_id') ?? -1;
+
+      int initialIndex = 0;
+      if (lastId != -1) {
+        initialIndex = displayedRecitations.indexWhere((r) => r['id'] == lastId);
+        if (initialIndex == -1) initialIndex = 0;
+      }
+
       int? savedIndex = _playingIndex;
       Duration savedPos = _player.position;
       bool wasPlaying = _player.playing;
@@ -335,11 +355,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
       final newPlaylist = ConcatenatingAudioSource(children: sources);
 
       if (savedIndex != null && savedIndex < sources.length) {
-        // On insère la nouvelle playlist mais on force le lecteur à rester sur la piste actuelle
+        // L'appli tournait déjà, on ne perturbe pas la lecture
         await _player.setAudioSource(newPlaylist, initialIndex: savedIndex, initialPosition: savedPos);
         if (wasPlaying) _player.play();
       } else {
-        await _player.setAudioSource(newPlaylist);
+        // Démarrage de l'appli : on charge la dernière piste mémorisée (en pause)
+        await _player.setAudioSource(newPlaylist, initialIndex: initialIndex);
+        if (initialIndex < displayedRecitations.length) {
+           setState(() {
+             currentRecitation = displayedRecitations[initialIndex];
+             _playingIndex = initialIndex;
+           });
+        }
       }
     }
   }
@@ -508,8 +535,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _play(Map<String, dynamic> rec) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('last_played_id', rec['id']); // <-- AJOUTE CETTE LIGNE
+
     int index = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
-    
+
     if (index != -1) {
       _isSwitchingTrack = true;
       
@@ -1923,46 +1953,34 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // Moteur Instagram : L'Armada Cobalt (Contournement Cloudflare)
+    // Moteur Instagram : Scrapers privés ultra-furtifs
     if (cleanUrl.contains('instagram')) {
       
-      // Liste des serveurs miroirs. Si l'un se fait bloquer par Cloudflare, on passe au suivant.
-      final cobaltMirrors = [
-        'https://api.cobalt.tools/', // Officiel
-        'https://cobalt.canarduc.dev/', // Miroir FR
-        'https://co.wuk.sh/api/json', // Instance privée ultra-robuste
-        'https://api.cobalt.zipline.daneeskrip.dev/',
-        'https://cobalt.tcr.gg/',
-        'https://api.cobalt.bgn.tools/'
-      ];
-
-      for (String mirror in cobaltMirrors) {
-         try {
-           final res = await Dio().post(
-             mirror.endsWith('json') ? mirror : (mirror.endsWith('/') ? mirror : '$mirror/'), // Gère les formats d'URL
-             options: Options(
-                headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, 
-                validateStatus: (_) => true, 
-                sendTimeout: const Duration(seconds: 8) // On teste vite pour ne pas faire attendre l'utilisateur
-             ),
-             data: {"url": cleanUrl, "vCodec": "h264"}
-           );
-           
-           if (res.statusCode == 200 && res.data != null && res.data['url'] != null) {
-              return res.data['url']; // Succès ! On a percé Cloudflare.
-           }
-         } catch (_) {
-           continue; // Serveur bloqué, on passe au suivant silencieusement
-         }
-      }
-
-      // Ultime secours (Scraper sans Cobalt)
+      // Serveur 1 : BK9 (Très stable)
       try {
-         final res = await Dio().get('https://api.winoa.me/ig/reel?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
+         final res = await Dio().get('https://bk9.fun/download/instagram?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.statusCode == 200 && res.data != null && res.data['BK9'] != null && res.data['BK9'].isNotEmpty) {
+           return res.data['BK9'][0]['url'];
+         }
+      } catch (_) {}
+
+      // Serveur 2 : Nyxs (Backup performant)
+      try {
+         final res = await Dio().get('https://api.nyxs.pw/dl/ig?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.statusCode == 200 && res.data != null && res.data['result'] != null && res.data['result'].isNotEmpty) {
+           return res.data['result'][0]['url'];
+         }
       } catch (_) {}
       
-      throw Exception("L'Armada a échoué. Réessayez dans 1 minute (Blocage IP temporaire).");
+      // Serveur 3 : VkrDownloader (Secours ultime)
+      try {
+         final res = await Dio().get('https://api.vkrdownloader.co/api?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data']['downloads'] != null && res.data['data']['downloads'].isNotEmpty) {
+           return res.data['data']['downloads'][0]['url'];
+         }
+      } catch (_) {}
+      
+      throw Exception("Toutes les API Instagram sont temporairement bloquées. Réessayez plus tard.");
     }
 
     return null;
