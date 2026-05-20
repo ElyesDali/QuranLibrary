@@ -276,6 +276,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen> {
                                 horizontalMargin: 10,
                                 child: TrimTimeline(
                                   controller: _controller,
+                                  quantity : 8,
                                   padding: const EdgeInsets.only(top: 10),
                                   textStyle: const TextStyle(color: Colors.grey, fontSize: 10),
                                 ),

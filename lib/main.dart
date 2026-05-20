@@ -163,57 +163,32 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _player.setVolume(volume);
     _player.setLoopMode(LoopMode.off); 
 
+    // 1. LE GARDE-FOU INTELLIGENT (Gère l'arrêt et la boucle sans bloquer AirPlay)
     _positionSubscription?.cancel(); 
     _positionSubscription = _player.positionStream.listen((position) {
       final duration = _player.duration;
-      if (duration != null && _player.loopMode == LoopMode.one) {
+      if (duration != null && position.inMilliseconds > 0) {
+        // Si on est à 250ms de la fin de la piste...
         if (duration.inMilliseconds - position.inMilliseconds < 250) {
-          _player.seek(Duration.zero);
+          if (loopMode == LoopModeState.one) {
+            _player.seek(Duration.zero); // On boucle
+          } else if (loopMode == LoopModeState.off) {
+            _player.pause(); // On s'arrête naturellement
+            _player.seek(Duration.zero);
+          }
         }
       }
     });
 
-    _player.playerStateStream.listen((state) async {
-      if (state.processingState == ProcessingState.completed) {
-        if (loopMode == LoopModeState.off) {
-          await _player.pause();
-          await _player.seek(Duration.zero, index: _playingIndex); 
-        } else if (loopMode == LoopModeState.one) {
-          await _player.pause();
-          await Future.delayed(const Duration(milliseconds: 200)); 
-          await _player.seek(Duration.zero, index: _playingIndex);
-          _player.play();
-        }
-      }
-    });
-
-    _player.currentIndexStream.listen((index) async {
-      if (index == null || _isSwitchingTrack) return;
-      
-      if (_playingIndex != null && index == _playingIndex! + 1) {
-         if (loopMode == LoopModeState.off) {
-            _isSwitchingTrack = true;
-            await _player.pause();
-            await _player.seek(Duration.zero, index: _playingIndex); 
-            _isSwitchingTrack = false;
-            return; 
-         } else if (loopMode == LoopModeState.one) {
-            _isSwitchingTrack = true;
-            await _player.pause();
-            await Future.delayed(const Duration(milliseconds: 200)); 
-            await _player.seek(Duration.zero, index: _playingIndex); 
-            _player.play();
-            _isSwitchingTrack = false;
-            return; 
-         }
-      }
-      
+    // 2. MISE À JOUR DE L'UI (Laisse AirPlay travailler tranquillement)
+    _player.currentIndexStream.listen((index) {
+      if (index == null) return;
       _playingIndex = index;
       if (index < displayedRecitations.length) {
-         setState(() => currentRecitation = displayedRecitations[index]);
+         if (mounted) setState(() => currentRecitation = displayedRecitations[index]);
       }
     });
-  } // <-- L'accolade manquante est bien là !
+  }
 
   @override
   void dispose() {
@@ -1404,7 +1379,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
             ),
           ListTile(
             leading: const Icon(Icons.video_file, color: Color(0xFF7EB8C9)),
-            title: const Text("Importer une nouvelle vidéo"),
+            title: const Text("Importer une nouvelle récitation"),
             onTap: () {
              Navigator.pop(sheetContext);
              _showForm(); // Réutilise ton formulaire existant !
@@ -1946,34 +1921,43 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // Moteur Instagram : Scrapers privés ultra-furtifs
+    // Moteur Instagram : Scrapers Asiatiques (Contournement Cloudflare)
     if (cleanUrl.contains('instagram')) {
       
-      // Serveur 1 : BK9 (Très stable)
+      // 1. Cobalt API (Format v7 récent)
       try {
-         final res = await Dio().get('https://bk9.fun/download/instagram?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data != null && res.data['BK9'] != null && res.data['BK9'].isNotEmpty) {
-           return res.data['BK9'][0]['url'];
-         }
+         final res = await Dio().post('https://api.cobalt.tools/',
+           options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
+           data: {"url": cleanUrl}
+         );
+         if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
       } catch (_) {}
 
-      // Serveur 2 : Nyxs (Backup performant)
+      // 2. Siputzx (API Indonésienne très fiable)
       try {
-         final res = await Dio().get('https://api.nyxs.pw/dl/ig?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data != null && res.data['result'] != null && res.data['result'].isNotEmpty) {
-           return res.data['result'][0]['url'];
-         }
+         final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
       } catch (_) {}
-      
-      // Serveur 3 : VkrDownloader (Secours ultime)
+
+      // 3. Ryzendesu (Serveur VIP gratuit)
       try {
-         final res = await Dio().get('https://api.vkrdownloader.co/api?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data']['downloads'] != null && res.data['data']['downloads'].isNotEmpty) {
-           return res.data['data']['downloads'][0]['url'];
-         }
+         final res = await Dio().get('https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
       } catch (_) {}
-      
-      throw Exception("Toutes les API Instagram sont temporairement bloquées. Réessayez plus tard.");
+
+      // 4. AEMT Serveur
+      try {
+         final res = await Dio().get('https://aemt.me/download/igdl?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.statusCode == 200 && res.data != null && res.data['result'] != null && res.data['result'].isNotEmpty) return res.data['result'][0]['url'];
+      } catch (_) {}
+
+      // 5. BK9 Serveur de secours
+      try {
+         final res = await Dio().get('https://bk9.fun/download/instagram?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.statusCode == 200 && res.data != null && res.data['BK9'] != null && res.data['BK9'].isNotEmpty) return res.data['BK9'][0]['url'];
+      } catch (_) {}
+
+      throw Exception("Toutes les API Instagram sont bloquées actuellement. Veuillez réessayer plus tard.");
     }
 
     return null;
