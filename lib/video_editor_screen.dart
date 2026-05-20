@@ -33,7 +33,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen> {
     _controller = VideoEditorController.file(
       widget.videoFile,
       minDuration: const Duration(seconds: 1),
-      maxThumbnailQuality: 10, // <-- AJOUTE CETTE LIGNE ICI POUR SAUVER LA RAM
       trimStyle: TrimSliderStyle(
         positionLineColor: Colors.red,
         positionLineWidth: 3,

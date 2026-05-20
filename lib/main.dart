@@ -161,10 +161,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
     super.initState();
     _initApp();
     _player.setVolume(volume);
-    _player.setLoopMode(LoopMode.off); // FIX : On force la boucle native à OFF
+    _player.setLoopMode(LoopMode.off); 
 
-    // --- CORRECTIF ANTI-FUITE (BOUCLE) AVEC GESTION DE MÉMOIRE ---
-    _positionSubscription?.cancel(); // On détruit l'ancien s'il existe !
+    _positionSubscription?.cancel(); 
     _positionSubscription = _player.positionStream.listen((position) {
       final duration = _player.duration;
       if (duration != null && _player.loopMode == LoopMode.one) {
@@ -174,51 +173,58 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
     });
 
-    // 2. FIX : GESTION DU TOUT DERNIER FICHIER DE LA PLAYLIST
     _player.playerStateStream.listen((state) async {
       if (state.processingState == ProcessingState.completed) {
         if (loopMode == LoopModeState.off) {
           await _player.pause();
-          await _player.seek(Duration.zero, index: _playingIndex); // Reste sur la piste à 0
+          await _player.seek(Duration.zero, index: _playingIndex); 
         } else if (loopMode == LoopModeState.one) {
           await _player.pause();
-          await Future.delayed(const Duration(milliseconds: 200)); // Délai doux
+          await Future.delayed(const Duration(milliseconds: 200)); 
           await _player.seek(Duration.zero, index: _playingIndex);
           _player.play();
         }
       }
     });
 
-    // 3. FIX : GESTION DES SAUTS (La piste actuelle se termine)
     _player.currentIndexStream.listen((index) async {
       if (index == null || _isSwitchingTrack) return;
       
-      // Si l'audio a naturellement basculé sur la piste suivante
       if (_playingIndex != null && index == _playingIndex! + 1) {
          if (loopMode == LoopModeState.off) {
             _isSwitchingTrack = true;
             await _player.pause();
-            await _player.seek(Duration.zero, index: _playingIndex); // REVIENT A 0 SUR L'ACTUELLE
+            await _player.seek(Duration.zero, index: _playingIndex); 
             _isSwitchingTrack = false;
             return; 
          } else if (loopMode == LoopModeState.one) {
             _isSwitchingTrack = true;
             await _player.pause();
-            await Future.delayed(const Duration(milliseconds: 200)); // DELAI DE 200ms AVANT BOUCLE
-            await _player.seek(Duration.zero, index: _playingIndex); // REVIENT A 0 SUR L'ACTUELLE
+            await Future.delayed(const Duration(milliseconds: 200)); 
+            await _player.seek(Duration.zero, index: _playingIndex); 
             _player.play();
             _isSwitchingTrack = false;
             return; 
          }
       }
       
-      // Sinon (Lecture automatique classique, ou bouton manuel pressé)
       _playingIndex = index;
       if (index < displayedRecitations.length) {
          setState(() => currentRecitation = displayedRecitations[index]);
       }
     });
+  } // <--- C'EST CETTE ACCOLADE QUE TU AVAIS SÛREMENT EFFACÉE !
+
+  @override
+  void dispose() {
+    _positionSubscription?.cancel();
+    _sleepTimer?.cancel();
+    _countdownTimer?.cancel();
+    _player.dispose();
+    super.dispose();
   }
+
+  Future<void> _initApp() async {
   
   @override
   void dispose() {
