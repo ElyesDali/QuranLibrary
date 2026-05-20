@@ -213,7 +213,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
          setState(() => currentRecitation = displayedRecitations[index]);
       }
     });
-  } // <--- C'EST CETTE ACCOLADE QUE TU AVAIS SÛREMENT EFFACÉE !
+  } // <-- L'accolade manquante est bien là !
 
   @override
   void dispose() {
@@ -222,20 +222,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _countdownTimer?.cancel();
     _player.dispose();
     super.dispose();
-  }
-
-  Future<void> _initApp() async {
-  
-  @override
-  void dispose() {
-    _positionSubscription?.cancel(); // Tue l'écouteur de boucle
-    _sleepTimer?.cancel();
-    _countdownTimer?.cancel();
-    _player.dispose(); // Tue le lecteur audio
-    super.dispose();
-  }
-
-  Future<void> _initApp() async {
+  } // <-- Celle-ci aussi !
 
   Future<void> _initApp() async {
     final dir = await getApplicationDocumentsDirectory();
