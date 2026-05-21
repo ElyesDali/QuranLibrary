@@ -19,6 +19,7 @@ import 'package:archive/archive_io.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 import 'video_editor_screen.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1379,7 +1380,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   // --- LANCEUR ET SAUVEGARDE DE L'ÉDITEUR ---
   Future<void> _launchEditorAndSave(File videoFile, Map<String, dynamic> metadata) async {
-    await _player.stop(); // <-- CRITIQUE : Stop complet pour forcer l'iPhone à vider le cache de l'ancienne vidéo
+    await _player.stop(); // CRITIQUE : Stop complet pour forcer l'iPhone à vider le cache de l'ancienne vidéo
     final result = await Navigator.push(
       context,
       MaterialPageRoute(
@@ -1415,11 +1416,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
              await File(p.join(dir.path, newThumb)).writeAsBytes(thumbData);
            }
            
-           // NOUVEAU : On enregistre le NOUVEAU nom de fichier dans la BDD
+           // On enregistre le NOUVEAU nom de fichier dans la BDD
            await _db?.update('recitations', {'fichier': newFileName, 'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
         } catch (_) {}
         
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Récitation modifiée avec succès !"), backgroundColor: Colors.green));
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Récitation modifiée avec succès !"), backgroundColor: Colors.green));
       } else {
         // CAS 2 : NOUVELLE VIDÉO
         String newFileName = "local_${DateTime.now().millisecondsSinceEpoch}.mp4";
@@ -1428,7 +1429,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         
         meta['fichier'] = newFileName;
         await _db?.insert('recitations', meta);
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Nouvelle vidéo enregistrée et rognée !"), backgroundColor: Colors.green));
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Nouvelle vidéo enregistrée et rognée !"), backgroundColor: Colors.green));
       }
       
       // --- INTEGRATION DE LA PURGE DU CACHE AUDIO ---
@@ -1439,17 +1440,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
       await _fetch(); 
       await _updateFullPlaylist();
-
-      if (await editedFile.exists()) await editedFile.delete();
-      if (meta.containsKey('id')) {
-        final tempEdit = File(p.join(dir.path, "temp_edit_${meta['id']}.mp4"));
-        if (await tempEdit.exists()) await tempEdit.delete();
-      }
-    }
-  }
-      
-      _fetch(); 
-      _updateFullPlaylist();
 
       if (await editedFile.exists()) await editedFile.delete();
       if (meta.containsKey('id')) {
