@@ -156,6 +156,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   int? _playingIndex;
   int _lastPos = 0;
   int _lastDuration = 0;
+  int _lastIndex = 0;
 
   @override
   void initState() {
