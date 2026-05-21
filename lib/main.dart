@@ -163,43 +163,37 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _player.setVolume(volume);
     _player.setLoopMode(LoopMode.off); 
 
-    // 1. LE TRACKER DE POSITION (Mémorise en temps réel où on en est)
+    // 1. LE TRACKER DE POSITION INTERCEPTEUR (ZÉRO BLEED AUDIO)
     _positionSubscription?.cancel(); 
-    _positionSubscription = _player.positionStream.listen((pos) {
-      _lastPos = pos.inMilliseconds;
-      _lastDuration = _player.duration?.inMilliseconds ?? 0;
-    });
+    _positionSubscription = _player.positionStream.listen((position) async {
+      final duration = _player.duration;
+      if (duration != null && position.inMilliseconds > 0 && !_isSwitchingTrack) {
+        final remaining = duration.inMilliseconds - position.inMilliseconds;
+        _lastPos = position.inMilliseconds;
+        _lastDuration = duration.inMilliseconds;
 
-    // 2. LE CERVEAU DE LA LECTURE (Gère intelligemment tous les modes)
-    _player.currentIndexStream.listen((index) async {
-      if (index == null || _isSwitchingTrack) return;
-
-      // Si l'index change, on vérifie si la piste précédente s'est terminée "naturellement" (à moins de 1.5s de la fin)
-      if (_playingIndex != null && index != _playingIndex) {
-        bool finishedNaturally = (_lastDuration > 0 && (_lastDuration - _lastPos) < 1500);
-
-        if (finishedNaturally) {
-           if (loopMode == LoopModeState.off) {
-              // MODE OFF : On s'arrête à la fin de la piste actuelle
-              _isSwitchingTrack = true;
-              await _player.pause();
-              await _player.seek(Duration.zero, index: _playingIndex); 
-              _isSwitchingTrack = false;
-              return; // Annule le passage à la suivante
-           } else if (loopMode == LoopModeState.one) {
-              // MODE BOUCLE : On remet au début et on continue
-              _isSwitchingTrack = true;
-              await _player.seek(Duration.zero, index: _playingIndex); 
-              _isSwitchingTrack = false;
-              return; // Annule le passage à la suivante
-           }
-           // MODE AUTOPLAY : On ne fait rien, on le laisse passer à la suivante !
+        // On intercepte 250ms AVANT la fin pour couper net toute transition native
+        if (remaining <= 250) {
+          if (loopMode == LoopModeState.one) {
+            _isSwitchingTrack = true;
+            await _player.seek(Duration.zero, index: _playingIndex); 
+            _isSwitchingTrack = false;
+          } else if (loopMode == LoopModeState.off) {
+            _isSwitchingTrack = true;
+            await _player.pause();
+            await _player.seek(Duration.zero, index: _playingIndex); // Remet l'ACTUELLE à 0:00
+            _isSwitchingTrack = false;
+          }
         }
       }
+    });
 
+    // 2. MISE À JOUR EXCLUSIVE DE L'UI (Laisse les transitions se faire uniquement en mode AutoPlay)
+    _player.currentIndexStream.listen((index) {
+      if (index == null || _isSwitchingTrack) return;
       _playingIndex = index;
-      if (mounted && index < displayedRecitations.length) {
-         setState(() => currentRecitation = displayedRecitations[index]);
+      if (index < displayedRecitations.length) {
+         if (mounted) setState(() => currentRecitation = displayedRecitations[index]);
       }
     });
   }
@@ -1201,7 +1195,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
           ListTile(
             leading: const Icon(Icons.language, color: Color(0xFF7EB8C9)),
-            title: const Text("Navigateur YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
+            title: const Text("Navigateur Intégré (Web)", style: TextStyle(fontWeight: FontWeight.bold)),
             onTap: () {
               Navigator.pop(context); 
               Navigator.push(
@@ -1437,6 +1431,23 @@ class _LibraryScreenState extends State<LibraryScreen> {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Nouvelle vidéo enregistrée et rognée !"), backgroundColor: Colors.green));
       }
       
+      // --- INTEGRATION DE LA PURGE DU CACHE AUDIO ---
+      setState(() {
+        currentRecitation = null;
+        _playingIndex = null;
+      });
+
+      await _fetch(); 
+      await _updateFullPlaylist();
+
+      if (await editedFile.exists()) await editedFile.delete();
+      if (meta.containsKey('id')) {
+        final tempEdit = File(p.join(dir.path, "temp_edit_${meta['id']}.mp4"));
+        if (await tempEdit.exists()) await tempEdit.delete();
+      }
+    }
+  }
+      
       _fetch(); 
       _updateFullPlaylist();
 
@@ -1599,24 +1610,35 @@ class YoutubeBrowserScreen extends StatefulWidget {
 class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
   late final WebViewController _controller;
   String _currentUrl = "";
+  double _startX = 0; // Pour détecter le swipe back précis
 
   @override
   void initState() {
     super.initState();
-    _controller = WebViewController()
+    
+    // CONFIGURATION DES PARAMÈTRES D'AFFICHAGE INLINE POUR IOS (ANTI PLEIN ÉCRAN)
+    late final PlatformWebViewControllerCreationParams params;
+    if (WebViewPlatform.instance is WebKitWebViewPlatform) {
+      params = WebKitWebViewControllerCreationParams(
+        allowsInlineMediaPlayback: true, // Bloque le plein écran automatique d'iOS
+      );
+    } else {
+      params = const PlatformWebViewControllerCreationParams();
+    }
+
+    _controller = WebViewController.fromPlatformCreationParams(params)
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setUserAgent("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1") // Force l'interface web mobile moderne
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageFinished: (String url) {
+            // Script de fluidité pour YouTube Mobile et Shorts
             _controller.runJavaScript("""
               const observer = new MutationObserver(() => {
                 document.querySelectorAll('video').forEach(v => {
                   if (!v.hasAttribute('playsinline')) {
                     v.setAttribute('playsinline', 'true');
                     v.removeAttribute('autoplay');
-                  }
-                  if (v.webkitEnterInlineFullScreen) {
-                    v.webkitExitFullscreen();
                   }
                 });
                 document.querySelectorAll('ytm-inline-preview').forEach(e => e.remove());
@@ -1625,15 +1647,8 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
             """);
           },
           onUrlChange: (UrlChange change) {
-            if (mounted) {
-              setState(() {
-                _currentUrl = change.url ?? "";
-              });
-            }
+            if (mounted) setState(() => _currentUrl = change.url ?? "");
           },
-          onNavigationRequest: (NavigationRequest request) {
-            return NavigationDecision.navigate;
-          }
         ),
       )
       ..loadRequest(Uri.parse('https://m.youtube.com/'));
@@ -1657,7 +1672,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
       onWillPop: _handleBack,
       child: Scaffold(
         appBar: AppBar(
-          title: const Text("YouTube", style: TextStyle(color: Color(0xFF7EB8C9))),
+          title: const Text("Navigateur Intégré", style: TextStyle(color: Color(0xFF7EB8C9))),
           backgroundColor: const Color(0xFF111111),
           leading: IconButton(
             icon: const Icon(Icons.arrow_back),
@@ -1676,7 +1691,23 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
             )
           ],
         ),
-        body: WebViewWidget(controller: _controller),
+        // GESTURE DETECTOR POUR LE SWIPE BACK STYLE IOS NATIF
+        body: GestureDetector(
+          onHorizontalDragStart: (details) {
+            _startX = details.globalPosition.dx; // Mémorise où le doigt se pose
+          },
+          onHorizontalDragEnd: (details) async {
+            // Si le glissement commence à gauche (<60px) et va vers la droite (vitesse > 100)
+            if (_startX < 60 && (details.primaryVelocity ?? 0) > 100) {
+              if (await _controller.canGoBack()) {
+                _controller.goBack();
+              } else {
+                if (mounted) Navigator.pop(context);
+              }
+            }
+          },
+          child: WebViewWidget(controller: _controller),
+        ),
         floatingActionButton: _isVideoPage
             ? FloatingActionButton.extended(
                 onPressed: () {
@@ -1695,7 +1726,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
                 },
                 backgroundColor: const Color(0xFF4A8FA3),
                 icon: const Icon(Icons.download, color: Colors.white),
-                label: const Text("Télécharger la vidéo", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                label: const Text("Télécharger", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
               )
             : null,
       ),
@@ -2082,7 +2113,7 @@ class MediaExtractor {
          if (res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
       } catch (_) {}
 
-      throw Exception("L'API Instagram bloque la requête. Veuillez utiliser le 'Navigateur YouTube' intégré pour télécharger depuis un site tiers.");
+      throw Exception("L'API Instagram est temporairement surchargée. Veuillez utiliser le 'Navigateur Intégré' de l'application pour aller sur un site comme snapinsta.app.");
     }
 
     return null;
