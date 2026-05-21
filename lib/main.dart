@@ -163,24 +163,30 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _player.setVolume(volume);
     _player.setLoopMode(LoopMode.off); 
 
-    // 1. LE GARDE-FOU INTELLIGENT (Gère l'arrêt et la boucle sans bloquer AirPlay)
+    // 1. LE GARDE-FOU (Appliqué UNIQUEMENT au mode Répéter 1)
     _positionSubscription?.cancel(); 
     _positionSubscription = _player.positionStream.listen((position) {
       final duration = _player.duration;
-      if (duration != null && position.inMilliseconds > 0) {
-        // Si on est à 250ms de la fin de la piste...
+      // On ne coupe légèrement avant la fin QUE si on boucle
+      if (duration != null && position.inMilliseconds > 0 && loopMode == LoopModeState.one) {
         if (duration.inMilliseconds - position.inMilliseconds < 250) {
-          if (loopMode == LoopModeState.one) {
-            _player.seek(Duration.zero); // On boucle
-          } else if (loopMode == LoopModeState.off) {
-            _player.pause(); // On s'arrête naturellement
-            _player.seek(Duration.zero);
-          }
+          _player.seek(Duration.zero); 
         }
       }
     });
 
-    // 2. MISE À JOUR DE L'UI (Laisse AirPlay travailler tranquillement)
+    // 2. LA FIN NATURELLE (Boucle désactivée)
+    _player.playerStateStream.listen((state) async {
+      // Quand la piste est VRAIMENT terminée
+      if (state.processingState == ProcessingState.completed) {
+        if (loopMode == LoopModeState.off) {
+          await _player.pause();
+          await _player.seek(Duration.zero, index: _playingIndex); 
+        }
+      }
+    });
+
+    // 3. MISE À JOUR DE L'UI (Laisse AirPlay travailler tranquillement)
     _player.currentIndexStream.listen((index) {
       if (index == null) return;
       _playingIndex = index;
@@ -1304,6 +1310,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   // --- LANCEUR ET SAUVEGARDE DE L'ÉDITEUR ---
   Future<void> _launchEditorAndSave(File videoFile, Map<String, dynamic> metadata) async {
+    await _player.pause(); // <-- AJOUTE CETTE LIGNE ICI
     final result = await Navigator.push(
       context,
       MaterialPageRoute(
@@ -1405,7 +1412,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       backgroundColor: const Color(0xFF111111),
       isScrollControlled: true,
       builder: (ctx) => FractionallySizedBox(
-        heightFactor: 0.8, // Prend 80% de l'écran pour bien voir la liste
+        heightFactor: 0.8,
         child: Column(
           children: [
             const Padding(
@@ -1417,14 +1424,26 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 itemCount: allRecitations.length,
                 itemBuilder: (context, index) {
                   final rec = allRecitations[index];
-                  String path = rec['fichier'] ?? "";
-                  // On filtre pour ne garder que ce qui est potentiellement une vidéo
-                  if (!path.endsWith('.mp4') && !path.contains('yt_')) return const SizedBox.shrink();
+                  final id = rec['id'];
+                  final fileName = rec['fichier']?.toString() ?? "";
+                  
+                  // LOGIQUE DE DÉTECTION ROBUSTE :
+                  // 1. Soit c'est un fichier YouTube/Insta (stocké en yt_ID.mp4)
+                  // 2. Soit c'est un import local (stocké avec son nom d'origine)
+                  final File ytFile = File(p.join(_appDirPath!, "yt_$id.mp4"));
+                  final File localFile = File(p.join(_appDirPath!, fileName));
+
+                  bool exists = ytFile.existsSync() || (fileName.isNotEmpty && localFile.existsSync() && !fileName.startsWith('http'));
+
+                  if (!exists) return const SizedBox.shrink(); // On cache si le fichier n.est pas sur le téléphone
                   
                   return ListTile(
-                    leading: const Icon(Icons.movie, color: Colors.grey),
+                    leading: ClipRRect(
+                      borderRadius: BorderRadius.circular(4),
+                      child: _buildThumbnail(rec['thumbnail'])
+                    ),
                     title: Text("${rec['sourate_num']} - ${rec['sourate_name']}", style: const TextStyle(color: Colors.white)),
-                    subtitle: Text(rec['duration'] ?? "", style: const TextStyle(color: Colors.grey)),
+                    subtitle: Text(rec['duration'] ?? "Vidéo", style: const TextStyle(color: Colors.grey)),
                     onTap: () async {
                       Navigator.pop(ctx);
                       _prepareExistingVideoForEditor(rec);
@@ -1444,30 +1463,33 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _showLoading("Préparation de la copie de travail...");
     try {
       final dir = await getApplicationDocumentsDirectory();
-      File originalFile;
+      File sourceFile;
       
-      // On localise le fichier source
-      String path = rec['fichier'] ?? "";
-      if (path.contains('youtube.com') || path.contains('instagram') || path.contains('tiktok')) {
-        originalFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
+      final id = rec['id'];
+      final fileName = rec['fichier']?.toString() ?? "";
+      final File ytFile = File(p.join(dir.path, "yt_$id.mp4"));
+      final File localFile = File(p.join(dir.path, fileName));
+
+      // On détermine quel fichier utiliser
+      if (ytFile.existsSync()) {
+        sourceFile = ytFile;
+      } else if (localFile.existsSync()) {
+        sourceFile = localFile;
       } else {
-        originalFile = File(p.join(dir.path, path));
+        throw Exception("Fichier introuvable sur l'appareil.");
       }
 
-      if (!await originalFile.exists()) throw Exception("Le fichier vidéo original est introuvable.");
-
-      // On crée la COPIE (temp_edit_ID.mp4) pour ne pas casser la piste actuelle
+      // Création de la copie temporaire pour l'éditeur
       final tempFile = File(p.join(dir.path, "temp_edit_${rec['id']}.mp4"));
       if (await tempFile.exists()) await tempFile.delete();
-      await originalFile.copy(tempFile.path);
+      await sourceFile.copy(tempFile.path);
 
       if (mounted) Navigator.pop(context); // Ferme le chargement
 
-      // SUCCÈS : On lance l'éditeur avec la copie fraîchement créée
       _launchEditorAndSave(tempFile, rec);
 
     } catch (e) {
-      if (mounted) Navigator.pop(context); // Ferme le chargement
+      if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
     }
   }
