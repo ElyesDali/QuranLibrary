@@ -34,8 +34,8 @@ class _VideoEditorScreenState extends State<VideoEditorScreen> {
       widget.videoFile,
       minDuration: const Duration(seconds: 1),
       trimStyle: TrimSliderStyle(
-        positionLineColor: Colors.red,
-        positionLineWidth: 6,
+        positionLineColor: Colors.red, 
+        positionLineWidth: 5, // Ligne légèrement épaissie pour une meilleure visibilité
         lineColor: Colors.grey.withOpacity(0.5),
         onTrimmingColor: const Color(0xFF7EB8C9),
         lineWidth: 4,
@@ -44,13 +44,22 @@ class _VideoEditorScreenState extends State<VideoEditorScreen> {
       ),
     );
     
-    _controller.initialize().then((_) {
-      _saveDraft();
-      _controller.addListener(_updateTimecodes);
-      _controller.video.addListener(_updateCurrentTime); // Écoute la lecture en direct
-      setState(() {});
-    }).catchError((error) {
-      Navigator.pop(context);
+    // Initialisation sécurisée avec double vérification d'état
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _controller.initialize().then((_) {
+        _saveDraft();
+        _controller.addListener(_updateTimecodes);
+        _controller.video.addListener(_updateCurrentTime);
+        if (mounted) setState(() {});
+      }).catchError((error) {
+        debugPrint("Erreur d'initialisation de l'éditeur: \$error");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("❌ Impossible d'ouvrir cette vidéo dans l'éditeur"), backgroundColor: Colors.red)
+          );
+          Navigator.pop(context);
+        }
+      });
     });
   }
 

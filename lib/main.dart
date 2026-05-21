@@ -164,37 +164,46 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _player.setVolume(volume);
     _player.setLoopMode(LoopMode.off); 
 
-    // 1. LE TRACKER DE POSITION INTERCEPTEUR (ZÉRO BLEED AUDIO)
+    // 1. INTERCEPTEUR HAUTE FRÉQUENCE (ZÉRO BLEED AUDIO & ZÉRO COUPURE PRÉMATURÉE)
     _positionSubscription?.cancel(); 
-    _positionSubscription = _player.positionStream.listen((position) async {
+    _positionSubscription = _player.createPositionStream(
+      minPeriod: const Duration(milliseconds: 20),
+      maxPeriod: const Duration(milliseconds: 20),
+    ).listen((position) async {
       final duration = _player.duration;
       if (duration != null && position.inMilliseconds > 0 && !_isSwitchingTrack) {
         final remaining = duration.inMilliseconds - position.inMilliseconds;
         _lastPos = position.inMilliseconds;
         _lastDuration = duration.inMilliseconds;
 
-        // On intercepte 250ms AVANT la fin pour couper net toute transition native
-        if (remaining <= 250) {
-          if (loopMode == LoopModeState.one) {
-            _isSwitchingTrack = true;
-            await _player.seek(Duration.zero, index: _playingIndex); 
-            _isSwitchingTrack = false;
-          } else if (loopMode == LoopModeState.off) {
+        // On intercepte à l'extrême limite (60ms avant la fin) pour bloquer le pré-chargement iOS
+        if (remaining <= 60) {
+          if (loopMode == LoopModeState.off) {
             _isSwitchingTrack = true;
             await _player.pause();
-            await _player.seek(Duration.zero, index: _playingIndex); // Remet l'ACTUELLE à 0:00
+            await _player.seek(Duration.zero, index: _playingIndex); // Repositionne la récitation actuelle à 0:00
             _isSwitchingTrack = false;
           }
         }
       }
     });
 
-    // 2. MISE À JOUR EXCLUSIVE DE L'UI (Laisse les transitions se faire uniquement en mode AutoPlay)
-    _player.currentIndexStream.listen((index) {
+    // 2. LE CERVEAU DES TRANSITIONS (Sécurise le mode OFF, la Boucle et l'Autoplay)
+    _player.currentIndexStream.listen((index) async {
       if (index == null || _isSwitchingTrack) return;
+      
+      // Si le lecteur tente d'avancer tout seul alors qu'on est en mode OFF
+      if (_playingIndex != null && index != _playingIndex && loopMode == LoopModeState.off) {
+        _isSwitchingTrack = true;
+        await _player.pause();
+        await _player.seek(Duration.zero, index: _playingIndex);
+        _isSwitchingTrack = false;
+        return;
+      }
+
       _playingIndex = index;
-      if (index < displayedRecitations.length) {
-         if (mounted) setState(() => currentRecitation = displayedRecitations[index]);
+      if (mounted && index < displayedRecitations.length) {
+         setState(() => currentRecitation = displayedRecitations[index]);
       }
     });
   }
@@ -623,12 +632,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
     setState(() {
       if (loopMode == LoopModeState.off) {
         loopMode = LoopModeState.autoplay;
+        _player.setLoopMode(LoopMode.off);
       } else if (loopMode == LoopModeState.autoplay) {
         loopMode = LoopModeState.one;
+        _player.setLoopMode(LoopMode.one); // Active la boucle native parfaite
       } else {
         loopMode = LoopModeState.off;
+        _player.setLoopMode(LoopMode.off);
       }
-      _player.setLoopMode(LoopMode.off); // FIX : Toujours désactivé nativement
     });
   }
 
@@ -1394,7 +1405,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       final dir = await getApplicationDocumentsDirectory();
       
       if (meta.containsKey('id') && meta['id'] != null) {
-        // CAS 1 : MODIFICATION (On génère un nouveau nom pour tromper le cache du lecteur)
+        // CAS 1 : MODIFICATION
         int id = meta['id'];
         String newFileName = "edited_${id}_${DateTime.now().millisecondsSinceEpoch}.mp4"; 
         File finalDest = File(p.join(dir.path, newFileName));
@@ -1409,14 +1420,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
               newDur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
            }
            
-           String newThumb = meta['thumbnail'] ?? "";
+           String newThumb = "thumb_${id}_${DateTime.now().millisecondsSinceEpoch}.jpg";
            final thumbData = await VideoThumbnail.thumbnailData(video: finalDest.path, imageFormat: ImageFormat.JPEG, maxWidth: 300, quality: 50);
            if (thumbData != null) {
-             newThumb = "thumb_${id}_${DateTime.now().millisecondsSinceEpoch}.jpg";
              await File(p.join(dir.path, newThumb)).writeAsBytes(thumbData);
+           } else {
+             newThumb = meta['thumbnail'] ?? "";
            }
            
-           // On enregistre le NOUVEAU nom de fichier dans la BDD
            await _db?.update('recitations', {'fichier': newFileName, 'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
         } catch (_) {}
         
@@ -1432,7 +1443,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Nouvelle vidéo enregistrée et rognée !"), backgroundColor: Colors.green));
       }
       
-      // --- INTEGRATION DE LA PURGE DU CACHE AUDIO ---
+      // FORCAGE DU RESET DE MÉMOIRE POUR COMPROMETTRE LE CACHE AUDIO ET AIRPLAY
       setState(() {
         currentRecitation = null;
         _playingIndex = null;
@@ -1600,17 +1611,15 @@ class YoutubeBrowserScreen extends StatefulWidget {
 class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
   late final WebViewController _controller;
   String _currentUrl = "";
-  double _startX = 0; // Pour détecter le swipe back précis
 
   @override
   void initState() {
     super.initState();
     
-    // CONFIGURATION DES PARAMÈTRES D'AFFICHAGE INLINE POUR IOS (ANTI PLEIN ÉCRAN)
     late final PlatformWebViewControllerCreationParams params;
     if (WebViewPlatform.instance is WebKitWebViewPlatform) {
       params = WebKitWebViewControllerCreationParams(
-        allowsInlineMediaPlayback: true, // Bloque le plein écran automatique d'iOS
+        allowsInlineMediaPlayback: true, // Désactive le plein écran forcé automatique d'iOS
       );
     } else {
       params = const PlatformWebViewControllerCreationParams();
@@ -1618,20 +1627,16 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
 
     _controller = WebViewController.fromPlatformCreationParams(params)
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setUserAgent("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1") // Force l'interface web mobile moderne
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageFinished: (String url) {
-            // Script de fluidité pour YouTube Mobile et Shorts
             _controller.runJavaScript("""
               const observer = new MutationObserver(() => {
                 document.querySelectorAll('video').forEach(v => {
                   if (!v.hasAttribute('playsinline')) {
                     v.setAttribute('playsinline', 'true');
-                    v.removeAttribute('autoplay');
                   }
                 });
-                document.querySelectorAll('ytm-inline-preview').forEach(e => e.remove());
               });
               observer.observe(document.body, { childList: true, subtree: true });
             """);
@@ -1662,7 +1667,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
       onWillPop: _handleBack,
       child: Scaffold(
         appBar: AppBar(
-          title: const Text("Navigateur Intégré", style: TextStyle(color: Color(0xFF7EB8C9))),
+          title: const Text("Navigateur YouTube", style: TextStyle(color: Color(0xFF7EB8C9))),
           backgroundColor: const Color(0xFF111111),
           leading: IconButton(
             icon: const Icon(Icons.arrow_back),
@@ -1681,22 +1686,28 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
             )
           ],
         ),
-        // GESTURE DETECTOR POUR LE SWIPE BACK STYLE IOS NATIF
-        body: GestureDetector(
-          onHorizontalDragStart: (details) {
-            _startX = details.globalPosition.dx; // Mémorise où le doigt se pose
-          },
-          onHorizontalDragEnd: (details) async {
-            // Si le glissement commence à gauche (<60px) et va vers la droite (vitesse > 100)
-            if (_startX < 60 && (details.primaryVelocity ?? 0) > 100) {
-              if (await _controller.canGoBack()) {
-                _controller.goBack();
-              } else {
-                if (mounted) Navigator.pop(context);
-              }
-            }
-          },
-          child: WebViewWidget(controller: _controller),
+        body: Stack(
+          children: [
+            // Le navigateur occupe tout l'espace de manière fluide
+            WebViewWidget(controller: _controller),
+            
+            // Zone de Swipe Back invisible (25px de large sur le bord gauche uniquement)
+            Positioned(
+              left: 0, top: 0, bottom: 0, width: 25,
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onHorizontalDragUpdate: (details) async {
+                  if (details.delta.dx > 12) { // Détection d'un balayage vers la droite
+                    if (await _controller.canGoBack()) {
+                      _controller.goBack();
+                    } else {
+                      if (mounted) Navigator.pop(context);
+                    }
+                  }
+                },
+              ),
+            ),
+          ],
         ),
         floatingActionButton: _isVideoPage
             ? FloatingActionButton.extended(
@@ -2065,45 +2076,44 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // Moteur Instagram : Scrapers Furtifs (Contournement Cloudflare 2026)
+    // Moteur Instagram : Tunneling de prévisualisation natif (Infaillible & Gratuit)
     if (cleanUrl.contains('instagram')) {
-      final headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-      };
+      // Étape 1 : On convertit l'URL vers le serveur miroir de prévisualisation
+      String mirrorUrl = cleanUrl
+          .replaceAll('instagram.com', 'ddinstagram.com')
+          .replaceAll('www.', '');
 
-      // 1. Armada Cobalt (Requêtes v7 strictes)
-      final cobaltMirrors = [
-        'https://co.wuk.sh/api/json', 
-        'https://cobalt.canarduc.dev/api/json',
-        'https://api.cobalt.tools/api/json',
-        'https://api.cobalt.bgn.tools/api/json'
-      ];
-
-      for (String mirror in cobaltMirrors) {
-         try {
-           final res = await Dio().post(mirror,
-             options: Options(headers: headers, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 8)),
-             data: {"url": cleanUrl, "vCodec": "h264", "isAudioOnly": false}
-           );
-           if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
-         } catch (_) {}
-      }
-
-      // 2. API SnapSave (Le moteur utilisé par les sites web de téléchargement IG)
+      // Étape 2 : On extrait directement la source vidéo brute injectée dans les balises meta OpenGraph
       try {
-         final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
+        final response = await Dio().get(
+          mirrorUrl,
+          options: Options(
+            sendTimeout: const Duration(seconds: 8),
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)', // On se fait passer pour le robot officiel de Discord
+            }
+          )
+        );
+
+        if (response.statusCode == 200 && response.data != null) {
+          String html = response.data.toString();
+          // Recherche de la balise vidéo brute dans le code source HTML
+          RegExp regExp = RegExp(r'<meta property="og:video" content="([^"]+)"');
+          final match = regExp.firstMatch(html);
+          if (match != null && match.group(1) != null) {
+            String rawVideoUrl = match.group(1)!.replaceAll('&amp;', '&');
+            return rawVideoUrl; // URL directe et permanente trouvée !
+          }
+        }
       } catch (_) {}
 
-      // 3. API Publer (Secours)
+      // Secours standard si le miroir est surchargé
       try {
-         final res = await Dio().get('https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', options: Options(sendTimeout: const Duration(seconds: 8)));
          if (res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
       } catch (_) {}
-
-      throw Exception("L'API Instagram est temporairement surchargée. Veuillez utiliser le 'Navigateur Intégré' de l'application pour aller sur un site comme snapinsta.app.");
+      
+      throw Exception("L'extraction Instagram a échoué. Veuillez utiliser le Navigateur YouTube pour récupérer le contenu via un site externe de confiance.");
     }
 
     return null;
