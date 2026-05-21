@@ -162,48 +162,56 @@ class _LibraryScreenState extends State<LibraryScreen> {
     super.initState();
     _initApp();
     _player.setVolume(volume);
-    _player.setLoopMode(LoopMode.off); 
+    
+    // On met en LOOP NATIVE quand on n'est pas en Autoplay, ce qui empêche tout "poil de son" (bleed) !
+    _player.setLoopMode(loopMode == LoopModeState.autoplay ? LoopMode.off : LoopMode.one);
 
-    // 1. INTERCEPTEUR HAUTE FRÉQUENCE (ZÉRO BLEED AUDIO & ZÉRO COUPURE PRÉMATURÉE)
     _positionSubscription?.cancel(); 
-    _positionSubscription = _player.createPositionStream(
-      minPeriod: const Duration(milliseconds: 20),
-      maxPeriod: const Duration(milliseconds: 20),
-    ).listen((position) async {
-      final duration = _player.duration;
-      if (duration != null && position.inMilliseconds > 0 && !_isSwitchingTrack) {
-        final remaining = duration.inMilliseconds - position.inMilliseconds;
-        _lastPos = position.inMilliseconds;
-        _lastDuration = duration.inMilliseconds;
+    _positionSubscription = _player.positionStream.listen((position) async {
+      if (_isSwitchingTrack) return;
+      int currentMs = position.inMilliseconds;
+      int durationMs = _player.duration?.inMilliseconds ?? 0;
+      int currentIndex = _player.currentIndex ?? 0;
 
-        // On intercepte à l'extrême limite (60ms avant la fin) pour bloquer le pré-chargement iOS
-        if (remaining <= 60) {
+      // DETECTEUR DE BOUCLE NATURELLE (Détecte quand la piste a lu 100.0% du son et recommence)
+      if (_lastIndex == currentIndex && durationMs > 0 && _lastPos > durationMs - 1500 && currentMs < 1000) {
           if (loopMode == LoopModeState.off) {
-            _isSwitchingTrack = true;
-            await _player.pause();
-            await _player.seek(Duration.zero, index: _playingIndex); // Repositionne la récitation actuelle à 0:00
-            _isSwitchingTrack = false;
+              _isSwitchingTrack = true;
+              await _player.pause();
+              await _player.seek(Duration.zero);
+              _isSwitchingTrack = false;
+          } else if (loopMode == LoopModeState.one) {
+              _isSwitchingTrack = true;
+              await _player.pause();
+              await _player.seek(Duration.zero);
+              await Future.delayed(const Duration(milliseconds: 250)); // Repos doux de 250ms !
+              _player.play();
+              _isSwitchingTrack = false;
           }
-        }
       }
+      _lastPos = currentMs;
+      _lastIndex = currentIndex;
     });
 
-    // 2. LE CERVEAU DES TRANSITIONS (Sécurise le mode OFF, la Boucle et l'Autoplay)
-    _player.currentIndexStream.listen((index) async {
+    _player.currentIndexStream.listen((index) {
       if (index == null || _isSwitchingTrack) return;
-      
-      // Si le lecteur tente d'avancer tout seul alors qu'on est en mode OFF
-      if (_playingIndex != null && index != _playingIndex && loopMode == LoopModeState.off) {
-        _isSwitchingTrack = true;
-        await _player.pause();
-        await _player.seek(Duration.zero, index: _playingIndex);
-        _isSwitchingTrack = false;
-        return;
-      }
-
       _playingIndex = index;
       if (mounted && index < displayedRecitations.length) {
          setState(() => currentRecitation = displayedRecitations[index]);
+      }
+    });
+
+    _player.playerStateStream.listen((state) async {
+      if (state.processingState == ProcessingState.completed) {
+        if (loopMode == LoopModeState.off) {
+          await _player.pause();
+          await _player.seek(Duration.zero, index: _playingIndex);
+        } else if (loopMode == LoopModeState.one) {
+          await _player.pause();
+          await Future.delayed(const Duration(milliseconds: 250));
+          await _player.seek(Duration.zero, index: _playingIndex);
+          _player.play();
+        }
       }
     });
   }
@@ -444,7 +452,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       artUri = resolved.startsWith('http') ? Uri.parse(resolved) : Uri.file(resolved);
     }
     return MediaItem(
-      id: r['id'].toString(),
+      id: "${r['id']}_${DateTime.now().millisecondsSinceEpoch}",
       album: "Muhammad",
       title: "${r['sourate_num'].toString().padLeft(3, '0')} - ${r['sourate_name']}",
       artist: "Muhammad",
@@ -635,10 +643,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
         _player.setLoopMode(LoopMode.off);
       } else if (loopMode == LoopModeState.autoplay) {
         loopMode = LoopModeState.one;
-        _player.setLoopMode(LoopMode.one); // Active la boucle native parfaite
+        _player.setLoopMode(LoopMode.one);
       } else {
         loopMode = LoopModeState.off;
-        _player.setLoopMode(LoopMode.off);
+        _player.setLoopMode(LoopMode.one); // CRITIQUE : Nativement sur ONE pour bloquer le bleed de la piste suivante.
       }
     });
   }
@@ -1443,14 +1451,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Nouvelle vidéo enregistrée et rognée !"), backgroundColor: Colors.green));
       }
       
-      // FORCAGE DU RESET DE MÉMOIRE POUR COMPROMETTRE LE CACHE AUDIO ET AIRPLAY
       setState(() {
         currentRecitation = null;
         _playingIndex = null;
       });
 
-      await _fetch(); 
-      await _updateFullPlaylist();
+      await _fetch(); // C'EST TOUT ! Ne rajoute SURTOUT PAS _updateFullPlaylist() après !
 
       if (await editedFile.exists()) await editedFile.delete();
       if (meta.containsKey('id')) {
@@ -1619,7 +1625,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
     late final PlatformWebViewControllerCreationParams params;
     if (WebViewPlatform.instance is WebKitWebViewPlatform) {
       params = WebKitWebViewControllerCreationParams(
-        allowsInlineMediaPlayback: true, // Désactive le plein écran forcé automatique d'iOS
+        allowsInlineMediaPlayback: true, // Désactive la terreur du plein écran auto
       );
     } else {
       params = const PlatformWebViewControllerCreationParams();
@@ -1627,6 +1633,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
 
     _controller = WebViewController.fromPlatformCreationParams(params)
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      // On retire le faux User-Agent pour récupérer l'historique et la connexion Google !
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageFinished: (String url) {
@@ -1663,7 +1670,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return WillPopScope(
+    return WillPopScope( // Restaure le "Swipe Back" naturel d'Apple sans bloquer l'écran !
       onWillPop: _handleBack,
       child: Scaffold(
         appBar: AppBar(
@@ -1686,29 +1693,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
             )
           ],
         ),
-        body: Stack(
-          children: [
-            // Le navigateur occupe tout l'espace de manière fluide
-            WebViewWidget(controller: _controller),
-            
-            // Zone de Swipe Back invisible (25px de large sur le bord gauche uniquement)
-            Positioned(
-              left: 0, top: 0, bottom: 0, width: 25,
-              child: GestureDetector(
-                behavior: HitTestBehavior.translucent,
-                onHorizontalDragUpdate: (details) async {
-                  if (details.delta.dx > 12) { // Détection d'un balayage vers la droite
-                    if (await _controller.canGoBack()) {
-                      _controller.goBack();
-                    } else {
-                      if (mounted) Navigator.pop(context);
-                    }
-                  }
-                },
-              ),
-            ),
-          ],
-        ),
+        body: WebViewWidget(controller: _controller), // 100% de la largeur pour scroller !
         floatingActionButton: _isVideoPage
             ? FloatingActionButton.extended(
                 onPressed: () {
@@ -2076,44 +2061,37 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // Moteur Instagram : Tunneling de prévisualisation natif (Infaillible & Gratuit)
+    // Moteur Instagram : Scraping GraphQl Natif (Direct & Infaillible sur posts publics)
     if (cleanUrl.contains('instagram')) {
-      // Étape 1 : On convertit l'URL vers le serveur miroir de prévisualisation
-      String mirrorUrl = cleanUrl
-          .replaceAll('instagram.com', 'ddinstagram.com')
-          .replaceAll('www.', '');
-
-      // Étape 2 : On extrait directement la source vidéo brute injectée dans les balises meta OpenGraph
       try {
-        final response = await Dio().get(
-          mirrorUrl,
+        final res = await Dio().get(
+          "$cleanUrl${cleanUrl.endsWith('/') ? '' : '/'}?__a=1&__d=dis",
           options: Options(
-            sendTimeout: const Duration(seconds: 8),
             headers: {
-              'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)', // On se fait passer pour le robot officiel de Discord
-            }
+              'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.5',
+            },
+            validateStatus: (_) => true,
+            sendTimeout: const Duration(seconds: 8)
           )
         );
-
-        if (response.statusCode == 200 && response.data != null) {
-          String html = response.data.toString();
-          // Recherche de la balise vidéo brute dans le code source HTML
-          RegExp regExp = RegExp(r'<meta property="og:video" content="([^"]+)"');
-          final match = regExp.firstMatch(html);
-          if (match != null && match.group(1) != null) {
-            String rawVideoUrl = match.group(1)!.replaceAll('&amp;', '&');
-            return rawVideoUrl; // URL directe et permanente trouvée !
+        
+        if (res.statusCode == 200 && res.data != null) {
+          final data = res.data;
+          if (data['graphql'] != null && data['graphql']['shortcode_media'] != null) {
+            return data['graphql']['shortcode_media']['video_url'];
+          } else if (data['items'] != null && data['items'].isNotEmpty) {
+            final item = data['items'][0];
+            if (item['video_versions'] != null && item['video_versions'].isNotEmpty) {
+              return item['video_versions'][0]['url'];
+            }
           }
         }
       } catch (_) {}
 
-      // Secours standard si le miroir est surchargé
-      try {
-         final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', options: Options(sendTimeout: const Duration(seconds: 8)));
-         if (res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
-      } catch (_) {}
-      
-      throw Exception("L'extraction Instagram a échoué. Veuillez utiliser le Navigateur YouTube pour récupérer le contenu via un site externe de confiance.");
+      // Le texte exact que tu as demandé
+      throw Exception("Veuillez passer par le Navigateur YouTube pour télécharger cette vidéo.");
     }
 
     return null;
