@@ -163,35 +163,43 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _player.setVolume(volume);
     _player.setLoopMode(LoopMode.off); 
 
-    // 1. LE GARDE-FOU (Appliqué UNIQUEMENT au mode Répéter 1)
+    // 1. LE TRACKER DE POSITION (Mémorise en temps réel où on en est)
     _positionSubscription?.cancel(); 
-    _positionSubscription = _player.positionStream.listen((position) {
-      final duration = _player.duration;
-      // On ne coupe légèrement avant la fin QUE si on boucle
-      if (duration != null && position.inMilliseconds > 0 && loopMode == LoopModeState.one) {
-        if (duration.inMilliseconds - position.inMilliseconds < 250) {
-          _player.seek(Duration.zero); 
-        }
-      }
+    _positionSubscription = _player.positionStream.listen((pos) {
+      _lastPos = pos.inMilliseconds;
+      _lastDuration = _player.duration?.inMilliseconds ?? 0;
     });
 
-    // 2. LA FIN NATURELLE (Boucle désactivée)
-    _player.playerStateStream.listen((state) async {
-      // Quand la piste est VRAIMENT terminée
-      if (state.processingState == ProcessingState.completed) {
-        if (loopMode == LoopModeState.off) {
-          await _player.pause();
-          await _player.seek(Duration.zero, index: _playingIndex); 
+    // 2. LE CERVEAU DE LA LECTURE (Gère intelligemment tous les modes)
+    _player.currentIndexStream.listen((index) async {
+      if (index == null || _isSwitchingTrack) return;
+
+      // Si l'index change, on vérifie si la piste précédente s'est terminée "naturellement" (à moins de 1.5s de la fin)
+      if (_playingIndex != null && index != _playingIndex) {
+        bool finishedNaturally = (_lastDuration > 0 && (_lastDuration - _lastPos) < 1500);
+
+        if (finishedNaturally) {
+           if (loopMode == LoopModeState.off) {
+              // MODE OFF : On s'arrête à la fin de la piste actuelle
+              _isSwitchingTrack = true;
+              await _player.pause();
+              await _player.seek(Duration.zero, index: _playingIndex); 
+              _isSwitchingTrack = false;
+              return; // Annule le passage à la suivante
+           } else if (loopMode == LoopModeState.one) {
+              // MODE BOUCLE : On remet au début et on continue
+              _isSwitchingTrack = true;
+              await _player.seek(Duration.zero, index: _playingIndex); 
+              _isSwitchingTrack = false;
+              return; // Annule le passage à la suivante
+           }
+           // MODE AUTOPLAY : On ne fait rien, on le laisse passer à la suivante !
         }
       }
-    });
 
-    // 3. MISE À JOUR DE L'UI (Laisse AirPlay travailler tranquillement)
-    _player.currentIndexStream.listen((index) {
-      if (index == null) return;
       _playingIndex = index;
-      if (index < displayedRecitations.length) {
-         if (mounted) setState(() => currentRecitation = displayedRecitations[index]);
+      if (mounted && index < displayedRecitations.length) {
+         setState(() => currentRecitation = displayedRecitations[index]);
       }
     });
   }
@@ -265,6 +273,59 @@ class _LibraryScreenState extends State<LibraryScreen> {
       allRecitations = res ?? [];
       _applyFilters();
     });
+    
+    // NOUVEAU : Lance la réparation automatique en arrière-plan
+    _checkMissingThumbnails(res ?? []);
+  }
+
+  Future<void> _checkMissingThumbnails(List<dynamic> recs) async {
+    if (_appDirPath == null) return;
+    bool hasUpdates = false;
+    
+    for (var rec in recs) {
+      String thumb = rec['thumbnail'] ?? "";
+      String fileStr = rec['fichier'] ?? "";
+      bool needsThumb = false;
+      
+      // On regarde s'il manque une miniature locale
+      if (thumb.isEmpty) {
+         needsThumb = true;
+      } else if (!thumb.startsWith('http')) {
+         final thumbFile = File(p.join(_appDirPath!, thumb));
+         if (!await thumbFile.exists()) needsThumb = true;
+      }
+
+      // Si oui, on extrait une nouvelle image de la vidéo
+      if (needsThumb) {
+         File? videoFile;
+         if (fileStr.contains('youtube') || fileStr.contains('tiktok') || fileStr.contains('instagram')) {
+            videoFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
+         } else {
+            videoFile = File(p.join(_appDirPath!, fileStr));
+         }
+         
+         if (videoFile.existsSync()) {
+            try {
+               final thumbData = await VideoThumbnail.thumbnailData(video: videoFile.path, imageFormat: ImageFormat.JPEG, maxWidth: 300, quality: 50);
+               if (thumbData != null) {
+                 String newThumb = "thumb_${rec['id']}_${DateTime.now().millisecondsSinceEpoch}.jpg";
+                 await File(p.join(_appDirPath!, newThumb)).writeAsBytes(thumbData);
+                 await _db?.update('recitations', {'thumbnail': newThumb}, where: 'id = ?', whereArgs: [rec['id']]);
+                 hasUpdates = true;
+               }
+            } catch (_) {}
+         }
+      }
+    }
+    
+    // Si on a réparé des choses, on met à jour l'écran tout seul !
+    if (hasUpdates && mounted) {
+       final updatedRes = await _db?.query('recitations', orderBy: 'sourate_num ASC');
+       setState(() {
+          allRecitations = updatedRes ?? [];
+          _applyFilters();
+       });
+    }
   }
 
   void _applyFilters() {
@@ -509,11 +570,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _play(Map<String, dynamic> rec) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt('last_played_id', rec['id']); // <-- AJOUTE CETTE LIGNE
-
     int index = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
-
+    
     if (index != -1) {
       _isSwitchingTrack = true;
       
@@ -523,6 +581,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       });
 
       try {
+        await _player.pause(); // <-- LE CORRECTIF AIRPLAY EST ICI (Force la réinitialisation visuelle d'iOS)
         await _player.seek(Duration.zero, index: index);
         _player.play();
       } catch (e) {
@@ -1310,7 +1369,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   // --- LANCEUR ET SAUVEGARDE DE L'ÉDITEUR ---
   Future<void> _launchEditorAndSave(File videoFile, Map<String, dynamic> metadata) async {
-    await _player.pause(); // <-- AJOUTE CETTE LIGNE ICI
+    await _player.stop(); // <-- CRITIQUE : Stop complet pour forcer l'iPhone à vider le cache de l'ancienne vidéo
     final result = await Navigator.push(
       context,
       MaterialPageRoute(
@@ -1318,25 +1377,42 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ),
     );
 
-    // Si on a un retour, c'est que FFmpeg a réussi son export !
     if (result != null && result is Map) {
       File editedFile = result['file'];
       Map<String, dynamic> meta = result['metadata'];
-
       final dir = await getApplicationDocumentsDirectory();
       
       if (meta.containsKey('id') && meta['id'] != null) {
-        // CAS 1 : MODIFICATION (On écrase l'originale avec la version coupée)
+        // CAS 1 : MODIFICATION
         int id = meta['id'];
         String originalFileName = meta['fichier'] ?? "yt_$id.mp4"; 
         File finalDest = File(p.join(dir.path, originalFileName));
         
         if (await finalDest.exists()) await finalDest.delete();
         await editedFile.copy(finalDest.path);
+
+        // --- NOUVEAU : MISE À JOUR DE LA DURÉE ET MINIATURE DANS LA BASE DE DONNÉES ---
+        try {
+           final newMetadata = await MetadataRetriever.fromFile(finalDest);
+           String newDur = meta['duration'] ?? "--:--"; 
+           if (newMetadata.trackDuration != null) {
+              final d = Duration(milliseconds: newMetadata.trackDuration!);
+              newDur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+           }
+           
+           String newThumb = meta['thumbnail'] ?? "";
+           final thumbData = await VideoThumbnail.thumbnailData(video: finalDest.path, imageFormat: ImageFormat.JPEG, maxWidth: 300, quality: 50);
+           if (thumbData != null) {
+             newThumb = "thumb_${id}_${DateTime.now().millisecondsSinceEpoch}.jpg"; // Nom unique pour forcer le rafraichissement visuel
+             await File(p.join(dir.path, newThumb)).writeAsBytes(thumbData);
+           }
+           await _db?.update('recitations', {'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
+        } catch (_) {}
+        // --------------------------------------------------------------------------------
         
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Récitation modifiée avec succès !"), backgroundColor: Colors.green));
       } else {
-        // CAS 2 : NOUVELLE VIDÉO (On crée une nouvelle entrée BDD)
+        // CAS 2 : NOUVELLE VIDÉO
         String newFileName = "local_${DateTime.now().millisecondsSinceEpoch}.mp4";
         File finalDest = File(p.join(dir.path, newFileName));
         await editedFile.copy(finalDest.path);
@@ -1346,10 +1422,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Nouvelle vidéo enregistrée et rognée !"), backgroundColor: Colors.green));
       }
       
-      _fetch(); // Met à jour la liste à l'écran
+      _fetch(); 
       _updateFullPlaylist();
 
-      // Nettoyage des fichiers temporaires pour libérer l'iPhone
       if (await editedFile.exists()) await editedFile.delete();
       if (meta.containsKey('id')) {
         final tempEdit = File(p.join(dir.path, "temp_edit_${meta['id']}.mp4"));
@@ -1943,43 +2018,43 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // Moteur Instagram : Scrapers Asiatiques (Contournement Cloudflare)
+    // Moteur Instagram : Scrapers 2026 (Anti-Cloudflare avec Faux Navigateur)
     if (cleanUrl.contains('instagram')) {
-      
-      // 1. Cobalt API (Format v7 récent)
+      // On se déguise en vrai navigateur Windows pour berner Cloudflare
+      final headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+      };
+
+      // 1. API Siputzx (Très fiable actuellement)
       try {
-         final res = await Dio().post('https://api.cobalt.tools/',
-           options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)),
-           data: {"url": cleanUrl}
-         );
-         if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
+         final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', 
+            options: Options(headers: headers, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) {
+             return res.data['data'][0]['url'];
+         }
       } catch (_) {}
 
-      // 2. Siputzx (API Indonésienne très fiable)
+      // 2. API Ryzendesu (Serveur VIP gratuit)
       try {
-         final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
+         final res = await Dio().get('https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl', 
+            options: Options(headers: headers, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) {
+             return res.data['data'][0]['url'];
+         }
       } catch (_) {}
 
-      // 3. Ryzendesu (Serveur VIP gratuit)
+      // 3. API AEMT (Secours)
       try {
-         final res = await Dio().get('https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
+         final res = await Dio().get('https://aemt.me/download/igdl?url=$cleanUrl', 
+            options: Options(headers: headers, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.statusCode == 200 && res.data?['result'] != null && res.data['result'].isNotEmpty) {
+             return res.data['result'][0]['url'];
+         }
       } catch (_) {}
 
-      // 4. AEMT Serveur
-      try {
-         final res = await Dio().get('https://aemt.me/download/igdl?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data != null && res.data['result'] != null && res.data['result'].isNotEmpty) return res.data['result'][0]['url'];
-      } catch (_) {}
-
-      // 5. BK9 Serveur de secours
-      try {
-         final res = await Dio().get('https://bk9.fun/download/instagram?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data != null && res.data['BK9'] != null && res.data['BK9'].isNotEmpty) return res.data['BK9'][0]['url'];
-      } catch (_) {}
-
-      throw Exception("Toutes les API Instagram sont bloquées actuellement. Veuillez réessayer plus tard.");
+      throw Exception("Toutes les API publiques sont temporairement bloquées par Instagram. Réessayez plus tard.");
     }
 
     return null;

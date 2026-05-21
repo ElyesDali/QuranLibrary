@@ -35,7 +35,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen> {
       minDuration: const Duration(seconds: 1),
       trimStyle: TrimSliderStyle(
         positionLineColor: Colors.red,
-        positionLineWidth: 3,
+        positionLineWidth: 6,
         lineColor: Colors.grey.withOpacity(0.5),
         onTrimmingColor: const Color(0xFF7EB8C9),
         lineWidth: 4,
