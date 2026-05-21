@@ -329,6 +329,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   void _applyFilters() {
+    int? currentId = currentRecitation?['id']; // Sauvegarde l'ID unique de la piste en cours
+
     setState(() {
       if (selectedYearFilter == null) {
         displayedRecitations = allRecitations;
@@ -336,6 +338,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
         displayedRecitations = allRecitations.where((r) => r['annee'] == null).toList();
       } else {
         displayedRecitations = allRecitations.where((r) => r['annee'] == selectedYearFilter).toList();
+      }
+
+      // LE CORRECTIF ULTRA-ROBUSTE (Valable pour Ajout, Modif, Suppression et Filtres)
+      if (currentId != null) {
+        int newIndex = displayedRecitations.indexWhere((r) => r['id'] == currentId);
+        if (newIndex != -1) {
+          _playingIndex = newIndex;
+          currentRecitation = displayedRecitations[newIndex];
+        } else {
+          // Sécurité : Si la récitation en cours a été supprimée ou est masquée par un filtre d'année
+          _playingIndex = null;
+          currentRecitation = null;
+          _player.stop();
+        }
       }
     });
     _updateFullPlaylist(); 
@@ -1383,15 +1399,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
       final dir = await getApplicationDocumentsDirectory();
       
       if (meta.containsKey('id') && meta['id'] != null) {
-        // CAS 1 : MODIFICATION
+        // CAS 1 : MODIFICATION (On génère un nouveau nom pour tromper le cache du lecteur)
         int id = meta['id'];
-        String originalFileName = meta['fichier'] ?? "yt_$id.mp4"; 
-        File finalDest = File(p.join(dir.path, originalFileName));
+        String newFileName = "edited_${id}_${DateTime.now().millisecondsSinceEpoch}.mp4"; 
+        File finalDest = File(p.join(dir.path, newFileName));
         
-        if (await finalDest.exists()) await finalDest.delete();
         await editedFile.copy(finalDest.path);
 
-        // --- NOUVEAU : MISE À JOUR DE LA DURÉE ET MINIATURE DANS LA BASE DE DONNÉES ---
         try {
            final newMetadata = await MetadataRetriever.fromFile(finalDest);
            String newDur = meta['duration'] ?? "--:--"; 
@@ -1403,12 +1417,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
            String newThumb = meta['thumbnail'] ?? "";
            final thumbData = await VideoThumbnail.thumbnailData(video: finalDest.path, imageFormat: ImageFormat.JPEG, maxWidth: 300, quality: 50);
            if (thumbData != null) {
-             newThumb = "thumb_${id}_${DateTime.now().millisecondsSinceEpoch}.jpg"; // Nom unique pour forcer le rafraichissement visuel
+             newThumb = "thumb_${id}_${DateTime.now().millisecondsSinceEpoch}.jpg";
              await File(p.join(dir.path, newThumb)).writeAsBytes(thumbData);
            }
-           await _db?.update('recitations', {'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
+           
+           // NOUVEAU : On enregistre le NOUVEAU nom de fichier dans la BDD
+           await _db?.update('recitations', {'fichier': newFileName, 'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
         } catch (_) {}
-        // --------------------------------------------------------------------------------
         
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Récitation modifiée avec succès !"), backgroundColor: Colors.green));
       } else {
@@ -1903,6 +1918,17 @@ class _FormDialogState extends State<FormDialog> {
         ElevatedButton(
           style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF4A8FA3)),
           onPressed: () async {
+            // --- VIGILE ANTI-BUG (Empêche l'enregistrement sans fichier/lien) ---
+            if (_sourceType == "local" && _file.text.isEmpty) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("❌ Veuillez choisir un fichier vidéo."), backgroundColor: Colors.red));
+              return;
+            }
+            if (_sourceType != "local" && _ytUrl.text.isEmpty) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("❌ Veuillez coller un lien."), backgroundColor: Colors.red));
+              return;
+            }
+            // --------------------------------------------------------------------
+            
             try {
               String thumb = widget.rec?['thumbnail'] ?? "";
               String dur = widget.rec?['duration'] ?? "";
@@ -2018,43 +2044,45 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // Moteur Instagram : Scrapers 2026 (Anti-Cloudflare avec Faux Navigateur)
+    // Moteur Instagram : Scrapers Furtifs (Contournement Cloudflare 2026)
     if (cleanUrl.contains('instagram')) {
-      // On se déguise en vrai navigateur Windows pour berner Cloudflare
       final headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
       };
 
-      // 1. API Siputzx (Très fiable actuellement)
+      // 1. Armada Cobalt (Requêtes v7 strictes)
+      final cobaltMirrors = [
+        'https://co.wuk.sh/api/json', 
+        'https://cobalt.canarduc.dev/api/json',
+        'https://api.cobalt.tools/api/json',
+        'https://api.cobalt.bgn.tools/api/json'
+      ];
+
+      for (String mirror in cobaltMirrors) {
+         try {
+           final res = await Dio().post(mirror,
+             options: Options(headers: headers, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 8)),
+             data: {"url": cleanUrl, "vCodec": "h264", "isAudioOnly": false}
+           );
+           if (res.statusCode == 200 && res.data != null && res.data['url'] != null) return res.data['url'];
+         } catch (_) {}
+      }
+
+      // 2. API SnapSave (Le moteur utilisé par les sites web de téléchargement IG)
       try {
-         final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', 
-            options: Options(headers: headers, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) {
-             return res.data['data'][0]['url'];
-         }
+         final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
       } catch (_) {}
 
-      // 2. API Ryzendesu (Serveur VIP gratuit)
+      // 3. API Publer (Secours)
       try {
-         final res = await Dio().get('https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl', 
-            options: Options(headers: headers, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) {
-             return res.data['data'][0]['url'];
-         }
+         final res = await Dio().get('https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl', options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
+         if (res.data != null && res.data['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
       } catch (_) {}
 
-      // 3. API AEMT (Secours)
-      try {
-         final res = await Dio().get('https://aemt.me/download/igdl?url=$cleanUrl', 
-            options: Options(headers: headers, validateStatus: (_) => true, sendTimeout: const Duration(seconds: 10)));
-         if (res.statusCode == 200 && res.data?['result'] != null && res.data['result'].isNotEmpty) {
-             return res.data['result'][0]['url'];
-         }
-      } catch (_) {}
-
-      throw Exception("Toutes les API publiques sont temporairement bloquées par Instagram. Réessayez plus tard.");
+      throw Exception("L'API Instagram bloque la requête. Veuillez utiliser le 'Navigateur YouTube' intégré pour télécharger depuis un site tiers.");
     }
 
     return null;
