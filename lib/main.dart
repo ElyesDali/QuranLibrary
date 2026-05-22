@@ -163,44 +163,32 @@ class _LibraryScreenState extends State<LibraryScreen> {
     super.initState();
     _initApp();
     _player.setVolume(volume);
-    _player.setLoopMode(LoopMode.off); // CRITIQUE : Désactivation native complète pour éviter le double démarrage
+    
+    // Le moteur natif gère tout : "Auto" passe à la suite. Les autres bouclent sur eux-mêmes.
+    _player.setLoopMode(loopMode == LoopModeState.autoplay ? LoopMode.off : LoopMode.one);
 
-    // 1. L'INTERCEPTEUR CHIRURGICAL (ZÉRO BLEED, ZÉRO CUT VISIBLE, TEMPS DE REPOS)
     _positionSubscription?.cancel(); 
-    _positionSubscription = _player.positionStream.listen((position) async {
-      final duration = _player.duration;
-      if (duration != null && position.inMilliseconds > 0 && !_isSwitchingTrack) {
-        final remaining = duration.inMilliseconds - position.inMilliseconds;
-        _lastPos = position.inMilliseconds;
-        _lastDuration = duration.inMilliseconds;
+    _positionSubscription = _player.positionStream.listen((pos) {
+      int currentMs = pos.inMilliseconds;
+      int durationMs = _player.duration?.inMilliseconds ?? 0;
 
-        // On intercepte exactement à 150ms de la fin (silence de fin de fichier)
-        if (remaining <= 150) {
-          if (loopMode == LoopModeState.one) {
-            _isSwitchingTrack = true;
-            await _player.pause();
-            await _player.seek(Duration.zero, index: _playingIndex);
-            await Future.delayed(const Duration(milliseconds: 300)); // Temps de repos de 300ms demandé
-            if (loopMode == LoopModeState.one && mounted) {
-              await _player.play();
-            }
-            _isSwitchingTrack = false;
-          } else if (loopMode == LoopModeState.off) {
-            _isSwitchingTrack = true;
-            await _player.pause();
-            await _player.seek(Duration.zero, index: _playingIndex); // Reset l'actuelle à 0:00
-            _isSwitchingTrack = false;
-          }
-        }
+      // Si le mode est sur "Rien" (Off) et que le lecteur vient de reboucler nativement à 0:00
+      if (loopMode == LoopModeState.off && _lastPos > durationMs - 1000 && currentMs < 500) {
+        _player.pause(); // On fige l'audio instantanément. 100% de la fin a été lue.
       }
+      _lastPos = currentMs;
     });
 
-    // 2. MISE À JOUR DE L'INTERFACE (Uniquement lors des changements réels)
-    _player.currentIndexStream.listen((index) {
+    _player.currentIndexStream.listen((index) async {
       if (index == null || _isSwitchingTrack) return;
-      _playingIndex = index;
+      
       if (mounted && index < displayedRecitations.length) {
+         _playingIndex = index;
          setState(() => currentRecitation = displayedRecitations[index]);
+         
+         // ---> AJOUTE CES DEUX LIGNES ICI POUR ACTUALISER LA MÉMOIRE <---
+         final prefs = await SharedPreferences.getInstance();
+         prefs.setInt('last_played_id', displayedRecitations[index]['id']);
       }
     });
   }
@@ -390,14 +378,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
 
     if (sources.isNotEmpty) {
-      // 1. On récupère la dernière piste écoutée dans la mémoire du téléphone
       final prefs = await SharedPreferences.getInstance();
       int lastId = prefs.getInt('last_played_id') ?? -1;
 
-      int initialIndex = 0;
+      // On cherche si l'ancienne piste est toujours bien là (sans forcer index 0 si on ne la trouve pas)
+      int? initialIndex;
       if (lastId != -1) {
-        initialIndex = displayedRecitations.indexWhere((r) => r['id'] == lastId);
-        if (initialIndex == -1) initialIndex = 0;
+        int found = displayedRecitations.indexWhere((r) => r['id'] == lastId);
+        if (found != -1) initialIndex = found;
       }
 
       int? savedIndex = _playingIndex;
@@ -407,17 +395,28 @@ class _LibraryScreenState extends State<LibraryScreen> {
       final newPlaylist = ConcatenatingAudioSource(children: sources);
 
       if (savedIndex != null && savedIndex < sources.length) {
-        // L'appli tournait déjà, on ne perturbe pas la lecture
+        // CAS 1 : L'appli tournait déjà, on ne perturbe pas la lecture
         await _player.setAudioSource(newPlaylist, initialIndex: savedIndex, initialPosition: savedPos);
         if (wasPlaying) _player.play();
       } else {
-        // Démarrage de l'appli : on charge la dernière piste mémorisée (en pause)
-        await _player.setAudioSource(newPlaylist, initialIndex: initialIndex);
-        if (initialIndex < displayedRecitations.length) {
-           setState(() {
-             currentRecitation = displayedRecitations[initialIndex];
-             _playingIndex = initialIndex;
-           });
+        // CAS 2 : Démarrage de l'appli
+        if (initialIndex != null) {
+          // On a trouvé la dernière piste ! On l'affiche et on la prépare.
+          await _player.setAudioSource(newPlaylist, initialIndex: initialIndex);
+          if (mounted) {
+            setState(() {
+              currentRecitation = displayedRecitations[initialIndex!];
+              _playingIndex = initialIndex;
+            });
+          }
+        } else {
+          // AUCUNE piste trouvée. On respecte ton choix : on n'affiche RIEN et on laisse AirPlay vide.
+          if (mounted) {
+            setState(() {
+              currentRecitation = null;
+              _playingIndex = null;
+            });
+          }
         }
       }
     }
@@ -591,22 +590,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
     
     if (index != -1) {
       _isSwitchingTrack = true;
-      
       setState(() {
         currentRecitation = rec;
         _playingIndex = index;
       });
 
       try {
-        await _player.pause(); // <-- LE CORRECTIF AIRPLAY EST ICI (Force la réinitialisation visuelle d'iOS)
+        // On pousse la playlist dans iOS MAINTENANT, et on lance la piste
+        await _updateFullPlaylist(); 
         await _player.seek(Duration.zero, index: index);
         _player.play();
       } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("❌ Erreur de lecture : $e"), backgroundColor: Colors.red)
-          );
-        }
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e")));
       } finally {
         _isSwitchingTrack = false;
       }
@@ -629,12 +624,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
     setState(() {
       if (loopMode == LoopModeState.off) {
         loopMode = LoopModeState.autoplay;
+        _player.setLoopMode(LoopMode.off); // Laisse avancer à la suivante
       } else if (loopMode == LoopModeState.autoplay) {
         loopMode = LoopModeState.one;
+        _player.setLoopMode(LoopMode.one); // Boucle native parfaite
       } else {
         loopMode = LoopModeState.off;
+        _player.setLoopMode(LoopMode.one); // ASTUCE : Reste sur la même piste pour bloquer la suivante
       }
-      _player.setLoopMode(LoopMode.off); // Sécurité : On force le moteur d'Apple à rester OFF
     });
   }
 
@@ -2047,43 +2044,29 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // Moteur Instagram : Scrapers Multi-Passages Sécurisés
+    // Moteur Instagram : APIs 2026
     if (cleanUrl.contains('instagram')) {
       final headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept': 'application/json',
       };
 
-      // Serveur 1 : VKR Downloader (Moteur principal)
       try {
-         final res = await Dio().get('https://api.vkrdownloader.co/api?url=$cleanUrl', options: Options(headers: headers, sendTimeout: const Duration(seconds: 8)));
-         if (res.statusCode == 200 && res.data?['data']?['downloads'] != null) {
-           for (var download in res.data['data']['downloads']) {
-             if (download['type'] == 'video' || download['extension'] == 'mp4') {
-               return download['url'];
-             }
-           }
-         }
+         final res = await Dio().get('https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl', options: Options(headers: headers, sendTimeout: const Duration(seconds: 8)));
+         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
       } catch (_) {}
 
-      // Serveur 2 : Siputzx Indonésie
       try {
          final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', options: Options(headers: headers, sendTimeout: const Duration(seconds: 8)));
-         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) {
-             return res.data['data'][0]['url'];
-          }
+         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
       } catch (_) {}
 
-      // Serveur 3 : BK9 Fonctions Publiques
       try {
-         final res = await Dio().get('https://bk9.fun/download/instagram?url=$cleanUrl', options: Options(headers: headers, sendTimeout: const Duration(seconds: 8)));
-         if (res.statusCode == 200 && res.data?['BK9'] != null && res.data['BK9'].isNotEmpty) {
-           return res.data['BK9'][0]['url'];
-         }
+         final res = await Dio().post('https://api.cobalt.tools/api/json', data: {"url": cleanUrl}, options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, sendTimeout: const Duration(seconds: 8)));
+         if (res.statusCode == 200 && res.data?['url'] != null) return res.data['url'];
       } catch (_) {}
 
-      // Message d'erreur personnalisé obligatoire
-      throw Exception("Veuillez passer par le Navigateur YouTube pour télécharger cette vidéo.");
+      throw Exception("L'accès à Instagram est temporairement bloqué par leurs serveurs. Veuillez utiliser un autre lien.");
     }
 
     return null;
