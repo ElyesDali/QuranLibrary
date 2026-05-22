@@ -1211,7 +1211,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   builder: (context) => YoutubeBrowserScreen(
                     db: _db,
                     onSave: _fetch,
-                    onDownload: _launchDownloadFlow,
                   ),
                 ),
               );
