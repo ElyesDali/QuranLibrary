@@ -163,56 +163,44 @@ class _LibraryScreenState extends State<LibraryScreen> {
     super.initState();
     _initApp();
     _player.setVolume(volume);
-    
-    // On met en LOOP NATIVE quand on n'est pas en Autoplay, ce qui empêche tout "poil de son" (bleed) !
-    _player.setLoopMode(loopMode == LoopModeState.autoplay ? LoopMode.off : LoopMode.one);
+    _player.setLoopMode(LoopMode.off); // CRITIQUE : Désactivation native complète pour éviter le double démarrage
 
+    // 1. L'INTERCEPTEUR CHIRURGICAL (ZÉRO BLEED, ZÉRO CUT VISIBLE, TEMPS DE REPOS)
     _positionSubscription?.cancel(); 
     _positionSubscription = _player.positionStream.listen((position) async {
-      if (_isSwitchingTrack) return;
-      int currentMs = position.inMilliseconds;
-      int durationMs = _player.duration?.inMilliseconds ?? 0;
-      int currentIndex = _player.currentIndex ?? 0;
+      final duration = _player.duration;
+      if (duration != null && position.inMilliseconds > 0 && !_isSwitchingTrack) {
+        final remaining = duration.inMilliseconds - position.inMilliseconds;
+        _lastPos = position.inMilliseconds;
+        _lastDuration = duration.inMilliseconds;
 
-      // DETECTEUR DE BOUCLE NATURELLE (Détecte quand la piste a lu 100.0% du son et recommence)
-      if (_lastIndex == currentIndex && durationMs > 0 && _lastPos > durationMs - 1500 && currentMs < 1000) {
-          if (loopMode == LoopModeState.off) {
-              _isSwitchingTrack = true;
-              await _player.pause();
-              await _player.seek(Duration.zero);
-              _isSwitchingTrack = false;
-          } else if (loopMode == LoopModeState.one) {
-              _isSwitchingTrack = true;
-              await _player.pause();
-              await _player.seek(Duration.zero);
-              await Future.delayed(const Duration(milliseconds: 250)); // Repos doux de 250ms !
-              _player.play();
-              _isSwitchingTrack = false;
+        // On intercepte exactement à 150ms de la fin (silence de fin de fichier)
+        if (remaining <= 150) {
+          if (loopMode == LoopModeState.one) {
+            _isSwitchingTrack = true;
+            await _player.pause();
+            await _player.seek(Duration.zero, index: _playingIndex);
+            await Future.delayed(const Duration(milliseconds: 300)); // Temps de repos de 300ms demandé
+            if (loopMode == LoopModeState.one && mounted) {
+              await _player.play();
+            }
+            _isSwitchingTrack = false;
+          } else if (loopMode == LoopModeState.off) {
+            _isSwitchingTrack = true;
+            await _player.pause();
+            await _player.seek(Duration.zero, index: _playingIndex); // Reset l'actuelle à 0:00
+            _isSwitchingTrack = false;
           }
+        }
       }
-      _lastPos = currentMs;
-      _lastIndex = currentIndex;
     });
 
+    // 2. MISE À JOUR DE L'INTERFACE (Uniquement lors des changements réels)
     _player.currentIndexStream.listen((index) {
       if (index == null || _isSwitchingTrack) return;
       _playingIndex = index;
       if (mounted && index < displayedRecitations.length) {
          setState(() => currentRecitation = displayedRecitations[index]);
-      }
-    });
-
-    _player.playerStateStream.listen((state) async {
-      if (state.processingState == ProcessingState.completed) {
-        if (loopMode == LoopModeState.off) {
-          await _player.pause();
-          await _player.seek(Duration.zero, index: _playingIndex);
-        } else if (loopMode == LoopModeState.one) {
-          await _player.pause();
-          await Future.delayed(const Duration(milliseconds: 250));
-          await _player.seek(Duration.zero, index: _playingIndex);
-          _player.play();
-        }
       }
     });
   }
@@ -641,14 +629,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
     setState(() {
       if (loopMode == LoopModeState.off) {
         loopMode = LoopModeState.autoplay;
-        _player.setLoopMode(LoopMode.off);
       } else if (loopMode == LoopModeState.autoplay) {
         loopMode = LoopModeState.one;
-        _player.setLoopMode(LoopMode.one);
       } else {
         loopMode = LoopModeState.off;
-        _player.setLoopMode(LoopMode.one); // CRITIQUE : Nativement sur ONE pour bloquer le bleed de la piste suivante.
       }
+      _player.setLoopMode(LoopMode.off); // Sécurité : On force le moteur d'Apple à rester OFF
     });
   }
 
@@ -1216,18 +1202,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
           ListTile(
             leading: const Icon(Icons.language, color: Color(0xFF7EB8C9)),
-            title: const Text("Navigateur Intégré (Web)", style: TextStyle(fontWeight: FontWeight.bold)),
+            title: const Text("Navigateur YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
             onTap: () {
-              Navigator.pop(context); 
+              Navigator.pop(context);
               Navigator.push(
-                context, 
+                context,
                 MaterialPageRoute(
                   builder: (context) => YoutubeBrowserScreen(
-                    db: _db, 
+                    db: _db,
                     onSave: _fetch,
-                    onDownload: (id, url, file) => _startDownload(id, url, file),
-                  )
-                )
+                    onDownload: _launchDownloadFlow,
+                  ),
+                ),
               );
             },
           ),
@@ -2062,36 +2048,42 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // Moteur Instagram : Scraping GraphQl Natif (Direct & Infaillible sur posts publics)
+    // Moteur Instagram : Scrapers Multi-Passages Sécurisés
     if (cleanUrl.contains('instagram')) {
+      final headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+      };
+
+      // Serveur 1 : VKR Downloader (Moteur principal)
       try {
-        final res = await Dio().get(
-          "$cleanUrl${cleanUrl.endsWith('/') ? '' : '/'}?__a=1&__d=dis",
-          options: Options(
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-              'Accept-Language': 'en-US,en;q=0.5',
-            },
-            validateStatus: (_) => true,
-            sendTimeout: const Duration(seconds: 8)
-          )
-        );
-        
-        if (res.statusCode == 200 && res.data != null) {
-          final data = res.data;
-          if (data['graphql'] != null && data['graphql']['shortcode_media'] != null) {
-            return data['graphql']['shortcode_media']['video_url'];
-          } else if (data['items'] != null && data['items'].isNotEmpty) {
-            final item = data['items'][0];
-            if (item['video_versions'] != null && item['video_versions'].isNotEmpty) {
-              return item['video_versions'][0]['url'];
-            }
-          }
-        }
+         final res = await Dio().get('https://api.vkrdownloader.co/api?url=$cleanUrl', options: Options(headers: headers, sendTimeout: const Duration(seconds: 8)));
+         if (res.statusCode == 200 && res.data?['data']?['downloads'] != null) {
+           for (var download in res.data['data']['downloads']) {
+             if (download['type'] == 'video' || download['extension'] == 'mp4') {
+               return download['url'];
+             }
+           }
+         }
       } catch (_) {}
 
-      // Le texte exact que tu as demandé
+      // Serveur 2 : Siputzx Indonésie
+      try {
+         final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', options: Options(headers: headers, sendTimeout: const Duration(seconds: 8)));
+         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) {
+             return res.data['data'][0]['url'];
+          }
+      } catch (_) {}
+
+      // Serveur 3 : BK9 Fonctions Publiques
+      try {
+         final res = await Dio().get('https://bk9.fun/download/instagram?url=$cleanUrl', options: Options(headers: headers, sendTimeout: const Duration(seconds: 8)));
+         if (res.statusCode == 200 && res.data?['BK9'] != null && res.data['BK9'].isNotEmpty) {
+           return res.data['BK9'][0]['url'];
+         }
+      } catch (_) {}
+
+      // Message d'erreur personnalisé obligatoire
       throw Exception("Veuillez passer par le Navigateur YouTube pour télécharger cette vidéo.");
     }
 
