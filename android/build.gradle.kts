@@ -21,22 +21,30 @@ tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
 
-// Correctif minimaliste : Uniquement le Namespace, on laisse les SDK d'origine !
+// Correctif "Sniper" : On cible UNIQUEMENT le plugin problématique
 subprojects {
-    val configureNamespace = { p: Project ->
+    val configurePlugin = { p: Project ->
         p.plugins.withId("com.android.library") {
             val androidExt = p.extensions.findByName("android")
             if (androidExt is com.android.build.gradle.LibraryExtension) {
+                // 1. Répare l'erreur de Namespace pour tous les anciens plugins
                 if (androidExt.namespace == null) {
                     androidExt.namespace = p.group.toString()
                 }
+                
+                // 2. On force EXACTEMENT SDK 31 pour flutter_media_metadata
+                // (31 = assez récent pour lStar, assez vieux pour éviter IOException)
+                if (p.name == "flutter_media_metadata") {
+                    androidExt.compileSdk = 31
+                }
+                // NOTE: On ne met PAS de "else". sqflite gardera son SDK 35 !
             }
         }
     }
 
     if (project.state.executed) {
-        configureNamespace(project)
+        configurePlugin(project)
     } else {
-        project.afterEvaluate { configureNamespace(this) }
+        project.afterEvaluate { configurePlugin(this) }
     }
 }
