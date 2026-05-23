@@ -21,17 +21,21 @@ tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
 
-// Correctif ultra-sécurisé pour le Namespace ET l'erreur lStar
+// Aggressive override for older plugins (Namespace and compileSdk)
 subprojects {
-    plugins.withId("com.android.library") {
-        val androidExt = project.extensions.findByName("android")
-        if (androidExt is com.android.build.gradle.BaseExtension) {
-            // 1. Répare l'erreur de Namespace
-            if (androidExt.namespace == null) {
-                androidExt.namespace = project.group.toString()
+    afterEvaluate {
+        val pluginProject = this
+        // Check if the project is an Android library (which Flutter plugins are)
+        if (pluginProject.plugins.hasPlugin("com.android.library")) {
+            val androidExt = pluginProject.extensions.findByName("android")
+            if (androidExt is com.android.build.gradle.LibraryExtension) {
+                // 1. Fix the Namespace error
+                if (androidExt.namespace == null) {
+                    androidExt.namespace = pluginProject.group.toString()
+                }
+                // 2. Force compileSdk to 34 to resolve lStar resource error
+                androidExt.compileSdk = 34
             }
-            // 2. Répare l'erreur "lStar not found" en forçant le SDK récent
-            androidExt.compileSdkVersion(34)
         }
     }
 }
