@@ -21,21 +21,27 @@ tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
 
-// Aggressive override for older plugins (Namespace and compileSdk)
+// Correctif blindé : Vérifie l'état d'évaluation avant d'agir
 subprojects {
-    afterEvaluate {
-        val pluginProject = this
-        // Check if the project is an Android library (which Flutter plugins are)
-        if (pluginProject.plugins.hasPlugin("com.android.library")) {
-            val androidExt = pluginProject.extensions.findByName("android")
+    val configurePlugin = { p: Project ->
+        p.plugins.withId("com.android.library") {
+            val androidExt = p.extensions.findByName("android")
             if (androidExt is com.android.build.gradle.LibraryExtension) {
-                // 1. Fix the Namespace error
+                // 1. Répare l'erreur de Namespace
                 if (androidExt.namespace == null) {
-                    androidExt.namespace = pluginProject.group.toString()
+                    androidExt.namespace = p.group.toString()
                 }
-                // 2. Force compileSdk to 34 to resolve lStar resource error
+                // 2. Répare l'erreur "lStar not found"
                 androidExt.compileSdk = 34
             }
         }
+    }
+
+    if (project.state.executed) {
+        // Déjà évalué, on applique tout de suite !
+        configurePlugin(project)
+    } else {
+        // Pas encore évalué, on le programme !
+        project.afterEvaluate { configurePlugin(this) }
     }
 }
