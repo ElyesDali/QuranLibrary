@@ -21,7 +21,7 @@ tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
 
-// Correctif blindé : Vérifie l'état d'évaluation avant d'agir
+// Correctif chirurgical : SDK 31 pour le plugin capricieux, SDK 34 pour le reste
 subprojects {
     val configurePlugin = { p: Project ->
         p.plugins.withId("com.android.library") {
@@ -31,17 +31,20 @@ subprojects {
                 if (androidExt.namespace == null) {
                     androidExt.namespace = p.group.toString()
                 }
-                // 2. Répare l'erreur "lStar not found"
-                androidExt.compileSdk = 34
+                
+                // 2. Le "Sweet Spot" pour contourner l'erreur IOException
+                if (p.name == "flutter_media_metadata") {
+                    androidExt.compileSdk = 31
+                } else {
+                    androidExt.compileSdk = 34
+                }
             }
         }
     }
 
     if (project.state.executed) {
-        // Déjà évalué, on applique tout de suite !
         configurePlugin(project)
     } else {
-        // Pas encore évalué, on le programme !
         project.afterEvaluate { configurePlugin(this) }
     }
 }
