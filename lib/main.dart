@@ -131,7 +131,7 @@ class LibraryScreen extends StatefulWidget {
   State<LibraryScreen> createState() => _LibraryScreenState();
 }
 
-class _LibraryScreenState extends State<LibraryScreen> {
+class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserver {
   List<dynamic> allRecitations = [];
   List<dynamic> displayedRecitations = [];
   final AudioPlayer _player = AudioPlayer();
@@ -157,14 +157,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
   int _lastPos = 0;
   int _lastDuration = 0;
   int _lastIndex = 0;
+  DateTime _lastWakeUp = DateTime.now(); // NOUVEAU : Le chronomètre de réveil
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this); // On allume le radar
     _initApp();
     _player.setVolume(volume);
     
-    // Le moteur natif gère tout : "Auto" passe à la suite. Les autres bouclent sur eux-mêmes.
     _player.setLoopMode(loopMode == LoopModeState.autoplay ? LoopMode.off : LoopMode.one);
 
     _positionSubscription?.cancel(); 
@@ -172,21 +173,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
       int currentMs = pos.inMilliseconds;
       int durationMs = _player.duration?.inMilliseconds ?? 0;
 
-      // Si le mode est sur "Rien" (Off) et que le lecteur vient de reboucler nativement à 0:00
+      // FILTRE ANTI-HOQUET : On ignore les bonds temporels absurdes dans la seconde qui suit le réveil de l'app
+      if (DateTime.now().difference(_lastWakeUp).inMilliseconds < 1000) return;
+
       if (loopMode == LoopModeState.off && _lastPos > durationMs - 1000 && currentMs < 500) {
-        _player.pause(); // On fige l'audio instantanément. 100% de la fin a été lue.
+        _player.pause(); 
+        _player.seek(Duration.zero, index: _playingIndex); // Rembobine proprement
       }
       _lastPos = currentMs;
     });
 
     _player.currentIndexStream.listen((index) async {
       if (index == null || _isSwitchingTrack) return;
-      
       if (mounted && index < displayedRecitations.length) {
          _playingIndex = index;
          setState(() => currentRecitation = displayedRecitations[index]);
-         
-         // ---> AJOUTE CES DEUX LIGNES ICI POUR ACTUALISER LA MÉMOIRE <---
          final prefs = await SharedPreferences.getInstance();
          prefs.setInt('last_played_id', displayedRecitations[index]['id']);
       }
@@ -195,12 +196,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this); // On éteint le radar
     _positionSubscription?.cancel();
     _sleepTimer?.cancel();
     _countdownTimer?.cancel();
     _player.dispose();
     super.dispose();
-  } // <-- Celle-ci aussi !
+  }
 
   Future<void> _initApp() async {
     final dir = await getApplicationDocumentsDirectory();
@@ -228,22 +230,26 @@ class _LibraryScreenState extends State<LibraryScreen> {
     await _cleanupOrphans(); // L'aspirateur automatique est lancé ici !
   }
 
-  // --- L'ASPIRATEUR AUTOMATIQUE ---
   Future<void> _cleanupOrphans() async {
     if (_appDirPath == null) return;
     final dir = Directory(_appDirPath!);
     final files = dir.listSync();
     
-    // On dresse la liste des fichiers officiellement enregistrés dans l'application
+    // NOUVEAU : On récupère le chemin du brouillon pour le protéger
+    final prefs = await SharedPreferences.getInstance();
+    final draftPath = prefs.getString('draft_video_path');
+
     Set<String> validFiles = {'luhaidan.db', 'luhaidan.db-wal', 'luhaidan.db-shm'};
+    if (draftPath != null) validFiles.add(p.basename(draftPath)); // Bouclier activé !
+
     for (var rec in allRecitations) {
       if (rec['fichier'] != null) validFiles.add(p.basename(rec['fichier']));
       if (rec['thumbnail'] != null) validFiles.add(p.basename(rec['thumbnail']));
       validFiles.add("yt_${rec['id']}.mp4");
       validFiles.add("thumb_yt_${rec['id']}.jpg");
+      validFiles.add("temp_edit_${rec['id']}.mp4"); // Bouclier pour les fichiers en cours de montage !
     }
     
-    // On détruit tout ce qui n'est pas sur la liste (Les .tmp, les vieilles vidéos, etc.)
     for (var f in files) {
       if (f is File) {
         final basename = p.basename(f.path);
@@ -1584,6 +1590,19 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
     }
   }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _lastWakeUp = DateTime.now(); // On note l'heure du réveil
+      
+      // Resynchronisation AirPlay en douceur : 
+      // Si rien ne joue quand on rouvre l'app, on recharge la mémoire iOS
+      if (!_player.playing) {
+        _updateFullPlaylist();
+      }
+    }
+  }
 }
 
 class YoutubeBrowserScreen extends StatefulWidget {
@@ -1608,7 +1627,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
     late final PlatformWebViewControllerCreationParams params;
     if (WebViewPlatform.instance is WebKitWebViewPlatform) {
       params = WebKitWebViewControllerCreationParams(
-        allowsInlineMediaPlayback: true, // Désactive la terreur du plein écran auto
+        allowsInlineMediaPlayback: true,
       );
     } else {
       params = const PlatformWebViewControllerCreationParams();
@@ -1616,15 +1635,16 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
 
     _controller = WebViewController.fromPlatformCreationParams(params)
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      // On retire le faux User-Agent pour récupérer l'historique et la connexion Google !
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageFinished: (String url) {
+            // SCRIPT AGRESSIF : Force TOUTES les vidéos de la page à rester alignées
             _controller.runJavaScript("""
               const observer = new MutationObserver(() => {
                 document.querySelectorAll('video').forEach(v => {
-                  if (!v.hasAttribute('playsinline')) {
-                    v.setAttribute('playsinline', 'true');
+                  if (v.getAttribute('playsinline') !== '1') {
+                    v.setAttribute('playsinline', '1');
+                    v.setAttribute('webkit-playsinline', '1'); // La clé pour iOS !
                   }
                 });
               });
