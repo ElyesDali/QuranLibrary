@@ -20,9 +20,18 @@ import 'package:video_thumbnail/video_thumbnail.dart';
 import 'video_editor_screen.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'dart:io' show Platform;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  
+  // NOUVEAU : Initialisation spécifique pour Windows/Mac/Linux
+  if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  }
+
   await JustAudioBackground.init(
     androidNotificationChannelId: 'com.muhammad.luhaidan.app',
     androidNotificationChannelName: 'Quran Library',
@@ -520,34 +529,36 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         await tempFile.rename(localFile.path); 
         
         if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
-          try {
-             final metadata = await MetadataRetriever.fromFile(localFile);
-             String newDur = "--:--";
-             if (metadata.trackDuration != null) {
-                final d = Duration(milliseconds: metadata.trackDuration!);
-                newDur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
-             }
-             
-             String newThumb = "thumb_yt_$id.jpg";
-             final thumbData = await VideoThumbnail.thumbnailData(
-               video: localFile.path,
-               imageFormat: ImageFormat.JPEG,
-               maxWidth: 300, 
-               quality: 50,
-             );
-             
-             if (thumbData != null) {
-               final thumbFile = File(p.join(localFile.parent.path, newThumb));
-               await thumbFile.writeAsBytes(thumbData);
-             } else {
-               newThumb = ""; 
-             }
+          if (!Platform.isWindows) { // <-- PROTECTION WINDOWS
+            try {
+               final metadata = await MetadataRetriever.fromFile(localFile);
+               String newDur = "--:--";
+               if (metadata.trackDuration != null) {
+                  final d = Duration(milliseconds: metadata.trackDuration!);
+                  newDur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+               }
+               
+               String newThumb = "thumb_yt_$id.jpg";
+               final thumbData = await VideoThumbnail.thumbnailData(
+                 video: localFile.path,
+                 imageFormat: ImageFormat.JPEG,
+                 maxWidth: 300, 
+                 quality: 50,
+               );
+               
+               if (thumbData != null) {
+                 final thumbFile = File(p.join(localFile.parent.path, newThumb));
+                 await thumbFile.writeAsBytes(thumbData);
+               } else {
+                 newThumb = ""; 
+               }
 
-             if (newDur != "--:--" || newThumb.isNotEmpty) {
-                await _db?.update('recitations', {'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
-             }
-          } catch (e) {
-             debugPrint("Erreur métadonnées: $e");
+               if (newDur != "--:--" || newThumb.isNotEmpty) {
+                  await _db?.update('recitations', {'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
+               }
+            } catch (e) {
+               debugPrint("Erreur métadonnées: $e");
+            }
           }
         }
         
@@ -802,33 +813,45 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
-      // FIX SQLITE : On ferme la BDD pour forcer l'écriture du cache (WAL)
+      // 1. On ferme la BDD
       await _db?.close(); 
       
+      // PAUSE VITALE POUR WINDOWS : On lui laisse le temps de lâcher le fichier original
+      await Future.delayed(const Duration(milliseconds: 300));
+
       final dir = await getApplicationDocumentsDirectory();
-      final encoder = ZipFileEncoder();
-      final zipPath = p.join(dir.path, "QuranLibrary_Backup.zip");
       
-      encoder.create(zipPath);
+      // 2. Création du dossier "sas" temporaire
+      final tempExportDir = Directory(p.join(dir.path, 'temp_export_${DateTime.now().millisecondsSinceEpoch}'));
+      await tempExportDir.create();
       
+      // 3. Copie de la base de données dans le sas
       final dbFile = File(p.join(dir.path, 'luhaidan.db'));
       if (await dbFile.exists()) {
-        encoder.addFile(dbFile, 'luhaidan.db'); 
+        await dbFile.copy(p.join(tempExportDir.path, 'luhaidan.db')); 
       }
       
+      // 4. Copie des fichiers médias (.mp4, .jpg) dans le sas
       final files = dir.listSync();
       for (var f in files) {
         if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) {
-          encoder.addFile(f, p.basename(f.path)); 
+          await f.copy(p.join(tempExportDir.path, p.basename(f.path))); 
         }
       }
-      encoder.close();
 
-      // On rouvre la BDD pour pouvoir continuer d'utiliser l'app
+      // 5. On demande au compresseur de zipper tout le dossier d'un coup (Méthode 100% stable)
+      final zipPath = p.join(dir.path, "QuranLibrary_Backup.zip");
+      final encoder = ZipFileEncoder();
+      encoder.zipDirectory(tempExportDir, filename: zipPath);
+
+      // 6. On détruit le dossier sas pour ne pas polluer le PC
+      await tempExportDir.delete(recursive: true);
+
+      // 7. On rouvre la BDD pour pouvoir continuer d'utiliser l'app
       await _initApp(); 
 
       if (mounted) Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Fichier QuranLibrary_Backup.zip créé dans l'app Fichiers !"), backgroundColor: Colors.green));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Fichier QuranLibrary_Backup.zip créé avec succès !"), backgroundColor: Colors.green));
     } catch (e) {
       if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur d'exportation : $e"), backgroundColor: Colors.red));
@@ -1192,35 +1215,35 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
             )
           ),
           
-          ListTile(
+          // BOUCLIER WINDOWS : On cache les outils strictement mobiles
+          if (!Platform.isWindows) ...[
+            ListTile(
               leading: const Icon(Icons.movie_edit, color: Color(0xFF7EB8C9)),
               title: const Text("Éditeur Vidéo", style: TextStyle(color: Colors.white)),
               onTap: () {
-                Navigator.pop(context); // Ferme le menu latéral
-                _showVideoEditorMenu(); // Ouvre ton nouveau menu d'édition
+                Navigator.pop(context); 
+                _showVideoEditorMenu(); 
               },
             ),
-
-          const Divider(color: Colors.white24),
-
-          ListTile(
-            leading: const Icon(Icons.language, color: Color(0xFF7EB8C9)),
-            title: const Text("Navigateur YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
-            onTap: () {
-              Navigator.pop(context);
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => YoutubeBrowserScreen(
-                    db: _db,
-                    onSave: _fetch,
+            const Divider(color: Colors.white24),
+            ListTile(
+              leading: const Icon(Icons.language, color: Color(0xFF7EB8C9)),
+              title: const Text("Navigateur YouTube", style: TextStyle(fontWeight: FontWeight.bold)),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => YoutubeBrowserScreen(
+                      db: _db,
+                      onSave: _fetch,
+                    ),
                   ),
-                ),
-              );
-            },
-          ),
-          
-          const Divider(color: Colors.white24),
+                );
+              },
+            ),
+            const Divider(color: Colors.white24),
+          ],
           
           ListTile(
             leading: const Icon(Icons.upload_file, color: Colors.white70),
@@ -1990,18 +2013,21 @@ class _FormDialogState extends State<FormDialog> {
               else if (_sourceType == "local" && _file.text.isNotEmpty) {
                 final dir = await getApplicationDocumentsDirectory();
                 final localFilePath = p.join(dir.path, _file.text);
-                try {
-                  final metadata = await MetadataRetriever.fromFile(File(localFilePath));
-                  if (metadata.trackDuration != null) {
-                    final d = Duration(milliseconds: metadata.trackDuration!);
-                    dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
-                  }
-                  if (metadata.albumArt != null) {
-                    final thumbName = "thumb_${_file.text}.jpg";
-                    await File(p.join(dir.path, thumbName)).writeAsBytes(metadata.albumArt!);
-                    thumb = thumbName;
-                  }
-                } catch (e) { debugPrint("Erreur metadata: $e"); }
+                
+                if (!Platform.isWindows) { // <-- PROTECTION WINDOWS
+                  try {
+                    final metadata = await MetadataRetriever.fromFile(File(localFilePath));
+                    if (metadata.trackDuration != null) {
+                      final d = Duration(milliseconds: metadata.trackDuration!);
+                      dur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+                    }
+                    if (metadata.albumArt != null) {
+                      final thumbName = "thumb_${_file.text}.jpg";
+                      await File(p.join(dir.path, thumbName)).writeAsBytes(metadata.albumArt!);
+                      thumb = thumbName;
+                    }
+                  } catch (e) { debugPrint("Erreur metadata: $e"); }
+                }
               }
               
               final data = {
