@@ -813,45 +813,56 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
-      // 1. On ferme la BDD
+      // 1. On ferme la BDD pour relâcher la pression de Windows
       await _db?.close(); 
-      
-      // PAUSE VITALE POUR WINDOWS : On lui laisse le temps de lâcher le fichier original
-      await Future.delayed(const Duration(milliseconds: 300));
+      await Future.delayed(const Duration(milliseconds: 500)); 
 
       final dir = await getApplicationDocumentsDirectory();
+      final zipPath = p.join(dir.path, "QuranLibrary_Backup.zip");
+
+      // 2. Sécurité : Supprimer l'ancien ZIP pour éviter de corrompre le nouveau
+      final oldZip = File(zipPath);
+      if (await oldZip.exists()) await oldZip.delete();
+
+      // 3. Le "Sas" allégé : On ne copie QUE la base de données
+      final tempDbDir = Directory(p.join(dir.path, 'temp_db_${DateTime.now().millisecondsSinceEpoch}'));
+      await tempDbDir.create();
       
-      // 2. Création du dossier "sas" temporaire
-      final tempExportDir = Directory(p.join(dir.path, 'temp_export_${DateTime.now().millisecondsSinceEpoch}'));
-      await tempExportDir.create();
-      
-      // 3. Copie de la base de données dans le sas
-      final dbFile = File(p.join(dir.path, 'luhaidan.db'));
-      if (await dbFile.exists()) {
-        await dbFile.copy(p.join(tempExportDir.path, 'luhaidan.db')); 
+      final originalDb = File(p.join(dir.path, 'luhaidan.db'));
+      File? tempDb;
+      if (await originalDb.exists()) {
+        tempDb = await originalDb.copy(p.join(tempDbDir.path, 'luhaidan.db')); 
       }
-      
-      // 4. Copie des fichiers médias (.mp4, .jpg) dans le sas
+
+      // 4. Création manuelle du ZIP (la méthode qui a fait ses preuves)
+      final encoder = ZipFileEncoder();
+      encoder.create(zipPath);
+
+      // 5. On ajoute la BDD déverrouillée
+      if (tempDb != null) {
+        encoder.addFile(tempDb); 
+      }
+
+      // 6. On ajoute les médias DIRECTEMENT depuis leur emplacement
+      // (Pas de copie de vidéos = aucun risque de saturation de mémoire)
       final files = dir.listSync();
       for (var f in files) {
         if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) {
-          await f.copy(p.join(tempExportDir.path, p.basename(f.path))); 
+          encoder.addFile(f); 
         }
       }
 
-      // 5. On demande au compresseur de zipper tout le dossier d'un coup (Méthode 100% stable)
-      final zipPath = p.join(dir.path, "QuranLibrary_Backup.zip");
-      final encoder = ZipFileEncoder();
-      encoder.zipDirectory(tempExportDir, filename: zipPath);
+      // 7. CRITIQUE : Fermer l'encodeur pour finaliser l'écriture du fichier
+      encoder.close();
 
-      // 6. On détruit le dossier sas pour ne pas polluer le PC
-      await tempExportDir.delete(recursive: true);
+      // 8. Nettoyage du sas
+      await tempDbDir.delete(recursive: true);
 
-      // 7. On rouvre la BDD pour pouvoir continuer d'utiliser l'app
+      // 9. On rouvre l'app
       await _initApp(); 
 
       if (mounted) Navigator.pop(context);
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Fichier QuranLibrary_Backup.zip créé avec succès !"), backgroundColor: Colors.green));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Sauvegarde créée avec succès !"), backgroundColor: Colors.green));
     } catch (e) {
       if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur d'exportation : $e"), backgroundColor: Colors.red));
