@@ -813,18 +813,19 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
-      // 1. On ferme la BDD pour relâcher la pression de Windows
+      // 1. LE CORRECTIF WINDOWS : On coupe brutalement le lecteur pour déverrouiller les fichiers MP4
+      await _player.stop();
+
+      // 2. On ferme la BDD pour forcer l'écriture du cache
       await _db?.close(); 
-      await Future.delayed(const Duration(milliseconds: 500)); 
+      await Future.delayed(const Duration(milliseconds: 500));
 
       final dir = await getApplicationDocumentsDirectory();
       final zipPath = p.join(dir.path, "QuranLibrary_Backup.zip");
 
-      // 2. Sécurité : Supprimer l'ancien ZIP pour éviter de corrompre le nouveau
       final oldZip = File(zipPath);
       if (await oldZip.exists()) await oldZip.delete();
 
-      // 3. Le "Sas" allégé : On ne copie QUE la base de données
       final tempDbDir = Directory(p.join(dir.path, 'temp_db_${DateTime.now().millisecondsSinceEpoch}'));
       await tempDbDir.create();
       
@@ -834,31 +835,24 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         tempDb = await originalDb.copy(p.join(tempDbDir.path, 'luhaidan.db')); 
       }
 
-      // 4. Création manuelle du ZIP (la méthode qui a fait ses preuves)
       final encoder = ZipFileEncoder();
       encoder.create(zipPath);
 
-      // 5. On ajoute la BDD déverrouillée
       if (tempDb != null) {
         encoder.addFile(tempDb); 
       }
 
-      // 6. On ajoute les médias DIRECTEMENT depuis leur emplacement
-      // (Pas de copie de vidéos = aucun risque de saturation de mémoire)
       final files = dir.listSync();
       for (var f in files) {
         if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) {
+          // On ajoute le fichier directement, le lecteur ne le bloque plus !
           encoder.addFile(f); 
         }
       }
 
-      // 7. CRITIQUE : Fermer l'encodeur pour finaliser l'écriture du fichier
       encoder.close();
-
-      // 8. Nettoyage du sas
       await tempDbDir.delete(recursive: true);
-
-      // 9. On rouvre l'app
+      
       await _initApp(); 
 
       if (mounted) Navigator.pop(context);
@@ -867,6 +861,75 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       if (mounted) Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur d'exportation : $e"), backgroundColor: Colors.red));
       await _initApp();
+    }
+  }
+
+  Future<void> _importLibrary() async {
+    FilePickerResult? result = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['zip']);
+    if (result == null) return;
+
+    _showLoading("Restauration en cours...\nL'application va se figer quelques secondes, ne la fermez pas.");
+    await Future.delayed(const Duration(milliseconds: 500));
+
+    try {
+      final zipFile = File(result.files.single.path!);
+      final dir = await getApplicationDocumentsDirectory();
+      
+      final tempDir = Directory(p.join(dir.path, 'temp_restore'));
+      if (await tempDir.exists()) {
+        await tempDir.delete(recursive: true);
+      }
+      await tempDir.create();
+
+      extractFileToDisk(zipFile.path, tempDir.path);
+
+      File? extractedDb;
+      List<File> extractedMedia = [];
+      
+      final entities = tempDir.listSync(recursive: true);
+      for (var entity in entities) {
+        if (entity is File) {
+          final name = p.basename(entity.path);
+          // CORRECTIF IMPORT : On ignore la casse (Majuscules/Minuscules)
+          if (name.toLowerCase() == 'luhaidan.db') {
+            extractedDb = entity;
+          } else if (name.toLowerCase().endsWith('.mp4') || name.toLowerCase().endsWith('.jpg')) {
+            extractedMedia.add(entity);
+          }
+        }
+      }
+
+      if (extractedDb == null) {
+        throw Exception("Fichier luhaidan.db introuvable dans la sauvegarde.");
+      }
+
+      await _player.stop();
+      await _db?.close();
+      _db = null; 
+      
+      final realDbPath = p.join(dir.path, 'luhaidan.db');
+      await deleteDatabase(realDbPath); 
+      
+      await extractedDb.copy(realDbPath);
+
+      for (var mediaFile in extractedMedia) {
+        final newPath = p.join(dir.path, p.basename(mediaFile.path));
+        if (await File(newPath).exists()) {
+           await File(newPath).delete();
+        }
+        await mediaFile.copy(newPath);
+      }
+
+      await tempDir.delete(recursive: true);
+      await _initApp(); 
+
+      if (mounted) Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Bibliothèque restaurée avec succès !"), backgroundColor: Colors.green));
+      
+    } catch (e) {
+      if (mounted) Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de restauration : $e"), backgroundColor: Colors.red));
+      await _initApp(); 
     }
   }
 
