@@ -26,17 +26,17 @@ import 'dart:io' show Platform;
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  // NOUVEAU : Initialisation spécifique pour Windows/Mac/Linux
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
+  } else {
+    // CORRECTIF CRASH : On lance l'audio en arrière-plan UNIQUEMENT sur mobile
+    await JustAudioBackground.init(
+      androidNotificationChannelId: 'com.muhammad.luhaidan.app',
+      androidNotificationChannelName: 'Quran Library',
+      androidNotificationOngoing: true,
+    );
   }
-
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.muhammad.luhaidan.app',
-    androidNotificationChannelName: 'Quran Library',
-    androidNotificationOngoing: true,
-  );
   runApp(const QuranLibraryApp());
 }
 
@@ -214,11 +214,20 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   }
 
   Future<void> _initApp() async {
-    final dir = await getApplicationDocumentsDirectory();
-    _appDirPath = dir.path;
+    // 1. On lit le dossier personnalisé s'il existe
+    final prefs = await SharedPreferences.getInstance();
+    final customPath = prefs.getString('custom_storage_path');
+
+    if (customPath != null && Directory(customPath).existsSync()) {
+      _appDirPath = customPath;
+    } else {
+      final dir = await getApplicationDocumentsDirectory();
+      _appDirPath = dir.path;
+    }
+
     await ProxyServer.start(); 
 
-    final path = p.join(dir.path, 'luhaidan.db');
+    final path = p.join(_appDirPath!, 'luhaidan.db');
     _db = await openDatabase(
       path,
       version: 3, 
@@ -236,7 +245,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       }
     );
     await _fetch();
-    await _cleanupOrphans(); // L'aspirateur automatique est lancé ici !
+    await _cleanupOrphans(); 
   }
 
   Future<void> _cleanupOrphans() async {
@@ -377,19 +386,22 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         uri = Uri.file(_resolvePath(path));
       }
       
-      final baseSource = AudioSource.uri(uri, tag: _createMediaItem(rec));
+      // --- DÉBUT DU BLOC CORRIGÉ ---
+      final tag = Platform.isWindows ? null : _createMediaItem(rec);
+      final baseSource = AudioSource.uri(uri, tag: tag);
       
       if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
          try {
            final parts = rec['duration'].toString().split(':');
            if (parts.length == 2) {
              final dur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
-             sources.add(ClippingAudioSource(child: baseSource, end: dur, tag: _createMediaItem(rec)));
+             sources.add(ClippingAudioSource(child: baseSource, end: dur, tag: tag));
              continue;
            }
          } catch (_) {}
       }
       sources.add(baseSource);
+      // --- FIN DU BLOC CORRIGÉ ---
     }
 
     if (sources.isNotEmpty) {
@@ -817,7 +829,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       await _db?.close(); 
       await Future.delayed(const Duration(milliseconds: 500));
 
-      final dir = await getApplicationDocumentsDirectory();
+      final dir = Directory(_appDirPath!);
       final zipPath = p.join(dir.path, "QuranLibrary_Backup.zip");
 
       final oldZip = File(zipPath);
@@ -861,32 +873,49 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
     try {
       final zipFile = File(result.files.single.path!);
-      final dir = await getApplicationDocumentsDirectory();
+      final dir = Directory(_appDirPath!);
       
       final tempDir = Directory(p.join(dir.path, 'temp_restore'));
       if (await tempDir.exists()) await tempDir.delete(recursive: true);
       await tempDir.create();
 
-      extractFileToDisk(zipFile.path, tempDir.path);
-
       File? extractedDb;
+      File? extractedWal;
+      File? extractedShm;
       List<File> extractedMedia = [];
-      
-      final entities = tempDir.listSync(recursive: true);
-      for (var entity in entities) {
-        if (entity is File) {
-          // LE CORRECTIF IMPORT : Tolérance totale (majuscules, extensions masquées, sous-dossiers)
-          final pathLower = entity.path.toLowerCase();
-          if (pathLower.endsWith('luhaidan.db') || pathLower.endsWith('luhaidan')) {
-            extractedDb = entity;
-          } else if (pathLower.endsWith('.mp4') || pathLower.endsWith('.jpg') || pathLower.endsWith('.mov')) {
-            extractedMedia.add(entity);
-          }
+
+      final bytes = await zipFile.readAsBytes();
+      final archive = ZipDecoder().decodeBytes(bytes);
+
+      for (var file in archive) {
+        final filename = file.name;
+        final safeName = filename.split(RegExp(r'[/\\]')).last;
+        
+        if (!file.isFile || filename.contains('__MACOSX') || safeName.startsWith('._') || safeName.isEmpty) {
+          continue;
+        }
+
+        final cleanName = safeName.toLowerCase();
+        final destPath = p.join(tempDir.path, safeName);
+        
+        final extractedFile = File(destPath);
+        final content = file.content as List<int>;
+        await extractedFile.writeAsBytes(content);
+
+        // LE CORRECTIF EST ICI : Noms stricts pour ne jamais confondre avec une vidéo !
+        if (cleanName == 'luhaidan.db') {
+          extractedDb = extractedFile;
+        } else if (cleanName == 'luhaidan.db-wal') {
+          extractedWal = extractedFile;
+        } else if (cleanName == 'luhaidan.db-shm') {
+          extractedShm = extractedFile;
+        } else if (cleanName.endsWith('.mp4') || cleanName.endsWith('.jpg') || cleanName.endsWith('.mov')) {
+          extractedMedia.add(extractedFile);
         }
       }
 
       if (extractedDb == null) {
-        throw Exception("Fichier de base de données introuvable dans l'archive.");
+        throw Exception("Fichier luhaidan.db introuvable. Assurez-vous que le ZIP contient bien la base de données.");
       }
 
       await _player.stop();
@@ -894,9 +923,18 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       _db = null; 
       
       final realDbPath = p.join(dir.path, 'luhaidan.db');
-      if (await File(realDbPath).exists()) await deleteDatabase(realDbPath); 
+      final realWalPath = p.join(dir.path, 'luhaidan.db-wal');
+      final realShmPath = p.join(dir.path, 'luhaidan.db-shm');
+
+      // Nettoyage de l'ancienne base et de ses caches
+      if (await File(realDbPath).exists()) await File(realDbPath).delete(); 
+      if (await File(realWalPath).exists()) await File(realWalPath).delete(); 
+      if (await File(realShmPath).exists()) await File(realShmPath).delete(); 
       
+      // Copie de la nouvelle base (et de ses caches manuels s'ils existent)
       await extractedDb.copy(realDbPath);
+      if (extractedWal != null) await extractedWal.copy(realWalPath);
+      if (extractedShm != null) await extractedShm.copy(realShmPath);
 
       for (var mediaFile in extractedMedia) {
         final newPath = p.join(dir.path, p.basename(mediaFile.path));
@@ -1240,6 +1278,18 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
             onTap: () { 
               Navigator.pop(context); 
               _importLibrary(); 
+            }
+          ),
+
+          const Divider(color: Colors.white24),
+          
+          ListTile(
+            leading: const Icon(Icons.folder_special, color: Colors.orange),
+            title: const Text("Dossier de stockage"),
+            subtitle: Text(_appDirPath ?? "Par défaut", style: const TextStyle(fontSize: 10, color: Colors.grey), maxLines: 1, overflow: TextOverflow.ellipsis),
+            onTap: () {
+              Navigator.pop(context);
+              _changeStorageDirectory();
             }
           ),
           
@@ -1605,6 +1655,50 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       if (!_player.playing) {
         _updateFullPlaylist();
       }
+    }
+  }
+
+  Future<void> _changeStorageDirectory() async {
+    // Ouvre l'explorateur Windows pour choisir un dossier
+    String? newPath = await FilePicker.getDirectoryPath(dialogTitle: "Sélectionnez le nouveau dossier de stockage");
+    
+    if (newPath == null || newPath == _appDirPath) return;
+
+    _showLoading("Transfert des données vers le nouveau dossier...\nNe fermez pas l'application.");
+    await Future.delayed(const Duration(milliseconds: 500));
+
+    try {
+      await _player.stop();
+      await _db?.close();
+      _db = null;
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      final oldDir = Directory(_appDirPath!);
+      final files = oldDir.listSync();
+
+      // On déplace physiquement tous les fichiers
+      for (var f in files) {
+        if (f is File) {
+          final name = p.basename(f.path);
+          if (name.startsWith('luhaidan.db') || name.endsWith('.mp4') || name.endsWith('.jpg') || name.endsWith('.mov')) {
+            final newFile = File(p.join(newPath, name));
+            await f.copy(newFile.path); // On copie (sécurisé entre différents disques durs)
+            await f.delete(); // On supprime l'original
+          }
+        }
+      }
+
+      // On sauvegarde le nouveau chemin dans les paramètres
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('custom_storage_path', newPath);
+
+      await _initApp(); // On relance la machine sur le nouveau dossier
+      if (mounted) Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Transfert réussi !"), backgroundColor: Colors.green));
+    } catch (e) {
+      if (mounted) Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur lors du transfert : $e"), backgroundColor: Colors.red));
+      await _initApp(); // Sécurité : on relance quand même
     }
   }
 }
