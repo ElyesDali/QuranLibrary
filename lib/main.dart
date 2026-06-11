@@ -809,14 +809,11 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   }
 
   Future<void> _exportLibrary() async {
-    _showLoading("Création de la sauvegarde en cours...\nL'application va se figer quelques secondes, ne la fermez pas.");
+    _showLoading("Création de la sauvegarde...\nNe fermez pas l'application.");
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
-      // 1. LE CORRECTIF WINDOWS : On coupe brutalement le lecteur pour déverrouiller les fichiers MP4
       await _player.stop();
-
-      // 2. On ferme la BDD pour forcer l'écriture du cache
       await _db?.close(); 
       await Future.delayed(const Duration(milliseconds: 500));
 
@@ -826,33 +823,24 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       final oldZip = File(zipPath);
       if (await oldZip.exists()) await oldZip.delete();
 
-      final tempDbDir = Directory(p.join(dir.path, 'temp_db_${DateTime.now().millisecondsSinceEpoch}'));
-      await tempDbDir.create();
-      
-      final originalDb = File(p.join(dir.path, 'luhaidan.db'));
-      File? tempDb;
-      if (await originalDb.exists()) {
-        tempDb = await originalDb.copy(p.join(tempDbDir.path, 'luhaidan.db')); 
-      }
-
       final encoder = ZipFileEncoder();
       encoder.create(zipPath);
 
-      if (tempDb != null) {
-        encoder.addFile(tempDb); 
+      final originalDb = File(p.join(dir.path, 'luhaidan.db'));
+      if (await originalDb.exists()) {
+        // LE CORRECTIF WINDOWS : On force uniquement le nom court !
+        encoder.addFile(originalDb, 'luhaidan.db'); 
       }
 
       final files = dir.listSync();
       for (var f in files) {
         if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) {
-          // On ajoute le fichier directement, le lecteur ne le bloque plus !
-          encoder.addFile(f); 
+          // LE CORRECTIF WINDOWS : On force uniquement le nom court !
+          encoder.addFile(f, p.basename(f.path)); 
         }
       }
 
       encoder.close();
-      await tempDbDir.delete(recursive: true);
-      
       await _initApp(); 
 
       if (mounted) Navigator.pop(context);
@@ -868,7 +856,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     FilePickerResult? result = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: ['zip']);
     if (result == null) return;
 
-    _showLoading("Restauration en cours...\nL'application va se figer quelques secondes, ne la fermez pas.");
+    _showLoading("Restauration en cours...\nNe fermez pas l'application.");
     await Future.delayed(const Duration(milliseconds: 500));
 
     try {
@@ -876,9 +864,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       final dir = await getApplicationDocumentsDirectory();
       
       final tempDir = Directory(p.join(dir.path, 'temp_restore'));
-      if (await tempDir.exists()) {
-        await tempDir.delete(recursive: true);
-      }
+      if (await tempDir.exists()) await tempDir.delete(recursive: true);
       await tempDir.create();
 
       extractFileToDisk(zipFile.path, tempDir.path);
@@ -889,18 +875,18 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       final entities = tempDir.listSync(recursive: true);
       for (var entity in entities) {
         if (entity is File) {
-          final name = p.basename(entity.path);
-          // CORRECTIF IMPORT : On ignore la casse (Majuscules/Minuscules)
-          if (name.toLowerCase() == 'luhaidan.db') {
+          // LE CORRECTIF IMPORT : Tolérance totale (majuscules, extensions masquées, sous-dossiers)
+          final pathLower = entity.path.toLowerCase();
+          if (pathLower.endsWith('luhaidan.db') || pathLower.endsWith('luhaidan')) {
             extractedDb = entity;
-          } else if (name.toLowerCase().endsWith('.mp4') || name.toLowerCase().endsWith('.jpg')) {
+          } else if (pathLower.endsWith('.mp4') || pathLower.endsWith('.jpg') || pathLower.endsWith('.mov')) {
             extractedMedia.add(entity);
           }
         }
       }
 
       if (extractedDb == null) {
-        throw Exception("Fichier luhaidan.db introuvable dans la sauvegarde.");
+        throw Exception("Fichier de base de données introuvable dans l'archive.");
       }
 
       await _player.stop();
@@ -908,15 +894,13 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       _db = null; 
       
       final realDbPath = p.join(dir.path, 'luhaidan.db');
-      await deleteDatabase(realDbPath); 
+      if (await File(realDbPath).exists()) await deleteDatabase(realDbPath); 
       
       await extractedDb.copy(realDbPath);
 
       for (var mediaFile in extractedMedia) {
         final newPath = p.join(dir.path, p.basename(mediaFile.path));
-        if (await File(newPath).exists()) {
-           await File(newPath).delete();
-        }
+        if (await File(newPath).exists()) await File(newPath).delete();
         await mediaFile.copy(newPath);
       }
 
@@ -2066,7 +2050,6 @@ class _FormDialogState extends State<FormDialog> {
   }
 }
 
-// --- EXTRACTEUR MULTI-SERVEURS BLINDÉ (ARMADA) ---
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
     String cleanUrl = targetUrl.trim();
@@ -2079,7 +2062,7 @@ class MediaExtractor {
     // Moteur TikTok
     if (cleanUrl.contains('tiktok')) {
       try {
-        final res = await Dio().post('https://www.tikwm.com/api/', data: FormData.fromMap({'url': cleanUrl, 'hd': 1}), options: Options(validateStatus: (_) => true, sendTimeout: const Duration(seconds: 15)));
+        final res = await Dio().post('https://www.tikwm.com/api/', data: FormData.fromMap({'url': cleanUrl, 'hd': 1}));
         if (res.data != null && res.data['data'] != null && res.data['data']['play'] != null) {
            String playUrl = res.data['data']['play'].toString();
            return playUrl.startsWith('//') ? 'https:$playUrl' : playUrl;
@@ -2087,29 +2070,53 @@ class MediaExtractor {
       } catch (_) {}
     }
 
-    // Moteur Instagram : APIs 2026
+    // NOUVELLE SOLUTION INSTAGRAM : Multi-serveurs yt-dlp distants (Cobalt v11)
     if (cleanUrl.contains('instagram')) {
-      final headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-      };
+      
+      // Liste de serveurs publics faisant tourner yt-dlp 
+      final List<String> ytDlpServers = [
+        'https://api.cobalt.tools/', // Serveur officiel (API v11)
+        'https://co.wuk.sh/',        // Instance européenne populaire
+        'https://cobalt.chathelp.ru/' // Instance de secours
+      ];
 
+      for (String server in ytDlpServers) {
+        try {
+          final res = await Dio().post(
+            server,
+            data: {"url": cleanUrl},
+            options: Options(
+              headers: {
+                'Accept': 'application/json', // Requis par la nouvelle norme
+                'Content-Type': 'application/json',
+                // On se fait passer pour ton iPhone pour ne pas alerter les pare-feux
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)' 
+              },
+              sendTimeout: const Duration(seconds: 6),
+            )
+          );
+          
+          if (res.statusCode == 200 && res.data != null) {
+            // Le serveur yt-dlp a réussi, il nous renvoie le lien MP4 direct
+            if (res.data['url'] != null) return res.data['url'];
+          }
+        } catch (_) {
+          continue; // Si un serveur plante, on passe silencieusement au suivant
+        }
+      }
+      
+      // Scraper traditionnel en ultime recours si les serveurs yt-dlp sont saturés
       try {
-         final res = await Dio().get('https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl', options: Options(headers: headers, sendTimeout: const Duration(seconds: 8)));
-         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
+         final res = await Dio().get(
+           'https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl', 
+           options: Options(sendTimeout: const Duration(seconds: 5))
+         );
+         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) {
+           return res.data['data'][0]['url'];
+         }
       } catch (_) {}
 
-      try {
-         final res = await Dio().get('https://api.siputzx.my.id/api/d/igdl?url=$cleanUrl', options: Options(headers: headers, sendTimeout: const Duration(seconds: 8)));
-         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) return res.data['data'][0]['url'];
-      } catch (_) {}
-
-      try {
-         final res = await Dio().post('https://api.cobalt.tools/api/json', data: {"url": cleanUrl}, options: Options(headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, sendTimeout: const Duration(seconds: 8)));
-         if (res.statusCode == 200 && res.data?['url'] != null) return res.data['url'];
-      } catch (_) {}
-
-      throw Exception("L'accès à Instagram est temporairement bloqué par leurs serveurs. Veuillez utiliser un autre lien.");
+      throw Exception("L'accès à la vidéo Instagram a été rejeté par les serveurs. Le lien est peut-être privé.");
     }
 
     return null;
