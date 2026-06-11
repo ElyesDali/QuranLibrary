@@ -26,11 +26,14 @@ import 'dart:io' show Platform;
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
+  // LE DÉFIBRILLATEUR : On efface la mémoire de la dernière piste pour casser la boucle de crash
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.remove('last_played_id'); 
+
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   } else {
-    // CORRECTIF CRASH : On lance l'audio en arrière-plan UNIQUEMENT sur mobile
     await JustAudioBackground.init(
       androidNotificationChannelId: 'com.muhammad.luhaidan.app',
       androidNotificationChannelName: 'Quran Library',
@@ -214,38 +217,62 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   }
 
   Future<void> _initApp() async {
-    // 1. On lit le dossier personnalisé s'il existe
-    final prefs = await SharedPreferences.getInstance();
-    final customPath = prefs.getString('custom_storage_path');
+    try {
+      // 1. On récupère le chemin personnalisé
+      final prefs = await SharedPreferences.getInstance();
+      final customPath = prefs.getString('custom_storage_path');
 
-    if (customPath != null && Directory(customPath).existsSync()) {
-      _appDirPath = customPath;
-    } else {
+      if (customPath != null && Directory(customPath).existsSync()) {
+        _appDirPath = customPath;
+      } else {
+        final dir = await getApplicationDocumentsDirectory();
+        _appDirPath = dir.path;
+      }
+
+      await ProxyServer.start(); 
+
+      final path = p.join(_appDirPath!, 'luhaidan.db');
+      
+      // SÉCURITÉ : Si le fichier de BDD fait 0 octet (copie ratée), on le supprime pour éviter le crash
+      final dbFile = File(path);
+      if (await dbFile.exists() && await dbFile.length() == 0) {
+        await dbFile.delete();
+      }
+
+      // 2. Ouverture sécurisée de la base de données
+      _db = await openDatabase(
+        path,
+        version: 3, 
+        onCreate: (db, version) => db.execute(
+          'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, annee_g INTEGER, fichier TEXT, versets TEXT, thumbnail TEXT, duration TEXT)'
+        ),
+        onUpgrade: (db, oldV, newV) {
+          if (oldV < 2) {
+            db.execute('ALTER TABLE recitations ADD COLUMN thumbnail TEXT');
+            db.execute('ALTER TABLE recitations ADD COLUMN duration TEXT');
+          }
+          if (oldV < 3) {
+            try { db.execute('ALTER TABLE recitations ADD COLUMN annee_g INTEGER'); } catch (_) {}
+          }
+        }
+      );
+      
+      await _fetch();
+      try { await _cleanupOrphans(); } catch (_) {}
+      
+    } catch (e) {
+      // CELLULE DE SECOURS : Si le dossier personnalisé ou la BDD crashe, on réinitialise tout par défaut
+      debugPrint("Mode secours activé : $e");
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('custom_storage_path'); // On oublie le mauvais dossier
+      
       final dir = await getApplicationDocumentsDirectory();
       _appDirPath = dir.path;
+      
+      final fallbackPath = p.join(_appDirPath!, 'luhaidan.db');
+      _db = await openDatabase(fallbackPath, version: 3);
+      await _fetch();
     }
-
-    await ProxyServer.start(); 
-
-    final path = p.join(_appDirPath!, 'luhaidan.db');
-    _db = await openDatabase(
-      path,
-      version: 3, 
-      onCreate: (db, version) => db.execute(
-        'CREATE TABLE recitations(id INTEGER PRIMARY KEY AUTOINCREMENT, sourate_num INTEGER, sourate_name TEXT, annee INTEGER, annee_g INTEGER, fichier TEXT, versets TEXT, thumbnail TEXT, duration TEXT)'
-      ),
-      onUpgrade: (db, oldV, newV) {
-        if (oldV < 2) {
-          db.execute('ALTER TABLE recitations ADD COLUMN thumbnail TEXT');
-          db.execute('ALTER TABLE recitations ADD COLUMN duration TEXT');
-        }
-        if (oldV < 3) {
-          try { db.execute('ALTER TABLE recitations ADD COLUMN annee_g INTEGER'); } catch (_) {}
-        }
-      }
-    );
-    await _fetch();
-    await _cleanupOrphans(); 
   }
 
   Future<void> _cleanupOrphans() async {
@@ -371,23 +398,32 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   }
 
   Future<void> _updateFullPlaylist() async {
+    // Cette fonction n'est désormais appelée que sur Mobile pour stabiliser le PC
+    if (Platform.isWindows) return;
+
     List<AudioSource> sources = [];
+
     for (var rec in displayedRecitations) {
       String path = rec['fichier'] ?? "";
       Uri uri;
+
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
         final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
-        if (await localFile.exists() && await localFile.length() > 100000) { 
+        if (await localFile.exists() && await localFile.length() > 50000) {
           uri = Uri.file(localFile.path);
         } else {
           uri = Uri.parse(ProxyServer.getProxyUrl(path)); 
         }
       } else {
-        uri = Uri.file(_resolvePath(path));
+        String resolved = _resolvePath(path);
+        if (resolved.startsWith('http') || resolved.startsWith('https')) {
+          uri = Uri.parse(resolved); // Correctif crucial : allocation réseau propre
+        } else {
+          uri = Uri.file(resolved);
+        }
       }
-      
-      // --- DÉBUT DU BLOC CORRIGÉ ---
-      final tag = Platform.isWindows ? null : _createMediaItem(rec);
+
+      final tag = _createMediaItem(rec);
       final baseSource = AudioSource.uri(uri, tag: tag);
       
       if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
@@ -401,51 +437,13 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
          } catch (_) {}
       }
       sources.add(baseSource);
-      // --- FIN DU BLOC CORRIGÉ ---
     }
 
     if (sources.isNotEmpty) {
-      final prefs = await SharedPreferences.getInstance();
-      int lastId = prefs.getInt('last_played_id') ?? -1;
-
-      // On cherche si l'ancienne piste est toujours bien là (sans forcer index 0 si on ne la trouve pas)
-      int? initialIndex;
-      if (lastId != -1) {
-        int found = displayedRecitations.indexWhere((r) => r['id'] == lastId);
-        if (found != -1) initialIndex = found;
-      }
-
-      int? savedIndex = _playingIndex;
-      Duration savedPos = _player.position;
-      bool wasPlaying = _player.playing;
-
       final newPlaylist = ConcatenatingAudioSource(children: sources);
-
-      if (savedIndex != null && savedIndex < sources.length) {
-        // CAS 1 : L'appli tournait déjà, on ne perturbe pas la lecture
-        await _player.setAudioSource(newPlaylist, initialIndex: savedIndex, initialPosition: savedPos);
-        if (wasPlaying) _player.play();
-      } else {
-        // CAS 2 : Démarrage de l'appli
-        if (initialIndex != null) {
-          // On a trouvé la dernière piste ! On l'affiche et on la prépare.
-          await _player.setAudioSource(newPlaylist, initialIndex: initialIndex);
-          if (mounted) {
-            setState(() {
-              currentRecitation = displayedRecitations[initialIndex!];
-              _playingIndex = initialIndex;
-            });
-          }
-        } else {
-          // AUCUNE piste trouvée. On respecte ton choix : on n'affiche RIEN et on laisse AirPlay vide.
-          if (mounted) {
-            setState(() {
-              currentRecitation = null;
-              _playingIndex = null;
-            });
-          }
-        }
-      }
+      try {
+        await _player.setAudioSource(newPlaylist);
+      } catch (_) {}
     }
   }
 
@@ -616,24 +614,69 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
   Future<void> _play(Map<String, dynamic> rec) async {
     int index = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
-    
-    if (index != -1) {
+    if (index == -1) return;
+
+    String path = rec['fichier'] ?? "";
+    Uri uri;
+
+    try {
+      // 1. Détermination de l'URI et nettoyage des fichiers corrompus
+      if (path.contains('youtube') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
+        final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
+        if (await localFile.exists()) {
+          if (await localFile.length() < 50000) {
+            await localFile.delete(); // Suppression du fichier cassé
+            uri = Uri.parse(ProxyServer.getProxyUrl(path));
+          } else {
+            uri = Uri.file(localFile.path);
+          }
+        } else {
+          uri = Uri.parse(ProxyServer.getProxyUrl(path));
+        }
+      } else {
+        String resolved = _resolvePath(path);
+        if (resolved.startsWith('http') || resolved.startsWith('https')) {
+          uri = Uri.parse(resolved);
+        } else {
+          final f = File(resolved);
+          if (await f.exists() && await f.length() < 1000) {
+            await f.delete(); // Élimination des fichiers à 0 octet
+          }
+          if (!await f.exists()) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                content: Text("❌ Fichier introuvable sur le disque. Veuillez retélécharger la récitation."), 
+                backgroundColor: Colors.red
+              ));
+            }
+            return; // Blocage de sécurité : on n'envoie rien au lecteur
+          }
+          uri = Uri.file(resolved);
+        }
+      }
+
       _isSwitchingTrack = true;
       setState(() {
         currentRecitation = rec;
         _playingIndex = index;
       });
 
-      try {
-        // On pousse la playlist dans iOS MAINTENANT, et on lance la piste
+      // 2. DISPOSITIF ANTI-CRASH : Traitement différencié selon la plateforme
+      if (Platform.isWindows) {
+        // Mode Direct : On injecte la piste unique. Sécurité absolue sur PC.
+        await _player.setAudioSource(AudioSource.uri(uri));
+        _player.play();
+      } else {
+        // Mode Playlist : Préservé pour l'iPhone et le comportement en tâche de fond
         await _updateFullPlaylist(); 
         await _player.seek(Duration.zero, index: index);
         _player.play();
-      } catch (e) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e")));
-      } finally {
-        _isSwitchingTrack = false;
       }
+
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de lecture : $e"), backgroundColor: Colors.red));
+    } finally {
+      _isSwitchingTrack = false;
     }
   }
 
