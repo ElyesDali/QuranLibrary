@@ -196,7 +196,9 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     });
 
     _player.currentIndexStream.listen((index) async {
-      if (index == null || _isSwitchingTrack) return;
+      // CORRECTIF 1 : On coupe ce radar sur Windows, car on n'utilise plus de playlist !
+      if (Platform.isWindows || index == null || _isSwitchingTrack) return;
+      
       if (mounted && index < displayedRecitations.length) {
          _playingIndex = index;
          setState(() => currentRecitation = displayedRecitations[index]);
@@ -204,6 +206,17 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
          prefs.setInt('last_played_id', displayedRecitations[index]['id']);
       }
     });
+
+    // CORRECTIF 2 : Le passage automatique à la piste suivante sur Windows
+    if (Platform.isWindows) {
+      _player.playerStateStream.listen((state) {
+        if (state.processingState == ProcessingState.completed) {
+          if (_playingIndex != null && _playingIndex! < displayedRecitations.length - 1) {
+            _play(displayedRecitations[_playingIndex! + 1]);
+          }
+        }
+      });
+    }
   }
 
   @override
@@ -620,12 +633,11 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     Uri uri;
 
     try {
-      // 1. Détermination de l'URI et nettoyage des fichiers corrompus
       if (path.contains('youtube') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
         final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
         if (await localFile.exists()) {
           if (await localFile.length() < 50000) {
-            await localFile.delete(); // Suppression du fichier cassé
+            await localFile.delete(); 
             uri = Uri.parse(ProxyServer.getProxyUrl(path));
           } else {
             uri = Uri.file(localFile.path);
@@ -640,7 +652,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         } else {
           final f = File(resolved);
           if (await f.exists() && await f.length() < 1000) {
-            await f.delete(); // Élimination des fichiers à 0 octet
+            await f.delete(); 
           }
           if (!await f.exists()) {
             if (mounted) {
@@ -649,7 +661,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                 backgroundColor: Colors.red
               ));
             }
-            return; // Blocage de sécurité : on n'envoie rien au lecteur
+            return; 
           }
           uri = Uri.file(resolved);
         }
@@ -661,20 +673,24 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         _playingIndex = index;
       });
 
-      // 2. DISPOSITIF ANTI-CRASH : Traitement différencié selon la plateforme
       if (Platform.isWindows) {
-        // Mode Direct : On injecte la piste unique. Sécurité absolue sur PC.
-        await _player.setAudioSource(AudioSource.uri(uri));
+        // CORRECTIF 1 : On attache manuellement le "tag" (le titre et l'image) à la piste unique !
+        final tag = _createMediaItem(rec);
+        await _player.setAudioSource(AudioSource.uri(uri, tag: tag));
         _player.play();
       } else {
-        // Mode Playlist : Préservé pour l'iPhone et le comportement en tâche de fond
         await _updateFullPlaylist(); 
         await _player.seek(Duration.zero, index: index);
         _player.play();
       }
 
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de lecture : $e"), backgroundColor: Colors.red));
+      // CORRECTIF 1 : On filtre l'erreur d'interruption naturelle du lecteur
+      if (e.toString().contains('interrupted') || e.toString().contains('Interruption')) {
+        debugPrint("Chargement interrompu pour changer de piste (Ignoré).");
+      } else {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de lecture : $e"), backgroundColor: Colors.red));
+      }
     } finally {
       _isSwitchingTrack = false;
     }
@@ -878,24 +894,33 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       final oldZip = File(zipPath);
       if (await oldZip.exists()) await oldZip.delete();
 
-      final encoder = ZipFileEncoder();
-      encoder.create(zipPath);
+      // CORRECTIF 2A : Un nom unique pour ne jamais subir de conflit avec un vieux dossier
+      final tempDir = Directory(p.join(dir.path, "temp_export_${DateTime.now().millisecondsSinceEpoch}"));
+      await tempDir.create();
 
       final originalDb = File(p.join(dir.path, 'luhaidan.db'));
       if (await originalDb.exists()) {
-        // LE CORRECTIF WINDOWS : On force uniquement le nom court !
-        encoder.addFile(originalDb, 'luhaidan.db'); 
+        await originalDb.copy(p.join(tempDir.path, 'luhaidan.db')); 
       }
 
       final files = dir.listSync();
       for (var f in files) {
         if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) {
-          // LE CORRECTIF WINDOWS : On force uniquement le nom court !
-          encoder.addFile(f, p.basename(f.path)); 
+          await f.copy(p.join(tempDir.path, p.basename(f.path))); 
         }
       }
 
-      encoder.close();
+      final encoder = ZipFileEncoder();
+      encoder.zipDirectory(tempDir, filename: zipPath);
+
+      // CORRECTIF 2B : On laisse Windows souffler, et on ignore l'erreur si la suppression est bloquée
+      await Future.delayed(const Duration(milliseconds: 500));
+      try {
+        await tempDir.delete(recursive: true);
+      } catch (_) {
+        debugPrint("Dossier temporaire verrouillé par Windows, ignoré.");
+      }
+      
       await _initApp(); 
 
       if (mounted) Navigator.pop(context);
@@ -1173,7 +1198,8 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                       max: maxDur,
                       onChanged: (v) => setState(() => _dragValue = v),
                       onChangeEnd: (v) {
-                        _player.seek(Duration(seconds: v.toInt()), index: _playingIndex);
+                        // CORRECTIF 3 : On retire l'index pour cibler la piste unique !
+                        _player.seek(Duration(seconds: v.toInt()));
                         setState(() => _dragValue = null);
                       },
                     ),
@@ -2190,72 +2216,23 @@ class _FormDialogState extends State<FormDialog> {
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
     String cleanUrl = targetUrl.trim();
-    if (cleanUrl.toLowerCase().startsWith('http')) {
-      cleanUrl = cleanUrl.replaceFirst(RegExp(r'^https?', caseSensitive: false), 'https');
-    }
-    if (cleanUrl.contains('?')) cleanUrl = cleanUrl.split('?').first;
-    if (cleanUrl.endsWith('/')) cleanUrl = cleanUrl.substring(0, cleanUrl.length - 1);
-
-    // Moteur TikTok
-    if (cleanUrl.contains('tiktok')) {
-      try {
-        final res = await Dio().post('https://www.tikwm.com/api/', data: FormData.fromMap({'url': cleanUrl, 'hd': 1}));
-        if (res.data != null && res.data['data'] != null && res.data['data']['play'] != null) {
-           String playUrl = res.data['data']['play'].toString();
-           return playUrl.startsWith('//') ? 'https:$playUrl' : playUrl;
-        }
-      } catch (_) {}
-    }
-
-    // NOUVELLE SOLUTION INSTAGRAM : Multi-serveurs yt-dlp distants (Cobalt v11)
-    if (cleanUrl.contains('instagram')) {
+    // Utilisation d'un service de "bypass" reconnu pour sa stabilité avec Instagram
+    try {
+      final res = await Dio().get(
+        "https://api.cobalt.tools/api/json",
+        data: {"url": cleanUrl, "vimeoQuality": "1080", "isAudioOnly": false},
+        options: Options(headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+        })
+      );
       
-      // Liste de serveurs publics faisant tourner yt-dlp 
-      final List<String> ytDlpServers = [
-        'https://api.cobalt.tools/', // Serveur officiel (API v11)
-        'https://co.wuk.sh/',        // Instance européenne populaire
-        'https://cobalt.chathelp.ru/' // Instance de secours
-      ];
-
-      for (String server in ytDlpServers) {
-        try {
-          final res = await Dio().post(
-            server,
-            data: {"url": cleanUrl},
-            options: Options(
-              headers: {
-                'Accept': 'application/json', // Requis par la nouvelle norme
-                'Content-Type': 'application/json',
-                // On se fait passer pour ton iPhone pour ne pas alerter les pare-feux
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)' 
-              },
-              sendTimeout: const Duration(seconds: 6),
-            )
-          );
-          
-          if (res.statusCode == 200 && res.data != null) {
-            // Le serveur yt-dlp a réussi, il nous renvoie le lien MP4 direct
-            if (res.data['url'] != null) return res.data['url'];
-          }
-        } catch (_) {
-          continue; // Si un serveur plante, on passe silencieusement au suivant
-        }
+      if (res.data != null && res.data['url'] != null) {
+        return res.data['url'];
       }
-      
-      // Scraper traditionnel en ultime recours si les serveurs yt-dlp sont saturés
-      try {
-         final res = await Dio().get(
-           'https://api.ryzendesu.vip/api/downloader/igdl?url=$cleanUrl', 
-           options: Options(sendTimeout: const Duration(seconds: 5))
-         );
-         if (res.statusCode == 200 && res.data?['data'] != null && res.data['data'].isNotEmpty) {
-           return res.data['data'][0]['url'];
-         }
-      } catch (_) {}
-
-      throw Exception("L'accès à la vidéo Instagram a été rejeté par les serveurs. Le lien est peut-être privé.");
+    } catch (e) {
+      debugPrint("Erreur Cobalt: $e");
     }
-
     return null;
   }
 }
