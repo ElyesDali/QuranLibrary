@@ -25,10 +25,6 @@ import 'dart:io' show Platform;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  
-  // LE DÉFIBRILLATEUR : On efface la mémoire de la dernière piste pour casser la boucle de crash
-  final prefs = await SharedPreferences.getInstance();
-  await prefs.remove('last_played_id'); 
 
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     sqfliteFfiInit();
@@ -168,7 +164,6 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   int? _playingIndex;
   int _lastPos = 0;
   int _lastDuration = 0;
-  int _lastIndex = 0;
   DateTime _lastWakeUp = DateTime.now(); // NOUVEAU : Le chronomètre de réveil
 
   @override
@@ -188,11 +183,8 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       // FILTRE ANTI-HOQUET : On ignore les bonds temporels absurdes dans la seconde qui suit le réveil de l'app
       if (DateTime.now().difference(_lastWakeUp).inMilliseconds < 1000) return;
 
-      if (loopMode == LoopModeState.off && _lastPos > durationMs - 1000 && currentMs < 500) {
-        _player.pause(); 
-        _player.seek(Duration.zero, index: _playingIndex); // Rembobine proprement
-      }
       _lastPos = currentMs;
+      _lastDuration = durationMs;
     });
 
     _player.currentIndexStream.listen((index) async {
@@ -200,6 +192,14 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       if (Platform.isWindows || index == null || _isSwitchingTrack) return;
       
       if (mounted && index < displayedRecitations.length) {
+         // --- CORRECTION AIRPLAY : Intercepter avance auto en LoopModeState.off ---
+         if (loopMode == LoopModeState.off && _playingIndex != null && index != _playingIndex) {
+            // Si la piste précédente s'est terminée normalement (position près de la durée), on met en pause.
+            if (_lastPos >= _lastDuration - 1000) {
+               _player.pause();
+            }
+         }
+         
          _playingIndex = index;
          setState(() => currentRecitation = displayedRecitations[index]);
          final prefs = await SharedPreferences.getInstance();
@@ -326,6 +326,19 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       allRecitations = res ?? [];
       _applyFilters();
     });
+    
+    // NOUVEAU: Charger la dernière récitation écoutée
+    final prefs = await SharedPreferences.getInstance();
+    final lastPlayedId = prefs.getInt('last_played_id');
+    if (lastPlayedId != null && displayedRecitations.isNotEmpty) {
+       int index = displayedRecitations.indexWhere((r) => r['id'] == lastPlayedId);
+       if (index != -1 && mounted && currentRecitation == null) {
+          setState(() {
+             currentRecitation = displayedRecitations[index];
+             _playingIndex = index;
+          });
+       }
+    }
     
     // NOUVEAU : Lance la réparation automatique en arrière-plan
     _checkMissingThumbnails(res ?? []);
@@ -517,6 +530,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         downloadUrl = streamInfo.url.toString();
       }
       
+      int expectedTotal = -1;
       int lastUpdateValue = 0;
       
       await Dio().download(
@@ -532,6 +546,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         ),
         onReceiveProgress: (received, total) {
           if (total != -1) {
+            expectedTotal = total;
             int percentage = ((received / total) * 100).toInt();
             if (percentage != lastUpdateValue) {
               lastUpdateValue = percentage;
@@ -548,6 +563,10 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       );
       
       if (await tempFile.exists() && await tempFile.length() > 50000) { 
+        if (expectedTotal != -1 && await tempFile.length() < expectedTotal) {
+           throw Exception("Téléchargement incomplet (le fichier a été coupé).");
+        }
+
         if (await localFile.exists()) await localFile.delete(); 
         await tempFile.rename(localFile.path); 
         
@@ -555,11 +574,13 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
           if (!Platform.isWindows) { // <-- PROTECTION WINDOWS
             try {
                final metadata = await MetadataRetriever.fromFile(localFile);
-               String newDur = "--:--";
-               if (metadata.trackDuration != null) {
-                  final d = Duration(milliseconds: metadata.trackDuration!);
-                  newDur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+               if (metadata.trackDuration == null || metadata.trackDuration == 0) {
+                  throw Exception("Fichier corrompu (pas de durée audio valide).");
                }
+               
+               String newDur = "--:--";
+               final d = Duration(milliseconds: metadata.trackDuration!);
+               newDur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
                
                String newThumb = "thumb_yt_$id.jpg";
                final thumbData = await VideoThumbnail.thumbnailData(
@@ -580,6 +601,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                   await _db?.update('recitations', {'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
                }
             } catch (e) {
+               if (e.toString().contains("Fichier corrompu")) rethrow;
                debugPrint("Erreur métadonnées: $e");
             }
           }
@@ -718,7 +740,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         _player.setLoopMode(LoopMode.one); // Boucle native parfaite
       } else {
         loopMode = LoopModeState.off;
-        _player.setLoopMode(LoopMode.one); // ASTUCE : Reste sur la même piste pour bloquer la suivante
+        _player.setLoopMode(LoopMode.off); // CORRECTION: Rétablir LoopMode.off pour réparer les boutons Next/Prev d'AirPlay
       }
     });
   }
@@ -2216,10 +2238,10 @@ class _FormDialogState extends State<FormDialog> {
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
     String cleanUrl = targetUrl.trim();
-    // Utilisation d'un service de "bypass" reconnu pour sa stabilité avec Instagram
+    // Utilisation de l'API Cobalt V10 avec un fallback public
     try {
-      final res = await Dio().get(
-        "https://api.cobalt.tools/api/json",
+      final res = await Dio().post(
+        "https://api.cobalt.tools/",
         data: {"url": cleanUrl, "vimeoQuality": "1080", "isAudioOnly": false},
         options: Options(headers: {
           "Accept": "application/json",
@@ -2227,11 +2249,34 @@ class MediaExtractor {
         })
       );
       
-      if (res.data != null && res.data['url'] != null) {
-        return res.data['url'];
-      }
+      if (res.data != null && res.data['url'] != null) return res.data['url'];
     } catch (e) {
-      debugPrint("Erreur Cobalt: $e");
+      debugPrint("Erreur Cobalt principal: $e");
+      // Fallback sur une instance publique fonctionnelle connue
+      try {
+         final resFallback = await Dio().post(
+           "https://cobalt-api.pewpew.nyc/",
+           data: {"url": cleanUrl},
+           options: Options(headers: {
+             "Accept": "application/json",
+             "Content-Type": "application/json",
+           })
+         );
+         if (resFallback.data != null && resFallback.data['url'] != null) return resFallback.data['url'];
+      } catch (_) {}
+      
+      // Essai sur une autre instance publique si dispo
+      try {
+         final resFallback2 = await Dio().post(
+           "https://cobalt.qck.ie/",
+           data: {"url": cleanUrl},
+           options: Options(headers: {
+             "Accept": "application/json",
+             "Content-Type": "application/json",
+           })
+         );
+         if (resFallback2.data != null && resFallback2.data['url'] != null) return resFallback2.data['url'];
+      } catch (_) {}
     }
     return null;
   }
