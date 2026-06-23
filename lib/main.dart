@@ -173,7 +173,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     _initApp();
     _player.setVolume(volume);
     
-    _player.setLoopMode(loopMode == LoopModeState.autoplay ? LoopMode.off : LoopMode.one);
+    _player.setLoopMode(loopMode == LoopModeState.one ? LoopMode.one : LoopMode.off);
 
     _positionSubscription?.cancel(); 
     _positionSubscription = _player.positionStream.listen((pos) {
@@ -322,23 +322,23 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
   Future<void> _fetch() async {
     final res = await _db?.query('recitations', orderBy: 'sourate_num ASC');
-    setState(() {
-      allRecitations = res ?? [];
-      _applyFilters();
-    });
     
-    // NOUVEAU: Charger la dernière récitation écoutée
+    // NOUVEAU: Charger la dernière récitation écoutée AVANT d'appliquer les filtres
     final prefs = await SharedPreferences.getInstance();
     final lastPlayedId = prefs.getInt('last_played_id');
-    if (lastPlayedId != null && displayedRecitations.isNotEmpty) {
-       int index = displayedRecitations.indexWhere((r) => r['id'] == lastPlayedId);
-       if (index != -1 && mounted && currentRecitation == null) {
-          setState(() {
-             currentRecitation = displayedRecitations[index];
-             _playingIndex = index;
-          });
-       }
-    }
+
+    setState(() {
+      allRecitations = res ?? [];
+      
+      if (lastPlayedId != null && allRecitations.isNotEmpty && currentRecitation == null) {
+         int idx = allRecitations.indexWhere((r) => r['id'] == lastPlayedId);
+         if (idx != -1) {
+            currentRecitation = allRecitations[idx];
+         }
+      }
+
+      _applyFilters();
+    });
     
     // NOUVEAU : Lance la réparation automatique en arrière-plan
     _checkMissingThumbnails(res ?? []);
@@ -468,7 +468,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     if (sources.isNotEmpty) {
       final newPlaylist = ConcatenatingAudioSource(children: sources);
       try {
-        await _player.setAudioSource(newPlaylist);
+        await _player.setAudioSource(newPlaylist, initialIndex: _playingIndex ?? 0);
       } catch (_) {}
     }
   }
