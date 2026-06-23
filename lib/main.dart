@@ -2238,11 +2238,30 @@ class _FormDialogState extends State<FormDialog> {
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
     String cleanUrl = targetUrl.trim();
+    
+    // NOUVEAU : API spécifique pour TikTok (TikMate) qui fonctionne sans clé
+    if (cleanUrl.contains('tiktok')) {
+      try {
+        final res = await Dio().post(
+          "https://api.tikmate.app/api/lookup",
+          data: {"url": cleanUrl},
+          options: Options(headers: {
+             "Content-Type": "application/x-www-form-urlencoded",
+          })
+        );
+        if (res.data != null && res.data['success'] == true) {
+           return "https://tikmate.app/download/${res.data['token']}/${res.data['id']}.mp4";
+        }
+      } catch (e) {
+        debugPrint("Erreur TikMate: $e");
+      }
+    }
+
     // Utilisation de l'API Cobalt V10 avec un fallback public
     try {
       final res = await Dio().post(
         "https://api.cobalt.tools/",
-        data: {"url": cleanUrl, "vimeoQuality": "1080", "isAudioOnly": false},
+        data: {"url": cleanUrl},
         options: Options(headers: {
           "Accept": "application/json",
           "Content-Type": "application/json",
@@ -2252,7 +2271,7 @@ class MediaExtractor {
       if (res.data != null && res.data['url'] != null) return res.data['url'];
     } catch (e) {
       debugPrint("Erreur Cobalt principal: $e");
-      // Fallback sur une instance publique fonctionnelle connue
+      // Fallback sur une instance publique
       try {
          final resFallback = await Dio().post(
            "https://cobalt-api.pewpew.nyc/",
@@ -2265,7 +2284,6 @@ class MediaExtractor {
          if (resFallback.data != null && resFallback.data['url'] != null) return resFallback.data['url'];
       } catch (_) {}
       
-      // Essai sur une autre instance publique si dispo
       try {
          final resFallback2 = await Dio().post(
            "https://cobalt.qck.ie/",
@@ -2277,6 +2295,10 @@ class MediaExtractor {
          );
          if (resFallback2.data != null && resFallback2.data['url'] != null) return resFallback2.data['url'];
       } catch (_) {}
+      
+      if (cleanUrl.contains('instagram')) {
+         throw Exception("Les serveurs publics (Cobalt) sont actuellement bloqués par Instagram. Veuillez utiliser YouTube pour l'instant.");
+      }
     }
     return null;
   }
