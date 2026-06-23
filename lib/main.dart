@@ -169,6 +169,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   @override
   void initState() {
     super.initState();
+    WebScraper.init(); // Initialisation du navigateur invisible
     WidgetsBinding.instance.addObserver(this); // On allume le radar
     _initApp();
     _player.setVolume(volume);
@@ -1122,6 +1123,16 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                     backgroundColor: const Color(0xFF4A8FA3), 
                     child: const Icon(Icons.add, color: Colors.white, size: 30)
                   )
+                ),
+                // Navigateur invisible pour le scraping
+                Positioned(
+                  left: -1000,
+                  top: -1000,
+                  width: 100,
+                  height: 100,
+                  child: WebScraper.controller != null 
+                      ? WebViewWidget(controller: WebScraper.controller!) 
+                      : const SizedBox(),
                 ),
               ],
             ),
@@ -2235,6 +2246,91 @@ class _FormDialogState extends State<FormDialog> {
   }
 }
 
+// Scraper système D pour Instagram (Contourne les blocages d'API publiques)
+class WebScraper {
+  static WebViewController? controller;
+  static Completer<String?>? _completer;
+  static String _currentUrl = "";
+
+  static void init() {
+    controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..addJavaScriptChannel('ScraperChannel', onMessageReceived: (message) {
+         if (_completer != null && !_completer!.isCompleted) {
+            String url = message.message;
+            if (url.startsWith('http')) {
+               _completer!.complete(url);
+            }
+         }
+      });
+  }
+
+  static Future<String?> extractInstagram(String igUrl) async {
+    if (controller == null) return null;
+    
+    // Ordre de fallback
+    List<String> sites = ['https://fastdl.app/en', 'https://snapinsta.app/fr', 'https://igram.world/'];
+    
+    for (String site in sites) {
+       _completer = Completer<String?>();
+       _currentUrl = igUrl;
+       
+       await controller!.loadRequest(Uri.parse(site));
+       
+       Timer? checkTimer;
+       checkTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+          if (_completer != null && _completer!.isCompleted) {
+             timer.cancel();
+             return;
+          }
+          try {
+            await controller!.runJavaScript('''
+               // Script for fastdl / igram
+               let inp1 = document.getElementById('search-form-input');
+               let btn1 = document.querySelector('.search-form__button');
+               if (inp1 && btn1 && inp1.value === '') {
+                   inp1.value = '$_currentUrl';
+                   btn1.click();
+               }
+               let res1 = document.querySelector('.button--download');
+               if (res1 && res1.href && res1.href.startsWith('http')) {
+                   ScraperChannel.postMessage(res1.href);
+               }
+
+               // Script for snapinsta
+               let inp2 = document.getElementById('url');
+               let btn2 = document.getElementById('btn-submit');
+               if (inp2 && btn2 && inp2.value === '') {
+                   inp2.value = '$_currentUrl';
+                   btn2.click();
+               }
+               let res2 = document.querySelector('.download-bottom a');
+               if (!res2) res2 = document.querySelector('a.btn.download-media');
+               if (res2 && res2.href && res2.href.startsWith('http') && res2.href.includes('download')) {
+                   ScraperChannel.postMessage(res2.href);
+               }
+            ''');
+          } catch (_) {}
+       });
+
+       String? result;
+       try {
+         result = await _completer!.future.timeout(const Duration(seconds: 15));
+       } catch (e) {
+         result = null; 
+       }
+       
+       checkTimer.cancel();
+       
+       if (result != null && result.startsWith('http')) {
+          return result;
+       }
+    }
+    return null;
+  }
+}
+
+
 class MediaExtractor {
   static Future<String?> getDownloadUrl(String targetUrl) async {
     String cleanUrl = targetUrl.trim();
@@ -2297,7 +2393,14 @@ class MediaExtractor {
       } catch (_) {}
       
       if (cleanUrl.contains('instagram')) {
-         throw Exception("Les serveurs publics (Cobalt) sont actuellement bloqués par Instagram. Veuillez utiliser YouTube pour l'instant.");
+         // NOUVEAU: Utilisation du navigateur invisible (Système D)
+         try {
+           final scrapedUrl = await WebScraper.extractInstagram(cleanUrl);
+           if (scrapedUrl != null) return scrapedUrl;
+         } catch (e) {
+           debugPrint("Erreur WebScraper: $e");
+         }
+         throw Exception("Le téléchargement de ce lien Instagram a échoué (Serveurs bloqués). Veuillez utiliser YouTube.");
       }
     }
     return null;
