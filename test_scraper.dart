@@ -1,22 +1,40 @@
-import 'dart:convert';
-import 'package:http/http.dart' as http;
+import 'package:dio/dio.dart';
 
 void main() async {
-  final url = 'https://www.instagram.com/p/C6Z7T_3M5hB/';
-  final saveigUrl = Uri.parse('https://saveig.app/api/ajaxSearch');
+  final url = 'https://www.instagram.com/reel/C8-0B86t06I/'; // Example public reel
+  
   try {
-    final res = await http.post(saveigUrl, headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'X-Requested-With': 'XMLHttpRequest'
-    }, body: {
+    print('Testing cobalt.qck.ie...');
+    final res = await Dio().post(
+      "https://cobalt.qck.ie/",
+      data: {"url": url},
+      options: Options(headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+      })
+    );
+    print("Cobalt QCK Response: ${res.data}");
+    return;
+  } catch (e) {
+    print("Cobalt QCK failed: $e");
+  }
+
+  try {
+    print('Testing saveig.app/api/ajaxSearch...');
+    final formData = FormData.fromMap({
       'q': url,
       't': 'media',
       'lang': 'en'
     });
-    print('SAVEIG RESPONSE: ${res.statusCode}');
-    print(res.body.substring(0, res.body.length > 500 ? 500 : res.body.length));
+    final res = await Dio().post(
+      "https://v3.saveig.app/api/ajaxSearch",
+      data: formData,
+      options: Options(headers: {
+        "Accept": "*/*",
+      })
+    );
+    print("SaveIG Response: ${res.data}");
   } catch (e) {
-    print('Error: $e');
+    print("SaveIG failed: $e");
   }
 }

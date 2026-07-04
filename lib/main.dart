@@ -55,9 +55,9 @@ class ProxyServer {
             // L'APPEL AU NOUVEAU RÉSEAU DE SERVEURS
             final streamUrl = await MediaExtractor.getDownloadUrl(ytUrl);
             if (streamUrl != null) {
-              request.response.redirect(Uri.parse(streamUrl), status: HttpStatus.movedTemporarily);
+              try { await request.response.redirect(Uri.parse(streamUrl), status: HttpStatus.movedTemporarily); } catch (_) {}
             } else {
-              request.response.statusCode = 404;
+              try { request.response.statusCode = 404; } catch (_) {}
             }
             return;
           } else {
@@ -65,14 +65,14 @@ class ProxyServer {
             var manifest = await yt.videos.streamsClient.getManifest(ytUrl);
             var streamInfo = manifest.muxed.withHighestBitrate();
             yt.close();
-            request.response.redirect(streamInfo.url, status: HttpStatus.movedTemporarily);
+            try { await request.response.redirect(streamInfo.url, status: HttpStatus.movedTemporarily); } catch (_) {}
             return;
           }
         }
       } catch (_) {
-        request.response.statusCode = 500;
+        try { request.response.statusCode = 500; } catch (_) {}
       } finally {
-        await request.response.close();
+        try { await request.response.close(); } catch (_) {}
       }
     });
   }
@@ -145,6 +145,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   final AudioPlayer _player = AudioPlayer();
   StreamSubscription? _positionSubscription; // NOUVEAU : Le garde-fou de la mémoire
   Map<String, dynamic>? currentRecitation;
+  int _playRequestId = 0; // Fix race conditions during track change
   
   double volume = 0.8;
   LoopModeState loopMode = LoopModeState.off;
@@ -212,8 +213,15 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     if (Platform.isWindows) {
       _player.playerStateStream.listen((state) {
         if (state.processingState == ProcessingState.completed) {
-          if (_playingIndex != null && _playingIndex! < displayedRecitations.length - 1) {
-            _play(displayedRecitations[_playingIndex! + 1]);
+          if (loopMode == LoopModeState.off) {
+            _player.pause();
+            _player.seek(Duration.zero);
+          } else {
+            if (_playingIndex != null && _playingIndex! < displayedRecitations.length - 1) {
+              _play(displayedRecitations[_playingIndex! + 1]);
+            } else if (_playingIndex != null && _playingIndex! == displayedRecitations.length - 1 && loopMode == LoopModeState.autoplay) {
+              _play(displayedRecitations[0]);
+            }
           }
         }
       });
@@ -652,6 +660,8 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     int index = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
     if (index == -1) return;
 
+    final reqId = ++_playRequestId;
+
     String path = rec['fichier'] ?? "";
     Uri uri;
 
@@ -690,6 +700,8 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         }
       }
 
+      if (reqId != _playRequestId) return; // A newer request was made
+
       _isSwitchingTrack = true;
       setState(() {
         currentRecitation = rec;
@@ -697,25 +709,31 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       });
 
       if (Platform.isWindows) {
-        // CORRECTIF 1 : On attache manuellement le "tag" (le titre et l'image) à la piste unique !
         final tag = _createMediaItem(rec);
-        await _player.setAudioSource(AudioSource.uri(uri, tag: tag));
-        _player.play();
+        var loadFuture = _player.setAudioSource(AudioSource.uri(uri, tag: tag));
+        _player.play(); // Queues playback to start automatically once loaded
+        await loadFuture;
       } else {
         await _updateFullPlaylist(); 
-        await _player.seek(Duration.zero, index: index);
+        if (reqId != _playRequestId) return;
+        
+        var seekFuture = _player.seek(Duration.zero, index: index);
         _player.play();
+        await seekFuture;
       }
 
     } catch (e) {
-      // CORRECTIF 1 : On filtre l'erreur d'interruption naturelle du lecteur
-      if (e.toString().contains('interrupted') || e.toString().contains('Interruption')) {
+      if (reqId != _playRequestId) return; // Ignore errors from cancelled requests
+      
+      if (e.toString().contains('interrupted') || e.toString().contains('Interruption') || e.toString().contains('abort')) {
         debugPrint("Chargement interrompu pour changer de piste (Ignoré).");
       } else {
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur de lecture : $e"), backgroundColor: Colors.red));
       }
     } finally {
-      _isSwitchingTrack = false;
+      if (reqId == _playRequestId) {
+        _isSwitchingTrack = false;
+      }
     }
   }
 
@@ -2253,16 +2271,21 @@ class WebScraper {
   static String _currentUrl = "";
 
   static void init() {
-    controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..addJavaScriptChannel('ScraperChannel', onMessageReceived: (message) {
-         if (_completer != null && !_completer!.isCompleted) {
-            String url = message.message;
-            if (url.startsWith('http')) {
-               _completer!.complete(url);
-            }
-         }
-      });
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) return;
+    try {
+      controller = WebViewController()
+        ..setJavaScriptMode(JavaScriptMode.unrestricted)
+        ..addJavaScriptChannel('ScraperChannel', onMessageReceived: (message) {
+           if (_completer != null && !_completer!.isCompleted) {
+              String url = message.message;
+              if (url.startsWith('http')) {
+                 _completer!.complete(url);
+              }
+           }
+        });
+    } catch (_) {
+      debugPrint("WebScraper init failed");
+    }
   }
 
   static Future<String?> extractInstagram(String igUrl) async {
@@ -2393,13 +2416,57 @@ class MediaExtractor {
       } catch (_) {}
       
       if (cleanUrl.contains('instagram')) {
-         // NOUVEAU: Utilisation du navigateur invisible (Système D)
+         // Utilisation d'API publiques directes pour Instagram (sans WebView)
          try {
-           final scrapedUrl = await WebScraper.extractInstagram(cleanUrl);
-           if (scrapedUrl != null) return scrapedUrl;
+           final formData = FormData.fromMap({"url": cleanUrl, "action": "post"});
+           final res = await Dio().post(
+             "https://snapinsta.app/action.php",
+             data: formData,
+             options: Options(headers: {
+               "Origin": "https://snapinsta.app",
+               "Referer": "https://snapinsta.app/",
+               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+             })
+           );
+           
+           if (res.data != null && res.data is String) {
+             // Extraction du lien MP4 avec Regex
+             final RegExp regExp = RegExp(r'href=\\"(https:\/\/[^"]+\.mp4.*?)\\"');
+             final match = regExp.firstMatch(res.data);
+             if (match != null) {
+               final String link = match.group(1)!.replaceAll(r'\\&', '&').replaceAll(r'\/', '/');
+               return link;
+             }
+           }
          } catch (e) {
-           debugPrint("Erreur WebScraper: $e");
+           debugPrint("Erreur SnapInsta HTTP: $e");
          }
+
+         try {
+           // Fallback 2: IgDownloader
+           final formData = FormData.fromMap({"q": cleanUrl, "t": "media", "lang": "en"});
+           final res = await Dio().post(
+             "https://v3.igdownloader.net/api/ajaxSearch",
+             data: formData,
+             options: Options(headers: {
+               "Origin": "https://igdownloader.net",
+               "Referer": "https://igdownloader.net/",
+               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+             })
+           );
+           
+           if (res.data != null && res.data['data'] != null) {
+             final String html = res.data['data'];
+             final RegExp regExp = RegExp(r'href="(https:\/\/[^"]+\.mp4.*?)"');
+             final match = regExp.firstMatch(html);
+             if (match != null) {
+               return match.group(1)!.replaceAll('&amp;', '&');
+             }
+           }
+         } catch (e) {
+           debugPrint("Erreur IGDownloader HTTP: $e");
+         }
+
          throw Exception("Le téléchargement de ce lien Instagram a échoué (Serveurs bloqués). Veuillez utiliser YouTube.");
       }
     }
