@@ -22,6 +22,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'dart:io' show Platform;
+import 'package:permission_handler/permission_handler.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -42,6 +44,7 @@ Future<void> main() async {
 class ProxyServer {
   static HttpServer? _server;
   static int? port;
+  static final Map<String, _CachedUrl> _urlCache = {};
   
   static Future<void> start() async {
     if (_server != null) return;
@@ -51,10 +54,17 @@ class ProxyServer {
       try {
         final ytUrl = request.uri.queryParameters['url'];
         if (ytUrl != null) {
+          _cleanCache();
+          if (_urlCache.containsKey(ytUrl) && _urlCache[ytUrl]!.isValid) {
+            try { await request.response.redirect(Uri.parse(_urlCache[ytUrl]!.url), status: HttpStatus.movedTemporarily); } catch (_) {}
+            return;
+          }
+          
           if (ytUrl.contains('instagram') || ytUrl.contains('tiktok')) {
             // L'APPEL AU NOUVEAU RÉSEAU DE SERVEURS
             final streamUrl = await MediaExtractor.getDownloadUrl(ytUrl);
             if (streamUrl != null) {
+              _urlCache[ytUrl] = _CachedUrl(streamUrl);
               try { await request.response.redirect(Uri.parse(streamUrl), status: HttpStatus.movedTemporarily); } catch (_) {}
             } else {
               try { request.response.statusCode = 404; } catch (_) {}
@@ -65,6 +75,7 @@ class ProxyServer {
             var manifest = await yt.videos.streamsClient.getManifest(ytUrl);
             var streamInfo = manifest.muxed.withHighestBitrate();
             yt.close();
+            _urlCache[ytUrl] = _CachedUrl(streamInfo.url.toString());
             try { await request.response.redirect(streamInfo.url, status: HttpStatus.movedTemporarily); } catch (_) {}
             return;
           }
@@ -77,7 +88,18 @@ class ProxyServer {
     });
   }
 
+  static void _cleanCache() {
+    _urlCache.removeWhere((key, value) => !value.isValid);
+  }
+
   static String getProxyUrl(String originalUrl) => 'http://127.0.0.1:$port/?url=${Uri.encodeComponent(originalUrl)}';
+}
+
+class _CachedUrl {
+  final String url;
+  final DateTime expiresAt;
+  _CachedUrl(this.url) : expiresAt = DateTime.now().add(const Duration(hours: 2));
+  bool get isValid => DateTime.now().isBefore(expiresAt);
 }
 
 const List<Map<String, dynamic>> ALL_SURAHS = [
@@ -282,6 +304,10 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       await _fetch();
       try { await _cleanupOrphans(); } catch (_) {}
       
+      if (!Platform.isWindows && !Platform.isLinux && !Platform.isMacOS) {
+        _checkPermissionsAndConnectivity();
+      }
+      
     } catch (e) {
       // CELLULE DE SECOURS : Si le dossier personnalisé ou la BDD crashe, on réinitialise tout par défaut
       debugPrint("Mode secours activé : $e");
@@ -294,6 +320,48 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       final fallbackPath = p.join(_appDirPath!, 'luhaidan.db');
       _db = await openDatabase(fallbackPath, version: 3);
       await _fetch();
+    }
+  }
+
+  Future<void> _checkPermissionsAndConnectivity() async {
+    // Demande dynamique des permissions
+    await [
+      Permission.storage,
+      Permission.videos,
+      Permission.audio,
+    ].request();
+
+    // Lancer la vérification des téléchargements manquants en arrière-plan
+    _checkMissingDownloads();
+  }
+
+  Future<void> _checkMissingDownloads() async {
+    if (_appDirPath == null) return;
+    
+    // Laisser le temps à l'application de s'afficher avant de bloquer le réseau
+    await Future.delayed(const Duration(seconds: 3));
+    
+    final connectivityResult = await (Connectivity().checkConnectivity());
+    if (connectivityResult.contains(ConnectivityResult.none)) return; // Pas de connexion internet
+
+    for (var rec in allRecitations) {
+      if (!mounted) break;
+      String path = rec['fichier'] ?? "";
+      if (path.isEmpty || path.startsWith('http')) continue;
+
+      if (path.contains('youtube') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
+        final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
+        if (!await localFile.exists() || await localFile.length() < 50000) {
+          if (!_activeDownloads.containsKey(rec['id'])) {
+             try {
+                // On télécharge silencieusement en arrière-plan
+                _startDownload(rec['id'], path, localFile);
+             } catch (e) {
+                debugPrint("Auto-download failed for ${rec['id']}: $e");
+             }
+          }
+        }
+      }
     }
   }
 
@@ -438,13 +506,13 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
     List<AudioSource> sources = [];
 
-    for (var rec in displayedRecitations) {
+    final futures = displayedRecitations.map((rec) async {
       String path = rec['fichier'] ?? "";
       Uri uri;
 
       if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
         final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
-        if (await localFile.exists() && await localFile.length() > 50000) {
+        if (await localFile.exists()) {
           uri = Uri.file(localFile.path);
         } else {
           uri = Uri.parse(ProxyServer.getProxyUrl(path)); 
@@ -457,7 +525,15 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
           uri = Uri.file(resolved);
         }
       }
+      return {'rec': rec, 'uri': uri};
+    }).toList();
 
+    final results = await Future.wait(futures);
+
+    for (var res in results) {
+      final rec = res['rec'] as Map<String, dynamic>;
+      final uri = res['uri'] as Uri;
+      
       final tag = _createMediaItem(rec);
       final baseSource = AudioSource.uri(uri, tag: tag);
       
