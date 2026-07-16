@@ -36,6 +36,7 @@ Future<void> main() async {
       androidNotificationChannelId: 'com.muhammad.luhaidan.app',
       androidNotificationChannelName: 'Quran Library',
       androidNotificationOngoing: true,
+      androidNotificationIcon: 'mipmap/ic_launcher',
     );
   }
   runApp(const QuranLibraryApp());
@@ -218,9 +219,11 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       if (mounted && index < displayedRecitations.length) {
          if (loopMode == LoopModeState.off && _playingIndex != null && index != _playingIndex) {
             // Si la piste précédente s'est terminée normalement (position près de la durée), on met en pause.
-            if (_lastPos >= _lastDuration - 1000) {
-               _player.pause();
-               _player.seek(Duration.zero, index: _playingIndex);
+            if (_lastDuration > 0 && _lastPos >= _lastDuration - 1000) {
+               Future.microtask(() {
+                 _player.pause();
+                 _player.seek(Duration.zero, index: _playingIndex);
+               });
                return;
             }
          }
