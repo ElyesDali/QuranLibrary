@@ -216,11 +216,12 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       if (Platform.isWindows || index == null || _isSwitchingTrack) return;
       
       if (mounted && index < displayedRecitations.length) {
-         // --- CORRECTION AIRPLAY : Intercepter avance auto en LoopModeState.off ---
          if (loopMode == LoopModeState.off && _playingIndex != null && index != _playingIndex) {
             // Si la piste précédente s'est terminée normalement (position près de la durée), on met en pause.
             if (_lastPos >= _lastDuration - 1000) {
                _player.pause();
+               _player.seek(Duration.zero, index: _playingIndex);
+               return;
             }
          }
          
