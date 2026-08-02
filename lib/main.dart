@@ -212,46 +212,20 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       _lastDuration = durationMs;
     });
 
-    _player.currentIndexStream.listen((index) async {
-      // CORRECTIF 1 : On coupe ce radar sur Windows, car on n'utilise plus de playlist !
-      if (Platform.isWindows || index == null || _isSwitchingTrack) return;
-      
-      if (mounted && index < displayedRecitations.length) {
-         if (loopMode == LoopModeState.off && _playingIndex != null && index != _playingIndex) {
-            // Si la piste précédente s'est terminée normalement (position près de la durée), on met en pause.
-            if (_lastDuration > 0 && _lastPos >= _lastDuration - 1000) {
-               Future.microtask(() {
-                 _player.pause();
-                 _player.seek(Duration.zero, index: _playingIndex);
-               });
-               return;
-            }
-         }
-         
-         _playingIndex = index;
-         setState(() => currentRecitation = displayedRecitations[index]);
-         final prefs = await SharedPreferences.getInstance();
-         prefs.setInt('last_played_id', displayedRecitations[index]['id']);
-      }
-    });
-
-    // CORRECTIF 2 : Le passage automatique à la piste suivante sur Windows
-    if (Platform.isWindows) {
-      _player.playerStateStream.listen((state) {
-        if (state.processingState == ProcessingState.completed) {
-          if (loopMode == LoopModeState.off) {
-            _player.pause();
-            _player.seek(Duration.zero);
-          } else {
-            if (_playingIndex != null && _playingIndex! < displayedRecitations.length - 1) {
-              _play(displayedRecitations[_playingIndex! + 1]);
-            } else if (_playingIndex != null && _playingIndex! == displayedRecitations.length - 1 && loopMode == LoopModeState.autoplay) {
-              _play(displayedRecitations[0]);
-            }
+    _player.playerStateStream.listen((state) {
+      if (state.processingState == ProcessingState.completed) {
+        if (loopMode == LoopModeState.off) {
+          _player.pause();
+          _player.seek(Duration.zero);
+        } else {
+          if (_playingIndex != null && _playingIndex! < displayedRecitations.length - 1) {
+            _play(displayedRecitations[_playingIndex! + 1]);
+          } else if (_playingIndex != null && _playingIndex! == displayedRecitations.length - 1 && loopMode == LoopModeState.autoplay) {
+            _play(displayedRecitations[0]);
           }
         }
-      });
-    }
+      }
+    });
   }
 
   @override
@@ -501,74 +475,16 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         }
       }
     });
-    _updateFullPlaylist(); 
-  }
-
-  Future<void> _updateFullPlaylist() async {
-    // Cette fonction n'est désormais appelée que sur Mobile pour stabiliser le PC
-    if (Platform.isWindows) return;
-
-    List<AudioSource> sources = [];
-
-    final futures = displayedRecitations.map((rec) async {
-      String path = rec['fichier'] ?? "";
-      Uri uri;
-
-      if (path.contains('youtube.com') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
-        final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
-        if (await localFile.exists()) {
-          uri = Uri.file(localFile.path);
-        } else {
-          uri = Uri.parse(ProxyServer.getProxyUrl(path)); 
-        }
-      } else {
-        String resolved = _resolvePath(path);
-        if (resolved.startsWith('http') || resolved.startsWith('https')) {
-          uri = Uri.parse(resolved); // Correctif crucial : allocation réseau propre
-        } else {
-          uri = Uri.file(resolved);
-        }
-      }
-      return {'rec': rec, 'uri': uri};
-    }).toList();
-
-    final results = await Future.wait(futures);
-
-    for (var res in results) {
-      final rec = res['rec'] as Map<String, dynamic>;
-      final uri = res['uri'] as Uri;
-      
-      final tag = _createMediaItem(rec);
-      final baseSource = AudioSource.uri(uri, tag: tag);
-      
-      if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
-         try {
-           final parts = rec['duration'].toString().split(':');
-           if (parts.length == 2) {
-             final dur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
-             sources.add(ClippingAudioSource(child: baseSource, end: dur, tag: tag));
-             continue;
-           }
-         } catch (_) {}
-      }
-      sources.add(baseSource);
-    }
-
-    if (sources.isNotEmpty) {
-      final newPlaylist = ConcatenatingAudioSource(children: sources);
-      try {
-        await _player.setAudioSource(newPlaylist, initialIndex: _playingIndex ?? 0);
-      } catch (_) {}
-    }
   }
 
   MediaItem _createMediaItem(Map<String, dynamic> r) {
     Duration? exactDur;
     if (r['duration'] != null && r['duration'].toString().contains(':')) {
-      // Le même bouclier s'applique ici pour le lecteur en arrière-plan
       try {
         final parts = r['duration'].toString().split(':');
-        if (parts.length == 2) {
+        if (parts.length == 3) {
+           exactDur = Duration(hours: int.parse(parts[0]), minutes: int.parse(parts[1]), seconds: int.parse(parts[2]));
+        } else if (parts.length == 2) {
            exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
         }
       } catch (_) {}
@@ -669,7 +585,12 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                
                String newDur = "--:--";
                final d = Duration(milliseconds: metadata.trackDuration!);
-               newDur = "${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}";
+               String twoDigits(int n) => n.toString().padLeft(2, '0');
+               if (d.inHours > 0) {
+                 newDur = "${twoDigits(d.inHours)}:${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
+               } else {
+                 newDur = "${twoDigits(d.inMinutes)}:${twoDigits(d.inSeconds.remainder(60))}";
+               }
                
                String newThumb = "thumb_yt_$id.jpg";
                final thumbData = await VideoThumbnail.thumbnailData(
@@ -702,7 +623,6 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
           );
         }
         _fetch(); 
-        _updateFullPlaylist(); 
       } else {
         throw Exception("Fichier corrompu ou illisible.");
       }
@@ -788,19 +708,30 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         _playingIndex = index;
       });
 
-      if (Platform.isWindows) {
-        final tag = _createMediaItem(rec);
-        var loadFuture = _player.setAudioSource(AudioSource.uri(uri, tag: tag));
-        _player.play(); // Queues playback to start automatically once loaded
-        await loadFuture;
-      } else {
-        await _updateFullPlaylist(); 
-        if (reqId != _playRequestId) return;
-        
-        var seekFuture = _player.seek(Duration.zero, index: index);
-        _player.play();
-        await seekFuture;
+      final tag = _createMediaItem(rec);
+      AudioSource finalSource = AudioSource.uri(uri, tag: tag);
+      
+      if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
+        try {
+          final parts = rec['duration'].toString().split(':');
+          Duration? dur;
+          if (parts.length == 3) {
+            dur = Duration(hours: int.parse(parts[0]), minutes: int.parse(parts[1]), seconds: int.parse(parts[2]));
+          } else if (parts.length == 2) {
+            dur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+          }
+          if (dur != null) {
+            finalSource = ClippingAudioSource(child: finalSource, end: dur, tag: tag);
+          }
+        } catch (_) {}
       }
+      
+      var loadFuture = _player.setAudioSource(finalSource);
+      _player.play(); // Queues playback to start automatically once loaded
+      await loadFuture;
+      
+      final prefs = await SharedPreferences.getInstance();
+      prefs.setInt('last_played_id', rec['id']);
 
     } catch (e) {
       if (reqId != _playRequestId) return; // Ignore errors from cancelled requests
@@ -949,7 +880,10 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
   String _formatDuration(Duration d) {
     String twoDigits(int n) => n.toString().padLeft(2, "0");
-    return "${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
+    if (d.inHours > 0) {
+      return "${twoDigits(d.inHours)}:${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
+    }
+    return "${twoDigits(d.inMinutes)}:${twoDigits(d.inSeconds.remainder(60))}";
   }
 
   Widget _buildThumbnail(String? thumbPath) {
