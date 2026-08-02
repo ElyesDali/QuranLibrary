@@ -709,7 +709,8 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       });
 
       final tag = _createMediaItem(rec);
-      AudioSource finalSource = AudioSource.uri(uri, tag: tag);
+      var baseSource = AudioSource.uri(uri, tag: tag);
+      AudioSource finalSource = baseSource;
       
       if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
         try {
@@ -721,7 +722,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
             dur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
           }
           if (dur != null) {
-            finalSource = ClippingAudioSource(child: finalSource, end: dur, tag: tag);
+            finalSource = ClippingAudioSource(child: baseSource, end: dur, tag: tag);
           }
         } catch (_) {}
       }
@@ -1784,11 +1785,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     if (state == AppLifecycleState.resumed) {
       _lastWakeUp = DateTime.now(); // On note l'heure du réveil
       
-      // Resynchronisation AirPlay en douceur : 
-      // Si rien ne joue quand on rouvre l'app, on recharge la mémoire iOS
-      if (!_player.playing) {
-        _updateFullPlaylist();
-      }
+      // Si rien ne joue quand on rouvre l'app, la source unique est conservée automatiquement par just_audio.
     }
   }
 
