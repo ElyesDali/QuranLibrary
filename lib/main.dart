@@ -198,9 +198,10 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     _initApp();
     _player.setVolume(volume);
     
-    _player.setLoopMode(loopMode == LoopModeState.one ? LoopMode.one : LoopMode.off);
+    // On n'utilise PLUS le loop natif pour éviter les coupures audio ("hiccups") lors du toggle.
+    _player.setLoopMode(LoopMode.off);
 
-    _positionSubscription?.cancel(); 
+    _positionSubscription?.cancel();
     _positionSubscription = _player.positionStream.listen((pos) {
       int currentMs = pos.inMilliseconds;
       int durationMs = _player.duration?.inMilliseconds ?? 0;
@@ -217,6 +218,9 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         if (loopMode == LoopModeState.off) {
           _player.pause();
           _player.seek(Duration.zero);
+        } else if (loopMode == LoopModeState.one) {
+          _player.seek(Duration.zero);
+          _player.play();
         } else {
           if (_playingIndex != null && _playingIndex! < displayedRecitations.length - 1) {
             _play(displayedRecitations[_playingIndex! + 1]);
@@ -765,13 +769,10 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     setState(() {
       if (loopMode == LoopModeState.off) {
         loopMode = LoopModeState.autoplay;
-        _player.setLoopMode(LoopMode.off); // Laisse avancer à la suivante
       } else if (loopMode == LoopModeState.autoplay) {
         loopMode = LoopModeState.one;
-        _player.setLoopMode(LoopMode.one); // Boucle native parfaite
       } else {
         loopMode = LoopModeState.off;
-        _player.setLoopMode(LoopMode.off); // CORRECTION: Rétablir LoopMode.off pour réparer les boutons Next/Prev d'AirPlay
       }
     });
   }
@@ -881,10 +882,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
   String _formatDuration(Duration d) {
     String twoDigits(int n) => n.toString().padLeft(2, "0");
-    if (d.inHours > 0) {
-      return "${twoDigits(d.inHours)}:${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
-    }
-    return "${twoDigits(d.inMinutes)}:${twoDigits(d.inSeconds.remainder(60))}";
+    return "${d.inMinutes}:${twoDigits(d.inSeconds.remainder(60))}";
   }
 
   Widget _buildThumbnail(String? thumbPath) {
@@ -894,6 +892,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         width: 50, 
         height: 50, 
         fit: BoxFit.cover, 
+        cacheWidth: 150,
         errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40)
       );
     }
@@ -905,6 +904,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         width: 50, 
         height: 50, 
         fit: BoxFit.cover, 
+        cacheWidth: 150,
         errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40)
       );
     } else {
@@ -913,6 +913,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         width: 50, 
         height: 50, 
         fit: BoxFit.cover, 
+        cacheWidth: 150,
         errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40)
       );
     }
@@ -1329,7 +1330,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                     onPressed: () async {
                       if (showPlayIcon) {
                         if (state?.processingState == ProcessingState.completed) {
-                          await _player.seek(Duration.zero, index: _playingIndex);
+                          await _player.seek(Duration.zero);
                         }
                         _player.play();
                       } else {
