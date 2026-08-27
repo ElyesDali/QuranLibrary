@@ -388,16 +388,15 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
     setState(() {
       allRecitations = res ?? [];
-      
-      if (lastPlayedId != null && allRecitations.isNotEmpty && currentRecitation == null) {
-         int idx = allRecitations.indexWhere((r) => r['id'] == lastPlayedId);
-         if (idx != -1) {
-            currentRecitation = allRecitations[idx];
-         }
-      }
-
       _applyFilters();
     });
+
+    if (lastPlayedId != null && allRecitations.isNotEmpty && currentRecitation == null) {
+       int idx = displayedRecitations.indexWhere((r) => r['id'] == lastPlayedId);
+       if (idx != -1) {
+          _play(displayedRecitations[idx], autoPlay: false);
+       }
+    }
     
     // NOUVEAU : Lance la réparation automatique en arrière-plan
     _checkMissingThumbnails(res ?? []);
@@ -660,7 +659,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     }
   }
 
-  Future<void> _play(Map<String, dynamic> rec) async {
+  Future<void> _play(Map<String, dynamic> rec, {bool autoPlay = true}) async {
     int index = displayedRecitations.indexWhere((r) => r['id'] == rec['id']);
     if (index == -1) return;
 
@@ -714,25 +713,11 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
       final tag = _createMediaItem(rec);
       var baseSource = AudioSource.uri(uri, tag: tag);
-      AudioSource finalSource = baseSource;
       
-      if (rec['duration'] != null && rec['duration'].toString().contains(':')) {
-        try {
-          final parts = rec['duration'].toString().split(':');
-          Duration? dur;
-          if (parts.length == 3) {
-            dur = Duration(hours: int.parse(parts[0]), minutes: int.parse(parts[1]), seconds: int.parse(parts[2]));
-          } else if (parts.length == 2) {
-            dur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
-          }
-          if (dur != null) {
-            finalSource = ClippingAudioSource(child: baseSource, end: dur, tag: tag);
-          }
-        } catch (_) {}
+      var loadFuture = _player.setAudioSource(baseSource);
+      if (autoPlay) {
+        _player.play(); // Queues playback to start automatically once loaded
       }
-      
-      var loadFuture = _player.setAudioSource(finalSource);
-      _player.play(); // Queues playback to start automatically once loaded
       await loadFuture;
       
       final prefs = await SharedPreferences.getInstance();
@@ -1348,7 +1333,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                 icon: const Icon(Icons.stop, size: 30, color: Colors.grey), 
                 onPressed: () {
                   _player.pause(); 
-                  _player.seek(Duration.zero, index: _playingIndex);
+                  _player.seek(Duration.zero);
                 }
               ),
             ],
