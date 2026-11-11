@@ -5,8 +5,10 @@ import 'package:flutter/foundation.dart'; // Pour compute (optimisation)
 import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:just_audio/just_audio.dart';
-import 'package:just_audio_background/just_audio_background.dart';
+import 'package:audio_service/audio_service.dart';
+import 'package:audio_session/audio_session.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
@@ -24,6 +26,128 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'dart:io' show Platform;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/return_code.dart';
+
+final AudioPlayer globalAudioPlayer = AudioPlayer();
+QuranAudioHandler? globalAudioHandler;
+
+/// Gestionnaire audio natif (iOS MPNowPlayingInfoCenter / MPRemoteCommandCenter & Android MediaSession)
+/// Garantit que les boutons Suivant/Précédent/Pause et la Timeline restent actifs en permanence
+/// sans saturer la mémoire avec une playlist vidéo complète ni bloquer le thread principal iOS.
+class QuranAudioHandler extends BaseAudioHandler with SeekHandler {
+  final AudioPlayer player;
+  Future<void> Function()? onSkipToNext;
+  Future<void> Function()? onSkipToPrevious;
+
+  QuranAudioHandler(this.player) {
+    player.playbackEventStream.listen(
+      (_) => _broadcastState(),
+      onError: (Object e, StackTrace st) {
+        debugPrint('PlaybackEvent error: $e');
+      },
+    );
+    player.playerStateStream.listen((_) => _broadcastState());
+    player.durationStream.listen((duration) {
+      final currentItem = mediaItem.value;
+      if (currentItem != null &&
+          duration != null &&
+          duration > Duration.zero &&
+          currentItem.duration != duration) {
+        mediaItem.add(currentItem.copyWith(duration: duration));
+      }
+      _broadcastState();
+    });
+  }
+
+  void updateCurrentMediaItem(MediaItem item) {
+    mediaItem.add(item);
+    _broadcastState();
+  }
+
+  void refreshState() => _broadcastState();
+
+  void _broadcastState() {
+    final playing = player.playing;
+    final procState = const {
+      ProcessingState.idle: AudioProcessingState.idle,
+      ProcessingState.loading: AudioProcessingState.loading,
+      ProcessingState.buffering: AudioProcessingState.buffering,
+      ProcessingState.ready: AudioProcessingState.ready,
+      ProcessingState.completed: AudioProcessingState.completed,
+    }[player.processingState] ?? AudioProcessingState.idle;
+
+    playbackState.add(playbackState.value.copyWith(
+      controls: [
+        MediaControl.skipToPrevious,
+        if (playing) MediaControl.pause else MediaControl.play,
+        MediaControl.stop,
+        MediaControl.skipToNext,
+      ],
+      systemActions: const {
+        MediaAction.seek,
+        MediaAction.seekForward,
+        MediaAction.seekBackward,
+        MediaAction.skipToNext,
+        MediaAction.skipToPrevious,
+        MediaAction.play,
+        MediaAction.pause,
+        MediaAction.playPause,
+        MediaAction.stop,
+      },
+      androidCompactActionIndices: const [0, 1, 3],
+      processingState: procState,
+      playing: playing,
+      updatePosition: player.position,
+      bufferedPosition: player.bufferedPosition,
+      speed: player.speed,
+      queueIndex: 0,
+    ));
+  }
+
+  @override
+  Future<void> play() async {
+    try {
+      final session = await AudioSession.instance;
+      await session.setActive(true);
+    } catch (_) {}
+    await player.play();
+    _broadcastState();
+  }
+
+  @override
+  Future<void> pause() async {
+    await player.pause();
+    _broadcastState();
+  }
+
+  @override
+  Future<void> seek(Duration position) async {
+    await player.seek(position);
+    _broadcastState();
+  }
+
+  @override
+  Future<void> stop() async {
+    await player.pause();
+    await player.seek(Duration.zero);
+    _broadcastState();
+  }
+
+  @override
+  Future<void> skipToNext() async {
+    if (onSkipToNext != null) {
+      await onSkipToNext!();
+    }
+  }
+
+  @override
+  Future<void> skipToPrevious() async {
+    if (onSkipToPrevious != null) {
+      await onSkipToPrevious!();
+    }
+  }
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -32,12 +156,22 @@ Future<void> main() async {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   } else {
-    await JustAudioBackground.init(
-      androidNotificationChannelId: 'com.muhammad.luhaidan.app',
-      androidNotificationChannelName: 'Quran Library',
-      androidNotificationOngoing: true,
-      androidNotificationIcon: 'mipmap/ic_launcher',
-    );
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(const AudioSessionConfiguration.music());
+      globalAudioHandler = await AudioService.init(
+        builder: () => QuranAudioHandler(globalAudioPlayer),
+        config: const AudioServiceConfig(
+          androidNotificationChannelId: 'com.muhammad.luhaidan.app',
+          androidNotificationChannelName: 'Quran Library',
+          androidNotificationOngoing: false,
+          androidStopForegroundOnPause: false,
+          androidNotificationIcon: 'mipmap/ic_launcher',
+        ),
+      );
+    } catch (e) {
+      debugPrint("AudioService init error: $e");
+    }
   }
   runApp(const QuranLibraryApp());
 }
@@ -53,33 +187,22 @@ class ProxyServer {
     port = _server!.port;
     _server!.listen((HttpRequest request) async {
       try {
-        final ytUrl = request.uri.queryParameters['url'];
-        if (ytUrl != null) {
+        final targetUrl = request.uri.queryParameters['url'];
+        if (targetUrl != null) {
           _cleanCache();
-          if (_urlCache.containsKey(ytUrl) && _urlCache[ytUrl]!.isValid) {
-            try { await request.response.redirect(Uri.parse(_urlCache[ytUrl]!.url), status: HttpStatus.movedTemporarily); } catch (_) {}
+          if (_urlCache.containsKey(targetUrl) && _urlCache[targetUrl]!.isValid) {
+            try { await request.response.redirect(Uri.parse(_urlCache[targetUrl]!.url), status: HttpStatus.movedTemporarily); } catch (_) {}
             return;
           }
           
-          if (ytUrl.contains('instagram') || ytUrl.contains('tiktok')) {
-            // L'APPEL AU NOUVEAU RÉSEAU DE SERVEURS
-            final streamUrl = await MediaExtractor.getDownloadUrl(ytUrl);
-            if (streamUrl != null) {
-              _urlCache[ytUrl] = _CachedUrl(streamUrl);
-              try { await request.response.redirect(Uri.parse(streamUrl), status: HttpStatus.movedTemporarily); } catch (_) {}
-            } else {
-              try { request.response.statusCode = 404; } catch (_) {}
-            }
-            return;
+          final streamUrl = await MediaExtractor.getDownloadUrl(targetUrl);
+          if (streamUrl != null) {
+            _urlCache[targetUrl] = _CachedUrl(streamUrl);
+            try { await request.response.redirect(Uri.parse(streamUrl), status: HttpStatus.movedTemporarily); } catch (_) {}
           } else {
-            var yt = YoutubeExplode();
-            var manifest = await yt.videos.streamsClient.getManifest(ytUrl);
-            var streamInfo = manifest.muxed.withHighestBitrate();
-            yt.close();
-            _urlCache[ytUrl] = _CachedUrl(streamInfo.url.toString());
-            try { await request.response.redirect(streamInfo.url, status: HttpStatus.movedTemporarily); } catch (_) {}
-            return;
+            try { request.response.statusCode = 404; } catch (_) {}
           }
+          return;
         }
       } catch (_) {
         try { request.response.statusCode = 500; } catch (_) {}
@@ -137,6 +260,23 @@ const List<Map<String, dynamic>> ALL_SURAHS = [
 
 enum LoopModeState { off, autoplay, one }
 
+bool isRemoteMediaUrl(String? path) {
+  if (path == null || path.trim().isEmpty) return false;
+  final s = path.trim().toLowerCase();
+  return s.startsWith('http://') ||
+      s.startsWith('https://') ||
+      s.contains('://') ||
+      s.contains('youtube.com') ||
+      s.contains('youtu.be') ||
+      s.contains('instagram.com') ||
+      s.contains('instagr.am') ||
+      s.contains('tiktok.com') ||
+      s.contains('twitter.com') ||
+      s.contains('x.com') ||
+      s.contains('facebook.com') ||
+      s.contains('fb.watch');
+}
+
 class QuranLibraryApp extends StatelessWidget {
   const QuranLibraryApp({super.key});
 
@@ -165,8 +305,9 @@ class LibraryScreen extends StatefulWidget {
 class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserver {
   List<dynamic> allRecitations = [];
   List<dynamic> displayedRecitations = [];
-  final AudioPlayer _player = AudioPlayer();
+  final AudioPlayer _player = globalAudioPlayer;
   StreamSubscription? _positionSubscription; // NOUVEAU : Le garde-fou de la mémoire
+  StreamSubscription? _playerStateSubscription;
   Map<String, dynamic>? currentRecitation;
   int _playRequestId = 0; // Fix race conditions during track change
   
@@ -175,8 +316,9 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   int? selectedYearFilter;
   Database? _db;
   bool _isDownloading = false;
-  double? _dragValue;
   bool _isSwitchingTrack = false;
+  bool _isInBackground = false;
+  bool _isExtractingAudioBg = false;
   String? _appDirPath;
   Map<int, double> _activeDownloads = {}; 
 
@@ -193,8 +335,10 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   @override
   void initState() {
     super.initState();
-    WebScraper.init(); // Initialisation du navigateur invisible
     WidgetsBinding.instance.addObserver(this); // On allume le radar
+    globalAudioHandler?.onSkipToNext = () async => _playNext();
+    globalAudioHandler?.onSkipToPrevious = () async => _playPrevious();
+
     _initApp();
     _player.setVolume(volume);
     
@@ -213,14 +357,17 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       _lastDuration = durationMs;
     });
 
-    _player.playerStateStream.listen((state) {
-      if (state.processingState == ProcessingState.completed) {
+    _playerStateSubscription?.cancel();
+    _playerStateSubscription = _player.playerStateStream.listen((state) {
+      if (state.processingState == ProcessingState.completed && !_isSwitchingTrack) {
         if (loopMode == LoopModeState.off) {
           _player.pause();
           _player.seek(Duration.zero);
+          globalAudioHandler?.refreshState();
         } else if (loopMode == LoopModeState.one) {
           _player.seek(Duration.zero);
           _player.play();
+          globalAudioHandler?.refreshState();
         } else {
           if (_playingIndex != null && _playingIndex! < displayedRecitations.length - 1) {
             _play(displayedRecitations[_playingIndex! + 1]);
@@ -236,9 +383,9 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   void dispose() {
     WidgetsBinding.instance.removeObserver(this); // On éteint le radar
     _positionSubscription?.cancel();
+    _playerStateSubscription?.cancel();
     _sleepTimer?.cancel();
     _countdownTimer?.cancel();
-    _player.dispose();
     super.dispose();
   }
 
@@ -288,6 +435,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       
       if (!Platform.isWindows && !Platform.isLinux && !Platform.isMacOS) {
         _checkPermissionsAndConnectivity();
+        _ensureAudioFilesExtracted();
       }
       
     } catch (e) {
@@ -302,6 +450,138 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       final fallbackPath = p.join(_appDirPath!, 'luhaidan.db');
       _db = await openDatabase(fallbackPath, version: 3);
       await _fetch();
+    }
+  }
+
+  /// Recherche un fichier média local déjà présent sur le disque (priorise le fichier .m4a léger pour le lecteur audio)
+  Future<File?> _findLocalMediaFile(Map<String, dynamic> rec, {bool preferAudioOnly = true}) async {
+    if (_appDirPath == null) return null;
+    final int? id = rec['id'] is int ? rec['id'] as int : int.tryParse(rec['id']?.toString() ?? '');
+    final String fileStr = (rec['fichier'] ?? "").toString().trim();
+
+    final List<String> candidates = [];
+    if (preferAudioOnly && id != null) {
+      candidates.add(p.join(_appDirPath!, "audio_$id.m4a"));
+    }
+    if (fileStr.isNotEmpty && !isRemoteMediaUrl(fileStr)) {
+      candidates.add(_resolvePath(fileStr));
+    }
+    if (id != null) {
+      candidates.add(p.join(_appDirPath!, "yt_$id.mp4"));
+      candidates.add(p.join(_appDirPath!, "yt_$id.m4a"));
+      candidates.add(p.join(_appDirPath!, "yt_$id.mp3"));
+      if (!preferAudioOnly) {
+        candidates.add(p.join(_appDirPath!, "audio_$id.m4a"));
+      }
+    }
+
+    for (final candidatePath in candidates) {
+      final f = File(candidatePath);
+      if (await f.exists()) {
+        final len = await f.length();
+        if (len > 1024) {
+          return f;
+        }
+      }
+    }
+
+    // Fallback : vérifier dans getApplicationDocumentsDirectory() si différent de _appDirPath
+    try {
+      final docsDir = await getApplicationDocumentsDirectory();
+      if (docsDir.path != _appDirPath) {
+        final List<String> docCandidates = [];
+        if (preferAudioOnly && id != null) {
+          docCandidates.add(p.join(docsDir.path, "audio_$id.m4a"));
+        }
+        if (fileStr.isNotEmpty && !isRemoteMediaUrl(fileStr)) {
+          docCandidates.add(p.join(docsDir.path, p.basename(fileStr)));
+        }
+        if (id != null) {
+          docCandidates.add(p.join(docsDir.path, "yt_$id.mp4"));
+        }
+        for (final cPath in docCandidates) {
+          final f = File(cPath);
+          if (await f.exists() && await f.length() > 1024) {
+            return f;
+          }
+        }
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  /// Extrait une piste audio pure (.m4a avec +faststart) à partir d'un fichier vidéo .mp4
+  /// Réduit la consommation RAM de 95%, élimine le temps de chargement et stabilise le seek sur iOS.
+  Future<File?> _extractFastAudio(File sourceVideo, int id) async {
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS || _appDirPath == null) return null;
+    if (!await sourceVideo.exists() || await sourceVideo.length() <= 1024) return null;
+
+    final outPath = p.join(_appDirPath!, "audio_$id.m4a");
+    final tempOutPath = p.join(_appDirPath!, "audio_${id}_temp.m4a");
+    final tempOutFile = File(tempOutPath);
+
+    try {
+      if (await tempOutFile.exists()) await tempOutFile.delete();
+
+      // 1. Essai ultra-rapide par copie directe du flux audio AAC (-vn -c:a copy -movflags +faststart)
+      final copyCmd = "-y -i '${sourceVideo.path}' -vn -c:a copy -movflags +faststart '$tempOutPath'";
+      final session1 = await FFmpegKit.execute(copyCmd);
+      final rc1 = await session1.getReturnCode();
+
+      if (ReturnCode.isSuccess(rc1) && await tempOutFile.exists() && await tempOutFile.length() > 1024) {
+        final finalFile = File(outPath);
+        if (await finalFile.exists()) await finalFile.delete();
+        await tempOutFile.rename(outPath);
+        return finalFile;
+      }
+
+      // 2. Fallback transcodage AAC (si le flux source était Opus / MP3 dans un conteneur MP4/WebM)
+      if (await tempOutFile.exists()) await tempOutFile.delete();
+      final aacCmd = "-y -i '${sourceVideo.path}' -vn -c:a aac -b:a 128k -movflags +faststart '$tempOutPath'";
+      final session2 = await FFmpegKit.execute(aacCmd);
+      final rc2 = await session2.getReturnCode();
+
+      if (ReturnCode.isSuccess(rc2) && await tempOutFile.exists() && await tempOutFile.length() > 1024) {
+        final finalFile = File(outPath);
+        if (await finalFile.exists()) await finalFile.delete();
+        await tempOutFile.rename(outPath);
+        return finalFile;
+      }
+    } catch (e) {
+      debugPrint("Erreur extraction audio rapide ($id): $e");
+    } finally {
+      try {
+        if (await tempOutFile.exists()) await tempOutFile.delete();
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  /// Génère en arrière-plan les fichiers audio .m4a pour les récitations vidéo déjà téléchargées
+  Future<void> _ensureAudioFilesExtracted() async {
+    if (_isExtractingAudioBg || _appDirPath == null) return;
+    _isExtractingAudioBg = true;
+    try {
+      await Future.delayed(const Duration(seconds: 2));
+      final recsCopy = List<dynamic>.from(allRecitations);
+      for (final rec in recsCopy) {
+        if (!mounted) break;
+        final int? id = rec['id'];
+        if (id == null) continue;
+        final audioFile = File(p.join(_appDirPath!, "audio_$id.m4a"));
+        if (await audioFile.exists() && await audioFile.length() > 1024) continue;
+
+        final videoFile = await _findLocalMediaFile(rec, preferAudioOnly: false);
+        if (videoFile != null &&
+            (videoFile.path.toLowerCase().endsWith('.mp4') || videoFile.path.toLowerCase().endsWith('.mov'))) {
+          await _extractFastAudio(videoFile, id);
+          await Future.delayed(const Duration(milliseconds: 250));
+        }
+      }
+    } catch (_) {
+    } finally {
+      _isExtractingAudioBg = false;
     }
   }
 
@@ -320,27 +600,28 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   Future<void> _checkMissingDownloads() async {
     if (_appDirPath == null) return;
     
-    // Laisser le temps à l'application de s'afficher avant de bloquer le réseau
+    // Laisser le temps à l'application de s'afficher avant de solliciter le réseau
     await Future.delayed(const Duration(seconds: 3));
     
     final connectivityResult = await (Connectivity().checkConnectivity());
     if (connectivityResult.contains(ConnectivityResult.none)) return; // Pas de connexion internet
 
-    for (var rec in allRecitations) {
+    final recsCopy = List<dynamic>.from(allRecitations);
+    for (var rec in recsCopy) {
       if (!mounted) break;
-      String path = rec['fichier'] ?? "";
-      if (path.isEmpty || path.startsWith('http')) continue;
+      String path = (rec['fichier'] ?? "").toString().trim();
+      if (path.isEmpty || !isRemoteMediaUrl(path)) continue;
 
-      if (path.contains('youtube') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
-        final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
-        if (!await localFile.exists() || await localFile.length() < 50000) {
-          if (!_activeDownloads.containsKey(rec['id'])) {
-             try {
-                // On télécharge silencieusement en arrière-plan
-                _startDownload(rec['id'], path, localFile);
-             } catch (e) {
-                debugPrint("Auto-download failed for ${rec['id']}: $e");
-             }
+      final existingLocal = await _findLocalMediaFile(rec, preferAudioOnly: false);
+      if (existingLocal == null) {
+        final int id = rec['id'];
+        if (!_activeDownloads.containsKey(id)) {
+          try {
+            final localFile = File(p.join(_appDirPath!, "yt_$id.mp4"));
+            // Téléchargement séquentiel (await) pour ne jamais saturer la mémoire vive
+            await _startDownload(id, path, localFile, deleteRecordOnFailure: false);
+          } catch (e) {
+            debugPrint("Auto-download failed for $id: $e");
           }
         }
       }
@@ -363,6 +644,9 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       if (rec['fichier'] != null) validFiles.add(p.basename(rec['fichier']));
       if (rec['thumbnail'] != null) validFiles.add(p.basename(rec['thumbnail']));
       validFiles.add("yt_${rec['id']}.mp4");
+      validFiles.add("yt_${rec['id']}.m4a");
+      validFiles.add("yt_${rec['id']}.mp3");
+      validFiles.add("audio_${rec['id']}.m4a");
       validFiles.add("thumb_yt_${rec['id']}.jpg");
       validFiles.add("temp_edit_${rec['id']}.mp4"); // Bouclier pour les fichiers en cours de montage !
     }
@@ -372,7 +656,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         final basename = p.basename(f.path);
         if (basename.endsWith('.tmp')) {
           try { await f.delete(); } catch (_) {}
-        } else if ((basename.endsWith('.mp4') || basename.endsWith('.jpg') || basename.endsWith('.mp3')) && !validFiles.contains(basename)) {
+        } else if ((basename.endsWith('.mp4') || basename.endsWith('.m4a') || basename.endsWith('.jpg') || basename.endsWith('.mp3')) && !validFiles.contains(basename)) {
           try { await f.delete(); } catch (_) {}
         }
       }
@@ -392,10 +676,19 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     });
 
     if (lastPlayedId != null && allRecitations.isNotEmpty && currentRecitation == null) {
-       int idx = displayedRecitations.indexWhere((r) => r['id'] == lastPlayedId);
-       if (idx != -1) {
-          _play(displayedRecitations[idx], autoPlay: false);
-       }
+      int idx = displayedRecitations.indexWhere((r) => r['id'] == lastPlayedId);
+      if (idx != -1) {
+        final candidate = displayedRecitations[idx];
+        final localFile = await _findLocalMediaFile(candidate);
+        if (localFile != null) {
+          _play(candidate, autoPlay: false);
+        } else {
+          setState(() {
+            currentRecitation = candidate;
+            _playingIndex = idx;
+          });
+        }
+      }
     }
     
     // NOUVEAU : Lance la réparation automatique en arrière-plan
@@ -407,48 +700,63 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     bool hasUpdates = false;
     
     for (var rec in recs) {
-      String thumb = rec['thumbnail'] ?? "";
-      String fileStr = rec['fichier'] ?? "";
+      String thumb = (rec['thumbnail'] ?? "").toString();
       bool needsThumb = false;
       
-      // On regarde s'il manque une miniature locale
-      if (thumb.isEmpty) {
-         needsThumb = true;
-      } else if (!thumb.startsWith('http')) {
-         final thumbFile = File(p.join(_appDirPath!, thumb));
-         if (!await thumbFile.exists()) needsThumb = true;
+      // On regarde s'il manque une miniature locale (ou si c'est encore un lien http distant qui bloque le mode hors-ligne)
+      if (thumb.isEmpty || thumb.startsWith('http')) {
+        needsThumb = true;
+      } else {
+        final thumbFile = File(p.join(_appDirPath!, thumb));
+        if (!await thumbFile.exists() || await thumbFile.length() < 100) needsThumb = true;
       }
 
-      // Si oui, on extrait une nouvelle image de la vidéo
+      // Si oui, on télécharge ou extrait une image locale sur le disque
       if (needsThumb) {
-         File? videoFile;
-         if (fileStr.contains('youtube') || fileStr.contains('tiktok') || fileStr.contains('instagram')) {
-            videoFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
-         } else {
-            videoFile = File(p.join(_appDirPath!, fileStr));
-         }
-         
-         if (videoFile.existsSync()) {
+        String? savedThumbName;
+        if (thumb.startsWith('http')) {
+          try {
+            final candidateName = "thumb_${rec['id']}.jpg";
+            final dest = p.join(_appDirPath!, candidateName);
+            await Dio().download(thumb, dest, options: Options(receiveTimeout: const Duration(seconds: 8)));
+            if (await File(dest).exists() && await File(dest).length() > 100) {
+              savedThumbName = candidateName;
+            }
+          } catch (_) {}
+        }
+
+        if (savedThumbName == null && !Platform.isWindows) {
+          final videoFile = await _findLocalMediaFile(rec, preferAudioOnly: false);
+          if (videoFile != null && videoFile.existsSync() && !videoFile.path.endsWith('.m4a') && !videoFile.path.endsWith('.mp3')) {
             try {
-               final thumbData = await VideoThumbnail.thumbnailData(video: videoFile.path, imageFormat: ImageFormat.JPEG, maxWidth: 300, quality: 50);
-               if (thumbData != null) {
-                 String newThumb = "thumb_${rec['id']}_${DateTime.now().millisecondsSinceEpoch}.jpg";
-                 await File(p.join(_appDirPath!, newThumb)).writeAsBytes(thumbData);
-                 await _db?.update('recitations', {'thumbnail': newThumb}, where: 'id = ?', whereArgs: [rec['id']]);
-                 hasUpdates = true;
-               }
+              final thumbData = await VideoThumbnail.thumbnailData(
+                video: videoFile.path,
+                imageFormat: ImageFormat.JPEG,
+                maxWidth: 300,
+                quality: 50,
+              );
+              if (thumbData != null && thumbData.isNotEmpty) {
+                savedThumbName = "thumb_${rec['id']}_${DateTime.now().millisecondsSinceEpoch}.jpg";
+                await File(p.join(_appDirPath!, savedThumbName)).writeAsBytes(thumbData);
+              }
             } catch (_) {}
-         }
+          }
+        }
+
+        if (savedThumbName != null) {
+          await _db?.update('recitations', {'thumbnail': savedThumbName}, where: 'id = ?', whereArgs: [rec['id']]);
+          hasUpdates = true;
+        }
       }
     }
     
     // Si on a réparé des choses, on met à jour l'écran tout seul !
     if (hasUpdates && mounted) {
-       final updatedRes = await _db?.query('recitations', orderBy: 'sourate_num ASC');
-       setState(() {
-          allRecitations = updatedRes ?? [];
-          _applyFilters();
-       });
+      final updatedRes = await _db?.query('recitations', orderBy: 'sourate_num ASC');
+      setState(() {
+        allRecitations = updatedRes ?? [];
+        _applyFilters();
+      });
     }
   }
 
@@ -486,23 +794,31 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       try {
         final parts = r['duration'].toString().split(':');
         if (parts.length == 3) {
-           exactDur = Duration(hours: int.parse(parts[0]), minutes: int.parse(parts[1]), seconds: int.parse(parts[2]));
+          exactDur = Duration(hours: int.parse(parts[0]), minutes: int.parse(parts[1]), seconds: int.parse(parts[2]));
         } else if (parts.length == 2) {
-           exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
+          exactDur = Duration(minutes: int.parse(parts[0]), seconds: int.parse(parts[1]));
         }
       } catch (_) {}
     }
     
+    // CRITIQUE : Ne JAMAIS passer une URL http distante dans artUri car iOS (AudioServicePlugin)
+    // appelle [NSData dataWithContentsOfURL:] de façon synchrone sur le thread principal,
+    // ce qui bloque le lecteur hors-ligne et fige l'ouverture de l'application depuis l'écran verrouillé !
     Uri? artUri;
     if (r['thumbnail'] != null && r['thumbnail'].toString().isNotEmpty) {
       String resolved = _resolvePath(r['thumbnail'].toString());
-      artUri = resolved.startsWith('http') ? Uri.parse(resolved) : Uri.file(resolved);
+      if (!resolved.startsWith('http')) {
+        final f = File(resolved);
+        if (f.existsSync()) {
+          artUri = Uri.file(resolved);
+        }
+      }
     }
     return MediaItem(
-      id: "${r['id']}_${DateTime.now().millisecondsSinceEpoch}",
-      album: "Muhammad",
+      id: "recitation_${r['id']}",
+      album: "Muhammad Al-Luhaidan",
       title: "${r['sourate_num'].toString().padLeft(3, '0')} - ${r['sourate_name']}",
-      artist: "Muhammad",
+      artist: "Muhammad Al-Luhaidan",
       artUri: artUri,
       duration: exactDur,
     );
@@ -510,152 +826,257 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
   String _resolvePath(String pathStr) {
     if (pathStr.startsWith('http')) return pathStr;
-    if (pathStr.startsWith('/')) return pathStr; 
+    if (pathStr.startsWith('/') || pathStr.contains(':\\')) return pathStr;
     return _appDirPath != null ? p.join(_appDirPath!, pathStr) : pathStr;
   }
 
-  Future<void> _startDownload(int id, String cleanUrl, File localFile) async {
-    if (_activeDownloads.containsKey(id)) return; 
-    
-    setState(() => _activeDownloads[id] = 0.0);
+  Future<void> _startDownload(int id, String rawUrl, File localFile, {bool deleteRecordOnFailure = true}) async {
+    if (_activeDownloads.containsKey(id)) return;
+    final cleanUrl = MediaExtractor.extractCleanUrl(rawUrl);
+
+    if (mounted) setState(() => _activeDownloads[id] = 0.0);
     YoutubeExplode? yt;
-    final tempFile = File("${localFile.path}.tmp"); 
-    
+    final tempFile = File("${localFile.path}.tmp");
+
     try {
-      String downloadUrl = "";
-      
-      if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
-        final extracted = await MediaExtractor.getDownloadUrl(cleanUrl);
-        if (extracted == null) throw Exception("Impossible de trouver la vidéo (Lien privé ou invalide).");
-        downloadUrl = extracted;
-      } else {
-        yt = YoutubeExplode();
-        var manifest = await yt.videos.streamsClient.getManifest(cleanUrl);
-        var mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
-        var streamInfo = mp4Muxed.isNotEmpty 
-            ? mp4Muxed.withHighestBitrate() 
-            : manifest.audioOnly.where((s) => s.container.name == 'mp4').withHighestBitrate();
-        downloadUrl = streamInfo.url.toString();
+      if (await tempFile.exists()) {
+        try { await tempFile.delete(); } catch (_) {}
       }
-      
+
       int expectedTotal = -1;
       int lastUpdateValue = 0;
-      
-      await Dio().download(
-        downloadUrl,
-        tempFile.path,
-        options: Options(
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
-            // CRITIQUE : AUCUN REFERER ICI. On laisse Instagram penser qu'on navigue normalement.
-          },
-          receiveTimeout: const Duration(seconds: 30),
-          followRedirects: true, 
-        ),
-        onReceiveProgress: (received, total) {
-          if (total != -1) {
-            expectedTotal = total;
-            int percentage = ((received / total) * 100).toInt();
-            if (percentage != lastUpdateValue) {
-              lastUpdateValue = percentage;
-              if (mounted) setState(() => _activeDownloads[id] = percentage / 100.0);
-            }
+      bool downloaded = false;
+      String? remoteThumbUrl;
+      Duration? extractedDuration;
+
+      // 1. Si c'est un lien YouTube, on tente d'abord le flux natif YoutubeExplode (ultra-rapide sans bridage 403)
+      if (MediaExtractor.isYouTubeUrl(cleanUrl)) {
+        try {
+          yt = YoutubeExplode();
+          final video = await yt.videos.get(cleanUrl).timeout(const Duration(seconds: 15));
+          extractedDuration = video.duration;
+          remoteThumbUrl = video.thumbnails.mediumResUrl;
+
+          final manifest = await yt.videos.streamsClient.getManifest(video.id).timeout(const Duration(seconds: 15));
+          StreamInfo? streamInfo;
+          final mp4Muxed = manifest.muxed.where((s) => s.container.name == 'mp4');
+          if (mp4Muxed.isNotEmpty) {
+            streamInfo = mp4Muxed.withHighestBitrate();
+          } else if (manifest.muxed.isNotEmpty) {
+            streamInfo = manifest.muxed.withHighestBitrate();
           } else {
-            int megabyteStep = (received / 500000).toInt(); 
-            if (megabyteStep != lastUpdateValue) {
-              lastUpdateValue = megabyteStep;
-              if (mounted) setState(() => _activeDownloads[id] = -(received.toDouble()));
+            final mp4Audio = manifest.audioOnly.where((s) => s.container.name == 'mp4');
+            streamInfo = mp4Audio.isNotEmpty ? mp4Audio.withHighestBitrate() : manifest.audioOnly.withHighestBitrate();
+          }
+
+          expectedTotal = streamInfo.size.totalBytes;
+          final stream = yt.videos.streamsClient.get(streamInfo);
+          final sink = tempFile.openWrite();
+          int received = 0;
+
+          await for (final chunk in stream) {
+            sink.add(chunk);
+            received += chunk.length;
+            if (expectedTotal > 0) {
+              int percentage = ((received / expectedTotal) * 100).clamp(0, 100).toInt();
+              if (percentage != lastUpdateValue) {
+                lastUpdateValue = percentage;
+                if (mounted) setState(() => _activeDownloads[id] = percentage / 100.0);
+              }
+            } else {
+              int step = (received / 250000).toInt();
+              if (step != lastUpdateValue) {
+                lastUpdateValue = step;
+                if (mounted) setState(() => _activeDownloads[id] = -(received.toDouble()));
+              }
             }
           }
-        },
-      );
-      
-      if (await tempFile.exists() && await tempFile.length() > 50000) { 
-        if (expectedTotal != -1 && await tempFile.length() < expectedTotal) {
-           throw Exception("Téléchargement incomplet (le fichier a été coupé).");
+          await sink.flush();
+          await sink.close();
+          if (await tempFile.exists() && await tempFile.length() > 5000) {
+            downloaded = true;
+          }
+        } catch (e) {
+          debugPrint("Fallback extracteur universel pour YouTube ($e)");
+        } finally {
+          yt?.close();
+          yt = null;
+        }
+      }
+
+      // 2. Extracteur Universel Multi-Sources ("Black Hole Splitter" engine : Instagram, TikTok, X, Facebook, YouTube fallback, Web...)
+      if (!downloaded) {
+        final extracted = await MediaExtractor.extractMedia(cleanUrl);
+        if (extracted == null || extracted.url.isEmpty) {
+          throw Exception("Impossible d'extraire la vidéo ou l'audio depuis ce lien (Lien privé ou protégé).");
         }
 
-        if (await localFile.exists()) await localFile.delete(); 
-        await tempFile.rename(localFile.path); 
-        
-        if (cleanUrl.contains('instagram') || cleanUrl.contains('tiktok')) {
-          if (!Platform.isWindows) { // <-- PROTECTION WINDOWS
+        remoteThumbUrl ??= extracted.thumbnailUrl;
+        extractedDuration ??= extracted.duration;
+
+        if (extracted.isHls || extracted.url.contains('.m3u8')) {
+          // Flux HLS (.m3u8) -> Téléchargement et assemblage direct via FFmpegKit
+          final cmd = "-y -i '${extracted.url}' -c copy -bsf:a aac_adtstoasc -movflags +faststart '${tempFile.path}'";
+          final session = await FFmpegKit.execute(cmd);
+          final rc = await session.getReturnCode();
+          if (!ReturnCode.isSuccess(rc) || !await tempFile.exists() || await tempFile.length() < 5000) {
+            throw Exception("Échec de l'assemblage du flux vidéo.");
+          }
+          downloaded = true;
+        } else {
+          expectedTotal = -1;
+          lastUpdateValue = 0;
+          await Dio().download(
+            extracted.url,
+            tempFile.path,
+            options: Options(
+              headers: extracted.headers,
+              receiveTimeout: const Duration(seconds: 60),
+              sendTimeout: const Duration(seconds: 20),
+              followRedirects: true,
+              maxRedirects: 8,
+            ),
+            onReceiveProgress: (received, total) {
+              if (total > 0) {
+                expectedTotal = total;
+                int percentage = ((received / total) * 100).clamp(0, 100).toInt();
+                if (percentage != lastUpdateValue) {
+                  lastUpdateValue = percentage;
+                  if (mounted) setState(() => _activeDownloads[id] = percentage / 100.0);
+                }
+              } else {
+                int megabyteStep = (received / 250000).toInt();
+                if (megabyteStep != lastUpdateValue) {
+                  lastUpdateValue = megabyteStep;
+                  if (mounted) setState(() => _activeDownloads[id] = -(received.toDouble()));
+                }
+              }
+            },
+          );
+
+          // Si Reddit ou flux adaptatif possède une piste audio séparée, on fusionne vidéo + audio avec FFmpeg
+          if (extracted.audioUrl != null && extracted.audioUrl!.isNotEmpty && !Platform.isWindows) {
             try {
-               final metadata = await MetadataRetriever.fromFile(localFile);
-               if (metadata.trackDuration == null || metadata.trackDuration == 0) {
-                  throw Exception("Fichier corrompu (pas de durée audio valide).");
-               }
-               
-               String newDur = "--:--";
-               final d = Duration(milliseconds: metadata.trackDuration!);
-               String twoDigits(int n) => n.toString().padLeft(2, '0');
-               if (d.inHours > 0) {
-                 newDur = "${twoDigits(d.inHours)}:${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
-               } else {
-                 newDur = "${twoDigits(d.inMinutes)}:${twoDigits(d.inSeconds.remainder(60))}";
-               }
-               
-               String newThumb = "thumb_yt_$id.jpg";
-               final thumbData = await VideoThumbnail.thumbnailData(
-                 video: localFile.path,
-                 imageFormat: ImageFormat.JPEG,
-                 maxWidth: 300, 
-                 quality: 50,
-               );
-               
-               if (thumbData != null) {
-                 final thumbFile = File(p.join(localFile.parent.path, newThumb));
-                 await thumbFile.writeAsBytes(thumbData);
-               } else {
-                 newThumb = ""; 
-               }
-
-               if (newDur != "--:--" || newThumb.isNotEmpty) {
-                  await _db?.update('recitations', {'duration': newDur, 'thumbnail': newThumb}, where: 'id = ?', whereArgs: [id]);
-               }
-            } catch (e) {
-               if (e.toString().contains("Fichier corrompu")) rethrow;
-               debugPrint("Erreur métadonnées: $e");
-            }
+              final tempAudio = File("${localFile.path}_audio.tmp");
+              final tempMerged = File("${localFile.path}_merged.mp4");
+              await Dio().download(extracted.audioUrl!, tempAudio.path, options: Options(headers: extracted.headers));
+              if (await tempAudio.exists() && await tempAudio.length() > 1000) {
+                final mergeCmd = "-y -i '${tempFile.path}' -i '${tempAudio.path}' -c:v copy -c:a aac -movflags +faststart '${tempMerged.path}'";
+                final session = await FFmpegKit.execute(mergeCmd);
+                if (ReturnCode.isSuccess(await session.getReturnCode()) && await tempMerged.exists()) {
+                  await tempFile.delete();
+                  await tempMerged.rename(tempFile.path);
+                }
+              }
+              if (await tempAudio.exists()) await tempAudio.delete();
+              if (await tempMerged.exists()) await tempMerged.delete();
+            } catch (_) {}
           }
+          downloaded = true;
         }
-        
+      }
+
+      if (downloaded && await tempFile.exists() && await tempFile.length() > 2048) {
+        if (expectedTotal > 0 && await tempFile.length() < (expectedTotal * 0.9)) {
+          throw Exception("Téléchargement incomplet (le fichier a été coupé).");
+        }
+
+        if (await localFile.exists()) await localFile.delete();
+        await tempFile.rename(localFile.path);
+
+        // Extraction immédiate de la piste audio pure (.m4a +faststart) pour une lecture instantanée sans saturer la RAM
+        await _extractFastAudio(localFile, id);
+
+        String newDur = "--:--";
+        if (extractedDuration != null && extractedDuration.inSeconds > 0) {
+          newDur = _formatDuration(extractedDuration);
+        }
+
+        String newThumb = "";
+        final thumbFileName = "thumb_yt_$id.jpg";
+        final thumbFilePath = p.join(localFile.parent.path, thumbFileName);
+
+        if (!Platform.isWindows) {
+          try {
+            final metadata = await MetadataRetriever.fromFile(localFile);
+            if (metadata.trackDuration != null && metadata.trackDuration! > 0) {
+              final d = Duration(milliseconds: metadata.trackDuration!);
+              newDur = _formatDuration(d);
+            }
+          } catch (e) {
+            debugPrint("Info metadata: $e");
+          }
+
+          try {
+            final thumbData = await VideoThumbnail.thumbnailData(
+              video: localFile.path,
+              imageFormat: ImageFormat.JPEG,
+              maxWidth: 300,
+              quality: 60,
+            );
+            if (thumbData != null && thumbData.isNotEmpty) {
+              await File(thumbFilePath).writeAsBytes(thumbData);
+              newThumb = thumbFileName;
+            }
+          } catch (_) {}
+        }
+
+        // Fallback miniature depuis l'URL distante si VideoThumbnail n'a rien extrait
+        if (newThumb.isEmpty && remoteThumbUrl != null && remoteThumbUrl.startsWith('http')) {
+          try {
+            await Dio().download(remoteThumbUrl, thumbFilePath, options: Options(receiveTimeout: const Duration(seconds: 8)));
+            if (await File(thumbFilePath).exists() && await File(thumbFilePath).length() > 100) {
+              newThumb = thumbFileName;
+            }
+          } catch (_) {}
+        }
+
+        final Map<String, Object?> updates = {};
+        if (newDur != "--:--") updates['duration'] = newDur;
+        if (newThumb.isNotEmpty) updates['thumbnail'] = newThumb;
+        if (updates.isNotEmpty) {
+          await _db?.update('recitations', updates, where: 'id = ?', whereArgs: [id]);
+        }
+
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("✅ Vidéo prête pour le hors-ligne !", style: TextStyle(color: Colors.white)), backgroundColor: Colors.green, duration: Duration(seconds: 3))
+            const SnackBar(
+              content: Text("✅ Récitation prête pour l'écoute hors-ligne !", style: TextStyle(color: Colors.white)),
+              backgroundColor: Colors.green,
+              duration: Duration(seconds: 3),
+            ),
           );
         }
-        _fetch(); 
+        await _fetch();
       } else {
         throw Exception("Fichier corrompu ou illisible.");
       }
     } catch (e) {
       debugPrint("Erreur téléchargement: $e");
       if (await tempFile.exists()) {
-         try { await tempFile.delete(); } catch (_) {}
-      }
-      
-      if (!await localFile.exists()) {
-          await _db?.delete('recitations', where: 'id = ?', whereArgs: [id]);
-          if (mounted) _fetch(); 
+        try { await tempFile.delete(); } catch (_) {}
       }
 
-      // AFFICHAGE DYNAMIQUE DE L'ERREUR
+      if (deleteRecordOnFailure && !await localFile.exists()) {
+        await _db?.delete('recitations', where: 'id = ?', whereArgs: [id]);
+        if (mounted) await _fetch();
+      }
+
       String errorMsg = e.toString();
       if (errorMsg.contains("Exception:")) {
-         errorMsg = errorMsg.split("Exception:").last.trim();
+        errorMsg = errorMsg.split("Exception:").last.trim();
       } else {
-         errorMsg = "Échec (${errorMsg.split('\n')[0]})"; 
+        errorMsg = "Échec (${errorMsg.split('\n')[0]})";
       }
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("❌ $errorMsg"), backgroundColor: Colors.red, duration: const Duration(seconds: 6))
+          SnackBar(content: Text("❌ $errorMsg"), backgroundColor: Colors.red, duration: const Duration(seconds: 6)),
         );
       }
     } finally {
       yt?.close();
-      if (mounted) setState(() => _activeDownloads.remove(id)); 
+      if (mounted) setState(() => _activeDownloads.remove(id));
     }
   }
 
@@ -664,64 +1085,92 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     if (index == -1) return;
 
     final reqId = ++_playRequestId;
-
-    String path = rec['fichier'] ?? "";
+    final int recId = rec['id'];
+    String path = (rec['fichier'] ?? "").toString().trim();
     Uri uri;
 
     try {
-      if (path.contains('youtube') || path.contains('youtu.be') || path.contains('shorts') || path.contains('instagram') || path.contains('tiktok')) {
-        final localFile = File(p.join(_appDirPath!, "yt_${rec['id']}.mp4"));
-        if (await localFile.exists()) {
-          if (await localFile.length() < 50000) {
-            await localFile.delete(); 
-            uri = Uri.parse(ProxyServer.getProxyUrl(path));
-          } else {
-            uri = Uri.file(localFile.path);
-          }
-        } else {
-          uri = Uri.parse(ProxyServer.getProxyUrl(path));
+      // 1. PRIORITÉ ABSOLUE AU FICHIER LOCAL (zéro attente réseau, lecture instantanée hors-ligne)
+      final localFile = await _findLocalMediaFile(rec, preferAudioOnly: true);
+
+      if (localFile != null) {
+        uri = Uri.file(localFile.path);
+        // Si on lit encore un .mp4, on lance l'extraction .m4a en tâche de fond pour la prochaine écoute
+        if (localFile.path.toLowerCase().endsWith('.mp4')) {
+          Future.microtask(() => _extractFastAudio(localFile, recId));
         }
+      } else if (isRemoteMediaUrl(path)) {
+        // Fichier non encore téléchargé sur l'appareil
+        final connectivityResult = await (Connectivity().checkConnectivity());
+        if (connectivityResult.contains(ConnectivityResult.none)) {
+          if (mounted && autoPlay) {
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text("⚠️ Récitation non téléchargée hors-ligne. Connectez-vous à Internet pour la télécharger."),
+              backgroundColor: Colors.orange,
+            ));
+          }
+          return;
+        }
+        // On lance son téléchargement local immédiatement pour qu'elle soit disponible hors-ligne
+        if (_appDirPath != null && !_activeDownloads.containsKey(recId)) {
+          final targetVideo = File(p.join(_appDirPath!, "yt_$recId.mp4"));
+          _startDownload(recId, path, targetVideo, deleteRecordOnFailure: false);
+        }
+        if (!autoPlay) return;
+        uri = Uri.parse(ProxyServer.getProxyUrl(path));
       } else {
-        String resolved = _resolvePath(path);
-        if (resolved.startsWith('http') || resolved.startsWith('https')) {
-          uri = Uri.parse(resolved);
-        } else {
-          final f = File(resolved);
-          if (await f.exists() && await f.length() < 1000) {
-            await f.delete(); 
-          }
-          if (!await f.exists()) {
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                content: Text("❌ Fichier introuvable sur le disque. Veuillez retélécharger la récitation."), 
-                backgroundColor: Colors.red
-              ));
-            }
-            return; 
-          }
-          uri = Uri.file(resolved);
+        if (mounted && autoPlay) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text("❌ Fichier introuvable sur le disque. Veuillez retélécharger la récitation."),
+            backgroundColor: Colors.red,
+          ));
         }
+        return;
       }
 
       if (reqId != _playRequestId) return; // A newer request was made
 
       _isSwitchingTrack = true;
-      setState(() {
+      if (mounted) {
+        setState(() {
+          currentRecitation = rec;
+          _playingIndex = index;
+        });
+      } else {
         currentRecitation = rec;
         _playingIndex = index;
-      });
+      }
 
       final tag = _createMediaItem(rec);
-      var baseSource = AudioSource.uri(uri, tag: tag);
-      
-      var loadFuture = _player.setAudioSource(baseSource);
+      globalAudioHandler?.updateCurrentMediaItem(tag);
+
+      if (!Platform.isWindows && !Platform.isLinux && !Platform.isMacOS && autoPlay) {
+        try {
+          final session = await AudioSession.instance;
+          await session.setActive(true);
+        } catch (_) {}
+      }
+
+      final baseSource = AudioSource.uri(uri, tag: tag);
+      final loadFuture = _player.setAudioSource(baseSource);
       if (autoPlay) {
         _player.play(); // Queues playback to start automatically once loaded
       }
-      await loadFuture;
-      
+      final loadedDuration = await loadFuture;
+
+      if (loadedDuration != null && loadedDuration > Duration.zero) {
+        globalAudioHandler?.updateCurrentMediaItem(tag.copyWith(duration: loadedDuration));
+        // Mise à jour automatique de la durée en BDD si elle était inconnue ("--:--")
+        if (rec['duration'] == null || rec['duration'] == "--:--" || rec['duration'].toString().isEmpty) {
+          final formattedDur = _formatDuration(loadedDuration);
+          await _db?.update('recitations', {'duration': formattedDur}, where: 'id = ?', whereArgs: [recId]);
+        }
+      } else {
+        globalAudioHandler?.refreshState();
+      }
+
       final prefs = await SharedPreferences.getInstance();
-      prefs.setInt('last_played_id', rec['id']);
+      prefs.setInt('last_played_id', recId);
 
     } catch (e) {
       if (reqId != _playRequestId) return; // Ignore errors from cancelled requests
@@ -734,6 +1183,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
     } finally {
       if (reqId == _playRequestId) {
         _isSwitchingTrack = false;
+        globalAudioHandler?.refreshState();
       }
     }
   }
@@ -746,6 +1196,11 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
   void _playPrevious() {
     if (displayedRecitations.isEmpty) return;
+    if (_player.position.inSeconds > 3) {
+      _player.seek(Duration.zero);
+      globalAudioHandler?.refreshState();
+      return;
+    }
     int index = displayedRecitations.indexWhere((r) => r['id'] == currentRecitation?['id']);
     _play(displayedRecitations[(index - 1 + displayedRecitations.length) % displayedRecitations.length]);
   }
@@ -866,40 +1321,51 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   }
 
   String _formatDuration(Duration d) {
+    if (d.isNegative) return "0:00";
     String twoDigits(int n) => n.toString().padLeft(2, "0");
+    if (d.inHours > 0) {
+      return "${d.inHours}:${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
+    }
     return "${d.inMinutes}:${twoDigits(d.inSeconds.remainder(60))}";
+  }
+
+  Widget _buildFallbackThumb() {
+    return Container(
+      width: 50,
+      height: 50,
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A262B),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: const Icon(Icons.graphic_eq, color: Color(0xFF7EB8C9), size: 26),
+    );
   }
 
   Widget _buildThumbnail(String? thumbPath) {
     if (thumbPath == null || thumbPath.isEmpty) {
-      return Image.asset(
-        'assets/logo.jpg', 
-        width: 50, 
-        height: 50, 
-        fit: BoxFit.cover, 
-        cacheWidth: 150,
-        errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40)
-      );
+      return _buildFallbackThumb();
     }
-    
+
     String resolvedPath = _resolvePath(thumbPath);
     if (resolvedPath.startsWith('http')) {
       return Image.network(
-        resolvedPath, 
-        width: 50, 
-        height: 50, 
-        fit: BoxFit.cover, 
+        resolvedPath,
+        width: 50,
+        height: 50,
+        fit: BoxFit.cover,
         cacheWidth: 150,
-        errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40)
+        errorBuilder: (_, __, ___) => _buildFallbackThumb(),
       );
     } else {
+      final file = File(resolvedPath);
+      if (!file.existsSync()) return _buildFallbackThumb();
       return Image.file(
-        File(resolvedPath), 
-        width: 50, 
-        height: 50, 
-        fit: BoxFit.cover, 
+        file,
+        width: 50,
+        height: 50,
+        fit: BoxFit.cover,
         cacheWidth: 150,
-        errorBuilder: (_, __, ___) => const Icon(Icons.mic, size: 40)
+        errorBuilder: (_, __, ___) => _buildFallbackThumb(),
       );
     }
   }
@@ -947,7 +1413,12 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
       final files = dir.listSync();
       for (var f in files) {
-        if (f is File && (f.path.endsWith('.mp4') || f.path.endsWith('.jpg'))) {
+        if (f is File &&
+            (f.path.endsWith('.mp4') ||
+             f.path.endsWith('.m4a') ||
+             f.path.endsWith('.mp3') ||
+             f.path.endsWith('.mov') ||
+             f.path.endsWith('.jpg'))) {
           await f.copy(p.join(tempDir.path, p.basename(f.path))); 
         }
       }
@@ -1019,7 +1490,11 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
           extractedWal = extractedFile;
         } else if (cleanName == 'luhaidan.db-shm') {
           extractedShm = extractedFile;
-        } else if (cleanName.endsWith('.mp4') || cleanName.endsWith('.jpg') || cleanName.endsWith('.mov')) {
+        } else if (cleanName.endsWith('.mp4') ||
+                   cleanName.endsWith('.m4a') ||
+                   cleanName.endsWith('.mp3') ||
+                   cleanName.endsWith('.jpg') ||
+                   cleanName.endsWith('.mov')) {
           extractedMedia.add(extractedFile);
         }
       }
@@ -1143,16 +1618,6 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                     child: const Icon(Icons.add, color: Colors.white, size: 30)
                   )
                 ),
-                // Navigateur invisible pour le scraping
-                Positioned(
-                  left: -1000,
-                  top: -1000,
-                  width: 100,
-                  height: 100,
-                  child: WebScraper.controller != null 
-                      ? WebViewWidget(controller: WebScraper.controller!) 
-                      : const SizedBox(),
-                ),
               ],
             ),
           ),
@@ -1226,50 +1691,22 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
             ],
           ),
           
-          const SizedBox(height: 4),
+          const SizedBox(height: 6),
           
+          // Barre de timeline style iOS (glissement relatif amorti + stabilisation anti-saut au relâchement)
           StreamBuilder<Duration>(
-            stream: _player.positionStream,
+            stream: _isInBackground ? const Stream<Duration>.empty() : _player.positionStream,
             builder: (context, snapshot) {
-              final pos = snapshot.data ?? Duration.zero;
+              final pos = snapshot.data ?? _player.position;
               final dur = _player.duration ?? Duration.zero;
-              double maxDur = dur.inSeconds.toDouble() > 0 ? dur.inSeconds.toDouble() : 1.0;
-              double sliderVal = _dragValue ?? pos.inSeconds.toDouble().clamp(0, maxDur);
-              
-              return Column(
-                children: [
-                  SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0), 
-                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 14.0)
-                    ),
-                    child: Slider(
-                      activeColor: const Color(0xFF7EB8C9), 
-                      inactiveColor: Colors.white24,
-                      value: sliderVal, 
-                      max: maxDur,
-                      onChanged: (v) => setState(() => _dragValue = v),
-                      onChangeEnd: (v) {
-                        // CORRECTIF 3 : On retire l'index pour cibler la piste unique !
-                        _player.seek(Duration(seconds: v.toInt()));
-                        setState(() => _dragValue = null);
-                      },
-                    ),
-                  ),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween, 
-                    children: [
-                      Text(
-                        _formatDuration(Duration(seconds: sliderVal.toInt())), 
-                        style: const TextStyle(fontSize: 11, color: Colors.grey)
-                      ), 
-                      Text(
-                        _formatDuration(dur), 
-                        style: const TextStyle(fontSize: 11, color: Colors.grey)
-                      )
-                    ]
-                  ),
-                ],
+              return _IosTimelineScrubber(
+                position: pos,
+                duration: dur,
+                formatDuration: _formatDuration,
+                onSeek: (target) async {
+                  await _player.seek(target);
+                  globalAudioHandler?.refreshState();
+                },
               );
             },
           ),
@@ -1321,6 +1758,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                       } else {
                         _player.pause();
                       }
+                      globalAudioHandler?.refreshState();
                     }
                   );
                 },
@@ -1334,6 +1772,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                 onPressed: () {
                   _player.pause(); 
                   _player.seek(Duration.zero);
+                  globalAudioHandler?.refreshState();
                 }
               ),
             ],
@@ -1377,6 +1816,8 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                     builder: (context) => YoutubeBrowserScreen(
                       db: _db,
                       onSave: _fetch,
+                      appDirPath: _appDirPath,
+                      onDownload: (id, url, file) => _startDownload(id, url, file),
                     ),
                   ),
                 );
@@ -1513,33 +1954,39 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
               // 3. NETTOYAGE PHYSIQUE ANTI-DOUBLONS (Fichiers & Miniatures)
               try {
-                final dir = await getApplicationDocumentsDirectory();
-                
-                // A. Supprimer la vidéo YouTube (si existante)
-                final ytFile = File(p.join(dir.path, "yt_${rec['id']}.mp4"));
-                if (await ytFile.exists()) await ytFile.delete();
+                final baseDirPath = _appDirPath ?? (await getApplicationDocumentsDirectory()).path;
+                final id = rec['id'];
 
-                // B. Supprimer le fichier vidéo Local (si existant)
-                String fileStr = rec['fichier'] ?? "";
-                if (!fileStr.contains('youtu') && fileStr.isNotEmpty) {
-                  final localFile = File(p.join(dir.path, fileStr));
+                for (final candidate in [
+                  "yt_$id.mp4",
+                  "yt_$id.m4a",
+                  "yt_$id.mp3",
+                  "audio_$id.m4a",
+                ]) {
+                  final f = File(p.join(baseDirPath, candidate));
+                  if (await f.exists()) await f.delete();
+                }
+
+                // B. Supprimer le fichier vidéo/audio Local (si existant)
+                String fileStr = (rec['fichier'] ?? "").toString();
+                if (!isRemoteMediaUrl(fileStr) && fileStr.isNotEmpty) {
+                  final localFile = File(p.join(baseDirPath, p.basename(fileStr)));
                   if (await localFile.exists()) await localFile.delete();
                 }
 
                 // C. Supprimer la miniature associée (si elle est téléchargée localement)
-                String thumbStr = rec['thumbnail'] ?? "";
+                String thumbStr = (rec['thumbnail'] ?? "").toString();
                 if (thumbStr.isNotEmpty && !thumbStr.startsWith('http')) {
-                  final thumbFile = File(p.join(dir.path, thumbStr));
+                  final thumbFile = File(p.join(baseDirPath, p.basename(thumbStr)));
                   if (await thumbFile.exists()) await thumbFile.delete();
                 }
               } catch (e) {
                 debugPrint("Erreur lors de la suppression des fichiers : $e");
               }
 
-              // 4. RAFRAÎCHIR L'INTERFACE ET LA PLAYLIST AIRPLAY
+              // 4. RAFRAÎCHIR L'INTERFACE
               _fetch(); 
             },
-            // LA LIGNE MANQUANTE EST JUSTE ICI :
             child: const Text("Supprimer", style: TextStyle(color: Colors.white)) 
           )
         ],
@@ -1554,9 +2001,10 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         rec: rec, 
         onSave: _fetch, 
         db: _db, 
+        appDirPath: _appDirPath,
         initialUrl: initialUrl,
         onDownload: (id, url, file) => _startDownload(id, url, file),
-        onEdit: _launchEditorAndSave, // NOUVEAU : On connecte l'éditeur au formulaire !
+        onEdit: _launchEditorAndSave,
       )
     );
   }
@@ -1573,16 +2021,23 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
 
     if (result != null && result is Map) {
       File editedFile = result['file'];
-      Map<String, dynamic> meta = result['metadata'];
-      final dir = await getApplicationDocumentsDirectory();
+      Map<String, dynamic> meta = Map<String, dynamic>.from(result['metadata']);
+      final baseDirPath = _appDirPath ?? (await getApplicationDocumentsDirectory()).path;
       
       if (meta.containsKey('id') && meta['id'] != null) {
         // CAS 1 : MODIFICATION
         int id = meta['id'];
         String newFileName = "edited_${id}_${DateTime.now().millisecondsSinceEpoch}.mp4"; 
-        File finalDest = File(p.join(dir.path, newFileName));
+        File finalDest = File(p.join(baseDirPath, newFileName));
         
         await editedFile.copy(finalDest.path);
+
+        // Régénère immédiatement la piste audio pure .m4a correspondant à la vidéo rognée
+        final oldAudio = File(p.join(baseDirPath, "audio_$id.m4a"));
+        if (await oldAudio.exists()) {
+          try { await oldAudio.delete(); } catch (_) {}
+        }
+        await _extractFastAudio(finalDest, id);
 
         try {
            final newMetadata = await MetadataRetriever.fromFile(finalDest);
@@ -1595,7 +2050,7 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
            String newThumb = "thumb_${id}_${DateTime.now().millisecondsSinceEpoch}.jpg";
            final thumbData = await VideoThumbnail.thumbnailData(video: finalDest.path, imageFormat: ImageFormat.JPEG, maxWidth: 300, quality: 50);
            if (thumbData != null) {
-             await File(p.join(dir.path, newThumb)).writeAsBytes(thumbData);
+             await File(p.join(baseDirPath, newThumb)).writeAsBytes(thumbData);
            } else {
              newThumb = meta['thumbnail'] ?? "";
            }
@@ -1607,11 +2062,14 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       } else {
         // CAS 2 : NOUVELLE VIDÉO
         String newFileName = "local_${DateTime.now().millisecondsSinceEpoch}.mp4";
-        File finalDest = File(p.join(dir.path, newFileName));
+        File finalDest = File(p.join(baseDirPath, newFileName));
         await editedFile.copy(finalDest.path);
         
         meta['fichier'] = newFileName;
-        await _db?.insert('recitations', meta);
+        final insertedId = await _db?.insert('recitations', meta);
+        if (insertedId != null) {
+          await _extractFastAudio(finalDest, insertedId);
+        }
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ Nouvelle vidéo enregistrée et rognée !"), backgroundColor: Colors.green));
       }
       
@@ -1620,11 +2078,11 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
         _playingIndex = null;
       });
 
-      await _fetch(); // C'EST TOUT ! Ne rajoute SURTOUT PAS _updateFullPlaylist() après !
+      await _fetch();
 
       if (await editedFile.exists()) await editedFile.delete();
       if (meta.containsKey('id')) {
-        final tempEdit = File(p.join(dir.path, "temp_edit_${meta['id']}.mp4"));
+        final tempEdit = File(p.join(baseDirPath, "temp_edit_${meta['id']}.mp4"));
         if (await tempEdit.exists()) await tempEdit.delete();
       }
     }
@@ -1700,14 +2158,14 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
                   final fileName = rec['fichier']?.toString() ?? "";
                   
                   // LOGIQUE DE DÉTECTION ROBUSTE :
-                  // 1. Soit c'est un fichier YouTube/Insta (stocké en yt_ID.mp4)
+                  // 1. Soit c'est un fichier téléchargé (stocké en yt_ID.mp4)
                   // 2. Soit c'est un import local (stocké avec son nom d'origine)
                   final File ytFile = File(p.join(_appDirPath!, "yt_$id.mp4"));
-                  final File localFile = File(p.join(_appDirPath!, fileName));
+                  final File localFile = File(p.join(_appDirPath!, p.basename(fileName)));
 
-                  bool exists = ytFile.existsSync() || (fileName.isNotEmpty && localFile.existsSync() && !fileName.startsWith('http'));
+                  bool exists = ytFile.existsSync() || (fileName.isNotEmpty && localFile.existsSync() && !isRemoteMediaUrl(fileName));
 
-                  if (!exists) return const SizedBox.shrink(); // On cache si le fichier n.est pas sur le téléphone
+                  if (!exists) return const SizedBox.shrink(); // On cache si le fichier n'est pas sur le téléphone
                   
                   return ListTile(
                     leading: ClipRRect(
@@ -1734,25 +2192,25 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   Future<void> _prepareExistingVideoForEditor(Map<String, dynamic> rec) async {
     _showLoading("Préparation de la copie de travail...");
     try {
-      final dir = await getApplicationDocumentsDirectory();
+      final baseDirPath = _appDirPath ?? (await getApplicationDocumentsDirectory()).path;
       File sourceFile;
       
       final id = rec['id'];
       final fileName = rec['fichier']?.toString() ?? "";
-      final File ytFile = File(p.join(dir.path, "yt_$id.mp4"));
-      final File localFile = File(p.join(dir.path, fileName));
+      final File ytFile = File(p.join(baseDirPath, "yt_$id.mp4"));
+      final File localFile = File(p.join(baseDirPath, p.basename(fileName)));
 
       // On détermine quel fichier utiliser
       if (ytFile.existsSync()) {
         sourceFile = ytFile;
-      } else if (localFile.existsSync()) {
+      } else if (fileName.isNotEmpty && !isRemoteMediaUrl(fileName) && localFile.existsSync()) {
         sourceFile = localFile;
       } else {
-        throw Exception("Fichier introuvable sur l'appareil.");
+        throw Exception("Fichier vidéo (.mp4) introuvable sur l'appareil.");
       }
 
       // Création de la copie temporaire pour l'éditeur
-      final tempFile = File(p.join(dir.path, "temp_edit_${rec['id']}.mp4"));
+      final tempFile = File(p.join(baseDirPath, "temp_edit_${rec['id']}.mp4"));
       if (await tempFile.exists()) await tempFile.delete();
       await sourceFile.copy(tempFile.path);
 
@@ -1769,9 +2227,17 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      _lastWakeUp = DateTime.now(); // On note l'heure du réveil
-      
-      // Si rien ne joue quand on rouvre l'app, la source unique est conservée automatiquement par just_audio.
+      _lastWakeUp = DateTime.now();
+      if (_isInBackground) {
+        _isInBackground = false;
+        if (mounted) setState(() {});
+      }
+      // Resynchronise immédiatement le Centre de Contrôle iOS et l'interface au retour dans l'application
+      globalAudioHandler?.refreshState();
+    } else if (state == AppLifecycleState.paused ||
+               state == AppLifecycleState.hidden ||
+               state == AppLifecycleState.detached) {
+      _isInBackground = true;
     }
   }
 
@@ -1797,7 +2263,12 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
       for (var f in files) {
         if (f is File) {
           final name = p.basename(f.path);
-          if (name.startsWith('luhaidan.db') || name.endsWith('.mp4') || name.endsWith('.jpg') || name.endsWith('.mov')) {
+          if (name.startsWith('luhaidan.db') ||
+              name.endsWith('.mp4') ||
+              name.endsWith('.m4a') ||
+              name.endsWith('.mp3') ||
+              name.endsWith('.jpg') ||
+              name.endsWith('.mov')) {
             final newFile = File(p.join(newPath, name));
             await f.copy(newFile.path); // On copie (sécurisé entre différents disques durs)
             await f.delete(); // On supprime l'original
@@ -1820,12 +2291,252 @@ class _LibraryScreenState extends State<LibraryScreen> with WidgetsBindingObserv
   }
 }
 
+/// Barre de timeline reproduisant fidèlement le comportement du lecteur natif iOS (Apple Music / Lock Screen) :
+/// 1. Glissement horizontal RELATIF (pas de saut brusque au toucher, pas de déplacement involontaire sur un simple tap).
+/// 2. Sensibilité amortie sur les longues récitations + précision accrue en glissant verticalement vers le bas.
+/// 3. Stabilisation au relâchement (fenêtre de 90 ms anti-"thumb-roll") empêchant tout bond de plusieurs minutes quand on lève le doigt.
+class _IosTimelineScrubber extends StatefulWidget {
+  final Duration position;
+  final Duration duration;
+  final Future<void> Function(Duration target) onSeek;
+  final String Function(Duration d) formatDuration;
+
+  const _IosTimelineScrubber({
+    required this.position,
+    required this.duration,
+    required this.onSeek,
+    required this.formatDuration,
+  });
+
+  @override
+  State<_IosTimelineScrubber> createState() => _IosTimelineScrubberState();
+}
+
+class _DragHistoryPoint {
+  final int timestampMs;
+  final double positionMs;
+  const _DragHistoryPoint(this.timestampMs, this.positionMs);
+}
+
+class _IosTimelineScrubberState extends State<_IosTimelineScrubber> {
+  bool _isDragging = false;
+  bool _isSeeking = false;
+  double _dragPositionMs = 0.0;
+  double _lastDragX = 0.0;
+  double _dragStartY = 0.0;
+  double _verticalPrecisionFactor = 1.0;
+  String? _precisionLabel;
+  final List<_DragHistoryPoint> _history = [];
+
+  double get _maxDurationMs {
+    final ms = widget.duration.inMilliseconds.toDouble();
+    return ms > 0 ? ms : 1.0;
+  }
+
+  void _recordPoint(double posMs) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _history.add(_DragHistoryPoint(now, posMs));
+    // On conserve uniquement les ~400 dernières millisecondes d'historique
+    _history.removeWhere((p) => now - p.timestampMs > 400);
+  }
+
+  /// Retourne la position stable enregistrée ~90 ms avant le relâchement du doigt
+  /// afin d'éliminer totalement le glissement parasite de la pulpe du pouce à la levée.
+  double _getStabilizedReleaseMs() {
+    if (_history.isEmpty) return _dragPositionMs;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final targetTime = now - 90;
+    _DragHistoryPoint? best;
+    for (int i = _history.length - 1; i >= 0; i--) {
+      final pt = _history[i];
+      if (pt.timestampMs <= targetTime) {
+        best = pt;
+        break;
+      }
+    }
+    best ??= _history.first;
+    // Si la dérive finale au lever du doigt dépasse un petit seuil, on verrouille sur le point stable
+    if ((_dragPositionMs - best.positionMs).abs() > 250) {
+      return best.positionMs.clamp(0.0, _maxDurationMs);
+    }
+    return _dragPositionMs.clamp(0.0, _maxDurationMs);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final maxMs = _maxDurationMs;
+    final currentMs = (_isDragging || _isSeeking)
+        ? _dragPositionMs.clamp(0.0, maxMs)
+        : widget.position.inMilliseconds.toDouble().clamp(0.0, maxMs);
+    final progress = (currentMs / maxMs).clamp(0.0, 1.0);
+    final remainingMs = (maxMs - currentMs).clamp(0.0, maxMs);
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final trackWidth = (constraints.maxWidth - 16.0).clamp(120.0, 2000.0);
+
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (_isDragging && _precisionLabel != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2.0),
+                child: Text(
+                  _precisionLabel!,
+                  style: const TextStyle(
+                    fontSize: 10,
+                    color: Color(0xFF7EB8C9),
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragStart: (details) {
+                final startMs = widget.position.inMilliseconds.toDouble().clamp(0.0, maxMs);
+                _history.clear();
+                _recordPoint(startMs);
+                setState(() {
+                  _isDragging = true;
+                  _dragPositionMs = startMs;
+                  _lastDragX = details.localPosition.dx;
+                  _dragStartY = details.localPosition.dy;
+                  _verticalPrecisionFactor = 1.0;
+                  _precisionLabel = null;
+                });
+              },
+              onHorizontalDragUpdate: (details) {
+                if (!_isDragging) return;
+                final dx = details.localPosition.dx - _lastDragX;
+                _lastDragX = details.localPosition.dx;
+
+                // Ignorer le micro-tremblement capacitif (< 0.4 px)
+                if (dx.abs() < 0.4) {
+                  _recordPoint(_dragPositionMs);
+                  return;
+                }
+
+                // Précision verticale style iOS : glisser le doigt vers le bas ou le haut affine la vitesse
+                final dy = (details.localPosition.dy - _dragStartY).abs();
+                if (dy > 110) {
+                  _verticalPrecisionFactor = 0.12;
+                  _precisionLabel = "Scrubbing de précision (×1/8)";
+                } else if (dy > 65) {
+                  _verticalPrecisionFactor = 0.25;
+                  _precisionLabel = "Quart de vitesse (×1/4)";
+                } else if (dy > 30) {
+                  _verticalPrecisionFactor = 0.5;
+                  _precisionLabel = "Demi-vitesse (×1/2)";
+                } else {
+                  _verticalPrecisionFactor = 1.0;
+                  _precisionLabel = null;
+                }
+
+                // Sur les longues récitations (> 10 min), on plafonne la sensibilité de base
+                // pour qu'un mouvement horizontal normal reste doux et précis comme sur iOS
+                const tenMinutesMs = 10.0 * 60.0 * 1000.0;
+                final effectiveSpanMs = maxMs > tenMinutesMs
+                    ? tenMinutesMs + (maxMs - tenMinutesMs) * 0.42
+                    : maxMs;
+
+                final msPerPixel = (effectiveSpanMs / trackWidth) * _verticalPrecisionFactor;
+                final nextMs = (_dragPositionMs + dx * msPerPixel).clamp(0.0, maxMs);
+
+                _recordPoint(nextMs);
+                setState(() {
+                  _dragPositionMs = nextMs;
+                });
+              },
+              onHorizontalDragEnd: (_) async {
+                if (!_isDragging) return;
+                final targetMs = _getStabilizedReleaseMs();
+                setState(() {
+                  _isDragging = false;
+                  _isSeeking = true;
+                  _dragPositionMs = targetMs;
+                  _precisionLabel = null;
+                });
+                try {
+                  await widget.onSeek(Duration(milliseconds: targetMs.round()));
+                } finally {
+                  if (mounted) {
+                    setState(() {
+                      _isSeeking = false;
+                    });
+                  }
+                }
+              },
+              onHorizontalDragCancel: () {
+                if (!_isDragging) return;
+                setState(() {
+                  _isDragging = false;
+                  _precisionLabel = null;
+                });
+              },
+              child: Container(
+                height: 34,
+                padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                alignment: Alignment.center,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 140),
+                  curve: Curves.easeOutCubic,
+                  height: _isDragging ? 11.0 : 5.5,
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(_isDragging ? 0.26 : 0.18),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: FractionallySizedBox(
+                    alignment: Alignment.centerLeft,
+                    widthFactor: progress,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: _isDragging ? Colors.white : const Color(0xFF7EB8C9),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    widget.formatDuration(Duration(milliseconds: currentMs.round())),
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: _isDragging ? FontWeight.bold : FontWeight.normal,
+                      color: _isDragging ? Colors.white : Colors.grey,
+                    ),
+                  ),
+                  Text(
+                    "-${widget.formatDuration(Duration(milliseconds: remainingMs.round()))}",
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: _isDragging ? FontWeight.bold : FontWeight.normal,
+                      color: _isDragging ? Colors.white : Colors.grey,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
 class YoutubeBrowserScreen extends StatefulWidget {
   final Database? db;
   final VoidCallback onSave;
+  final String? appDirPath;
   final Function(int, String, File)? onDownload; 
 
-  const YoutubeBrowserScreen({super.key, required this.db, required this.onSave, this.onDownload});
+  const YoutubeBrowserScreen({super.key, required this.db, required this.onSave, this.appDirPath, this.onDownload});
 
   @override
   State<YoutubeBrowserScreen> createState() => _YoutubeBrowserScreenState();
@@ -1919,6 +2630,7 @@ class _YoutubeBrowserScreenState extends State<YoutubeBrowserScreen> {
                     context: context,
                     builder: (dialogContext) => FormDialog(
                       db: widget.db,
+                      appDirPath: widget.appDirPath,
                       onSave: () {
                         widget.onSave();
                         Navigator.pop(context); 
@@ -1942,11 +2654,21 @@ class FormDialog extends StatefulWidget {
   final Map<String, dynamic>? rec;
   final VoidCallback onSave;
   final Database? db;
+  final String? appDirPath;
   final String? initialUrl; 
   final Function(int, String, File)? onDownload;
-  final Function(File, Map<String, dynamic>)? onEdit; // <-- LIGNE AJOUTÉE
+  final Function(File, Map<String, dynamic>)? onEdit;
   
-  const FormDialog({super.key, this.rec, required this.onSave, this.db, this.initialUrl, this.onDownload, this.onEdit});
+  const FormDialog({
+    super.key,
+    this.rec,
+    required this.onSave,
+    this.db,
+    this.appDirPath,
+    this.initialUrl,
+    this.onDownload,
+    this.onEdit,
+  });
   
   @override 
   State<FormDialog> createState() => _FormDialogState();
@@ -1957,22 +2679,23 @@ class _FormDialogState extends State<FormDialog> {
   String? selectedName = "Al-Fatiha";
   
   late TextEditingController _yearInput, _file, _ytUrl, _vStart, _vEnd;
-  String _sourceType = "local"; // NOUVEAU : Gère 4 états
+  String _sourceType = "local"; // "local" ou "link" (Bouton unique "Lien" universel)
   bool isFull = true;
 
   @override
   void initState() {
     super.initState();
     
-    // Auto-détection du lien
+    // Auto-détection du type de source (Local vs Lien universel)
     if (widget.rec != null) {
       String f = widget.rec!['fichier']?.toString() ?? "";
-      if (f.contains('youtu')) _sourceType = "youtube";
-      else if (f.contains('instagram')) _sourceType = "instagram";
-      else if (f.contains('tiktok')) _sourceType = "tiktok";
-      else _sourceType = "local";
+      if (isRemoteMediaUrl(f)) {
+        _sourceType = "link";
+      } else {
+        _sourceType = "local";
+      }
     } else if (widget.initialUrl != null && widget.initialUrl!.isNotEmpty) {
-      _sourceType = "youtube"; 
+      _sourceType = "link"; 
     }
     
     if (widget.rec != null) {
@@ -1983,13 +2706,13 @@ class _FormDialogState extends State<FormDialog> {
     
     _yearInput = TextEditingController(text: widget.rec?['annee']?.toString() ?? "");
     _file = TextEditingController(text: (widget.rec != null && _sourceType == "local") ? widget.rec!['fichier'] : "");
-    _ytUrl = TextEditingController(text: widget.initialUrl ?? ((widget.rec != null && _sourceType != "local") ? widget.rec!['fichier'] : ""));
+    _ytUrl = TextEditingController(text: widget.initialUrl ?? ((widget.rec != null && _sourceType == "link") ? widget.rec!['fichier'] : ""));
     
     _vStart = TextEditingController(); 
     _vEnd = TextEditingController();
     
     if (widget.rec != null && !isFull) {
-      List<String> parts = widget.rec!['versets'].split('-');
+      List<String> parts = widget.rec!['versets'].toString().split('-');
       if (parts.length == 2) { 
         _vStart.text = parts[0]; 
         _vEnd.text = parts[1]; 
@@ -2007,7 +2730,9 @@ class _FormDialogState extends State<FormDialog> {
           mainAxisSize: MainAxisSize.min,
           children: [
             DropdownMenu<Map<String, dynamic>>(
-              initialSelection: widget.rec != null ? ALL_SURAHS.firstWhere((s) => s['num'] == widget.rec!['sourate_num']) : ALL_SURAHS[0],
+              initialSelection: widget.rec != null
+                  ? ALL_SURAHS.firstWhere((s) => s['num'] == widget.rec!['sourate_num'], orElse: () => ALL_SURAHS[0])
+                  : ALL_SURAHS[0],
               width: 280,
               label: const Text("Sourate"),
               enableSearch: true,
@@ -2043,37 +2768,25 @@ class _FormDialogState extends State<FormDialog> {
             ),
             const SizedBox(height: 15),
 
-            // --- NOUVEAUTÉ : Les 4 puces de sélection rapides ---
+            // --- Sélection unifiée : Local ou Lien (toutes plateformes) ---
             Wrap(
-              spacing: 8,
+              spacing: 10,
               runSpacing: 8,
               alignment: WrapAlignment.center,
               children: [
                 ChoiceChip(
-                  label: const Text("Local", style: TextStyle(fontSize: 12)), 
+                  avatar: const Icon(Icons.folder_open, size: 16, color: Colors.white),
+                  label: const Text("Local", style: TextStyle(fontSize: 13)), 
                   selected: _sourceType == "local", 
                   onSelected: (v) => setState(() => _sourceType = "local"),
                   selectedColor: const Color(0xFF4A8FA3),
                   showCheckmark: false,
                 ),
                 ChoiceChip(
-                  label: const Text("YouTube", style: TextStyle(fontSize: 12)), 
-                  selected: _sourceType == "youtube", 
-                  onSelected: (v) => setState(() => _sourceType = "youtube"),
-                  selectedColor: const Color(0xFF4A8FA3),
-                  showCheckmark: false,
-                ),
-                ChoiceChip(
-                  label: const Text("Instagram", style: TextStyle(fontSize: 12)), 
-                  selected: _sourceType == "instagram", 
-                  onSelected: (v) => setState(() => _sourceType = "instagram"),
-                  selectedColor: const Color(0xFF4A8FA3),
-                  showCheckmark: false,
-                ),
-                ChoiceChip(
-                  label: const Text("TikTok", style: TextStyle(fontSize: 12)), 
-                  selected: _sourceType == "tiktok", 
-                  onSelected: (v) => setState(() => _sourceType = "tiktok"),
+                  avatar: const Icon(Icons.link, size: 16, color: Colors.white),
+                  label: const Text("Lien", style: TextStyle(fontSize: 13)), 
+                  selected: _sourceType == "link", 
+                  onSelected: (v) => setState(() => _sourceType = "link"),
                   selectedColor: const Color(0xFF4A8FA3),
                   showCheckmark: false,
                 ),
@@ -2088,20 +2801,29 @@ class _FormDialogState extends State<FormDialog> {
                   FilePickerResult? result = await FilePicker.pickFiles(type: FileType.any); 
                   if (result != null) {
                     final file = result.files.single;
-                    final dir = await getApplicationDocumentsDirectory();
-                    await File(file.path!).copy(p.join(dir.path, file.name));
+                    final baseDirPath = widget.appDirPath ?? (await getApplicationDocumentsDirectory()).path;
+                    await File(file.path!).copy(p.join(baseDirPath, file.name));
                     setState(() => _file.text = file.name);
                   }
                 }, 
-                child: const Text("Choisir un fichier .mp4 / .mp3")
+                child: Text(_file.text.isEmpty ? "Choisir un fichier .mp4 / .mp3 / .m4a" : _file.text, overflow: TextOverflow.ellipsis)
               )
             else 
               TextField(
                 controller: _ytUrl, 
                 decoration: InputDecoration(
-                  labelText: _sourceType == "youtube" 
-                    ? "Lien YouTube" 
-                    : (_sourceType == "instagram" ? "Lien du Reel (Instagram)" : "Lien de la vidéo (TikTok)")
+                  labelText: "Lien (YouTube, TikTok, Instagram, X, Web...)",
+                  hintText: "https://...",
+                  suffixIcon: IconButton(
+                    tooltip: "Coller depuis le presse-papiers",
+                    icon: const Icon(Icons.content_paste, color: Color(0xFF7EB8C9), size: 20),
+                    onPressed: () async {
+                      final data = await Clipboard.getData(Clipboard.kTextPlain);
+                      if (data?.text != null && data!.text!.trim().isNotEmpty) {
+                        setState(() => _ytUrl.text = data.text!.trim());
+                      }
+                    },
+                  ),
                 )
               ),
           ],
@@ -2139,8 +2861,8 @@ class _FormDialogState extends State<FormDialog> {
               };
 
               // 2. On localise la vidéo et on ferme le formulaire
-              final dir = await getApplicationDocumentsDirectory();
-              final videoFile = File(p.join(dir.path, _file.text));
+              final baseDirPath = widget.appDirPath ?? (await getApplicationDocumentsDirectory()).path;
+              final videoFile = File(p.join(baseDirPath, _file.text));
               
               if (mounted) Navigator.pop(context);
               
@@ -2155,10 +2877,10 @@ class _FormDialogState extends State<FormDialog> {
           onPressed: () async {
             // --- VIGILE ANTI-BUG (Empêche l'enregistrement sans fichier/lien) ---
             if (_sourceType == "local" && _file.text.isEmpty) {
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("❌ Veuillez choisir un fichier vidéo."), backgroundColor: Colors.red));
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("❌ Veuillez choisir un fichier média."), backgroundColor: Colors.red));
               return;
             }
-            if (_sourceType != "local" && _ytUrl.text.isEmpty) {
+            if (_sourceType == "link" && _ytUrl.text.trim().isEmpty) {
               ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("❌ Veuillez coller un lien."), backgroundColor: Colors.red));
               return;
             }
@@ -2166,7 +2888,8 @@ class _FormDialogState extends State<FormDialog> {
             
             try {
               String thumb = widget.rec?['thumbnail'] ?? "";
-              String dur = widget.rec?['duration'] ?? "";
+              String dur = widget.rec?['duration'] ?? "--:--";
+              if (dur.isEmpty) dur = "--:--";
               
               int? inputYear = int.tryParse(_yearInput.text);
               int? anneeH;
@@ -2182,31 +2905,13 @@ class _FormDialogState extends State<FormDialog> {
                 }
               }
 
-              // --- Logique de récupération initiale ---
-              if (_sourceType == "youtube" && _ytUrl.text.isNotEmpty) {
-                var yt = YoutubeExplode();
-                var video = await yt.videos.get(_ytUrl.text);
-                dur = "${video.duration?.inMinutes}:${((video.duration?.inSeconds ?? 0) % 60).toString().padLeft(2, '0')}";
+              final baseDirPath = widget.appDirPath ?? (await getApplicationDocumentsDirectory()).path;
+              final String cleanUrl = MediaExtractor.extractCleanUrl(_ytUrl.text.trim());
+
+              if (_sourceType == "local" && _file.text.isNotEmpty) {
+                final localFilePath = p.join(baseDirPath, _file.text);
                 
-                try {
-                   final dir = await getApplicationDocumentsDirectory();
-                   final thumbName = "thumb_yt_${video.id}.jpg";
-                   await Dio().download(video.thumbnails.highResUrl, p.join(dir.path, thumbName));
-                   thumb = thumbName;
-                } catch (_) { 
-                   thumb = video.thumbnails.standardResUrl; 
-                }
-                yt.close();
-              } 
-              else if ((_sourceType == "instagram" || _sourceType == "tiktok") && _ytUrl.text.isNotEmpty) {
-                dur = "--:--"; 
-                thumb = ""; 
-              } 
-              else if (_sourceType == "local" && _file.text.isNotEmpty) {
-                final dir = await getApplicationDocumentsDirectory();
-                final localFilePath = p.join(dir.path, _file.text);
-                
-                if (!Platform.isWindows) { // <-- PROTECTION WINDOWS
+                if (!Platform.isWindows) {
                   try {
                     final metadata = await MetadataRetriever.fromFile(File(localFilePath));
                     if (metadata.trackDuration != null) {
@@ -2215,7 +2920,7 @@ class _FormDialogState extends State<FormDialog> {
                     }
                     if (metadata.albumArt != null) {
                       final thumbName = "thumb_${_file.text}.jpg";
-                      await File(p.join(dir.path, thumbName)).writeAsBytes(metadata.albumArt!);
+                      await File(p.join(baseDirPath, thumbName)).writeAsBytes(metadata.albumArt!);
                       thumb = thumbName;
                     }
                   } catch (e) { debugPrint("Erreur metadata: $e"); }
@@ -2227,7 +2932,7 @@ class _FormDialogState extends State<FormDialog> {
                 "sourate_name": selectedName,
                 "annee": anneeH, 
                 "annee_g": anneeG, 
-                "fichier": _sourceType == "local" ? _file.text : _ytUrl.text,
+                "fichier": _sourceType == "local" ? _file.text : cleanUrl,
                 "versets": isFull ? "complet" : "${_vStart.text}-${_vEnd.text}",
                 "thumbnail": thumb, 
                 "duration": dur,
@@ -2236,10 +2941,12 @@ class _FormDialogState extends State<FormDialog> {
               int recordId = widget.rec == null ? await widget.db!.insert('recitations', data) : widget.rec!['id'];
               if (widget.rec != null) await widget.db!.update('recitations', data, where: 'id = ?', whereArgs: [recordId]);
               
-              if (_sourceType != "local" && _ytUrl.text.isNotEmpty) {
-                final cleanUrl = _ytUrl.text;
-                final dir = await getApplicationDocumentsDirectory();
-                final localAudioFile = File(p.join(dir.path, "yt_$recordId.mp4"));
+              if (_sourceType == "link" && cleanUrl.isNotEmpty) {
+                final localAudioFile = File(p.join(baseDirPath, "yt_$recordId.mp4"));
+                final prevUrl = widget.rec?['fichier']?.toString() ?? "";
+                if (prevUrl != cleanUrl && await localAudioFile.exists()) {
+                  try { await localAudioFile.delete(); } catch (_) {}
+                }
                 if (!await localAudioFile.exists()) {
                   widget.onDownload?.call(recordId, cleanUrl, localAudioFile);
                 }
@@ -2250,7 +2957,7 @@ class _FormDialogState extends State<FormDialog> {
 
             } catch (e) {
               if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : Lien invalide ou vidéo privée"), backgroundColor: Colors.red));
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ Erreur : $e"), backgroundColor: Colors.red));
               }
             }
           }, 
@@ -2261,212 +2968,901 @@ class _FormDialogState extends State<FormDialog> {
   }
 }
 
-// Scraper système D pour Instagram (Contourne les blocages d'API publiques)
-class WebScraper {
-  static WebViewController? controller;
-  static Completer<String?>? _completer;
-  static String _currentUrl = "";
+/// Modèle de média résolu par le moteur d'extraction universel (type Black Hole Splitter)
+class ExtractedMedia {
+  final String url;
+  final String? audioUrl;
+  final Map<String, String> headers;
+  final bool isHls;
+  final String? thumbnailUrl;
+  final Duration? duration;
 
-  static void init() {
-    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) return;
-    try {
-      controller = WebViewController()
-        ..setJavaScriptMode(JavaScriptMode.unrestricted)
-        ..addJavaScriptChannel('ScraperChannel', onMessageReceived: (message) {
-           if (_completer != null && !_completer!.isCompleted) {
-              String url = message.message;
-              if (url.startsWith('http')) {
-                 _completer!.complete(url);
-              }
-           }
-        });
-    } catch (_) {
-      debugPrint("WebScraper init failed");
-    }
-  }
-
-  static Future<String?> extractInstagram(String igUrl) async {
-    if (controller == null) return null;
-    
-    // Ordre de fallback
-    List<String> sites = ['https://fastdl.app/en', 'https://snapinsta.app/fr', 'https://igram.world/'];
-    
-    for (String site in sites) {
-       _completer = Completer<String?>();
-       _currentUrl = igUrl;
-       
-       await controller!.loadRequest(Uri.parse(site));
-       
-       Timer? checkTimer;
-       checkTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
-          if (_completer != null && _completer!.isCompleted) {
-             timer.cancel();
-             return;
-          }
-          try {
-            await controller!.runJavaScript('''
-               // Script for fastdl / igram
-               let inp1 = document.getElementById('search-form-input');
-               let btn1 = document.querySelector('.search-form__button');
-               if (inp1 && btn1 && inp1.value === '') {
-                   inp1.value = '$_currentUrl';
-                   btn1.click();
-               }
-               let res1 = document.querySelector('.button--download');
-               if (res1 && res1.href && res1.href.startsWith('http')) {
-                   ScraperChannel.postMessage(res1.href);
-               }
-
-               // Script for snapinsta
-               let inp2 = document.getElementById('url');
-               let btn2 = document.getElementById('btn-submit');
-               if (inp2 && btn2 && inp2.value === '') {
-                   inp2.value = '$_currentUrl';
-                   btn2.click();
-               }
-               let res2 = document.querySelector('.download-bottom a');
-               if (!res2) res2 = document.querySelector('a.btn.download-media');
-               if (res2 && res2.href && res2.href.startsWith('http') && res2.href.includes('download')) {
-                   ScraperChannel.postMessage(res2.href);
-               }
-            ''');
-          } catch (_) {}
-       });
-
-       String? result;
-       try {
-         result = await _completer!.future.timeout(const Duration(seconds: 15));
-       } catch (e) {
-         result = null; 
-       }
-       
-       checkTimer.cancel();
-       
-       if (result != null && result.startsWith('http')) {
-          return result;
-       }
-    }
-    return null;
-  }
+  const ExtractedMedia({
+    required this.url,
+    this.audioUrl,
+    this.headers = const {},
+    this.isHls = false,
+    this.thumbnailUrl,
+    this.duration,
+  });
 }
 
-
+/// Moteur d'extraction universel multi-couches inspiré de Black Hole Splitter :
+/// Permet de télécharger depuis n'importe quelle source (YouTube, TikTok, Instagram, X/Twitter,
+/// Facebook, Threads, Reddit, SoundCloud, liens directs .mp4/.m4a/.mp3/.m3u8 ou pages web quelconques)
+/// en contournant les blocages de serveurs grâce à une cascade d'extracteurs locaux et d'intercepteurs.
 class MediaExtractor {
+  static const String _mobileUA =
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+  static const String _desktopUA =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+  static Dio _createDio({Map<String, String>? headers, int timeoutSec = 15}) {
+    return Dio(
+      BaseOptions(
+        connectTimeout: Duration(seconds: timeoutSec),
+        receiveTimeout: Duration(seconds: timeoutSec),
+        followRedirects: true,
+        maxRedirects: 8,
+        validateStatus: (status) => status != null && status < 500,
+        headers: {
+          "User-Agent": _desktopUA,
+          "Accept": "*/*",
+          "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+          if (headers != null) ...headers,
+        },
+      ),
+    );
+  }
+
+  /// Extrait proprement la première URL présente dans un texte copié-collé (ex: texte de partage TikTok/Instagram)
+  static String extractCleanUrl(String rawInput) {
+    final trimmed = rawInput.trim();
+    final match = RegExp(r'https?:\/\/[^\s"<>]+', caseSensitive: false).firstMatch(trimmed);
+    if (match != null) {
+      return match.group(0)!.replaceAll(RegExp(r'[.,;!?)\]]+$'), '');
+    }
+    if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://') && trimmed.contains('.')) {
+      return 'https://$trimmed';
+    }
+    return trimmed;
+  }
+
+  static bool isYouTubeUrl(String url) {
+    final lower = url.toLowerCase();
+    return lower.contains('youtube.com') || lower.contains('youtu.be');
+  }
+
+  static bool _isDirectMediaUrl(String url) {
+    final lower = url.toLowerCase().split('?').first;
+    return lower.endsWith('.mp4') ||
+        lower.endsWith('.m4a') ||
+        lower.endsWith('.mp3') ||
+        lower.endsWith('.mov') ||
+        lower.endsWith('.aac') ||
+        lower.endsWith('.wav') ||
+        lower.endsWith('.webm') ||
+        lower.endsWith('.m3u8');
+  }
+
+  /// Point d'entrée de compatibilité (utilisé par ProxyServer)
   static Future<String?> getDownloadUrl(String targetUrl) async {
-    String cleanUrl = targetUrl.trim();
-    
-    // NOUVEAU : API spécifique pour TikTok (TikMate) qui fonctionne sans clé
-    if (cleanUrl.contains('tiktok')) {
-      try {
-        final res = await Dio().post(
-          "https://api.tikmate.app/api/lookup",
-          data: {"url": cleanUrl},
-          options: Options(headers: {
-             "Content-Type": "application/x-www-form-urlencoded",
-          })
-        );
-        if (res.data != null && res.data['success'] == true) {
-           return "https://tikmate.app/download/${res.data['token']}/${res.data['id']}.mp4";
-        }
-      } catch (e) {
-        debugPrint("Erreur TikMate: $e");
-      }
+    final extracted = await resolveMedia(targetUrl);
+    return extracted?.url;
+  }
+
+  /// Alias vers resolveMedia pour _startDownload
+  static Future<ExtractedMedia?> extractMedia(String rawUrl) => resolveMedia(rawUrl);
+
+  /// Résout n'importe quel lien vers un flux média téléchargeable avec ses en-têtes HTTP associés
+  static Future<ExtractedMedia?> resolveMedia(String rawUrl) async {
+    final String cleanUrl = extractCleanUrl(rawUrl);
+    if (cleanUrl.isEmpty) return null;
+
+    // 1. Lien direct vers un fichier média ou flux HLS (.m3u8)
+    if (_isDirectMediaUrl(cleanUrl)) {
+      return ExtractedMedia(
+        url: cleanUrl,
+        isHls: cleanUrl.toLowerCase().contains('.m3u8'),
+      );
     }
 
-    // Utilisation de l'API Cobalt V10 avec un fallback public
+    final lower = cleanUrl.toLowerCase();
+
+    // 2. YouTube (extraction native multi-clients : iOS, AndroidVR, Safari, TV, MWeb)
+    if (lower.contains('youtube.com') || lower.contains('youtu.be')) {
+      final ytRes = await _extractYouTube(cleanUrl);
+      if (ytRes != null) return ytRes;
+    }
+
+    // 3. TikTok (Cascade : TikWM -> Page Mobile Rehydration JSON -> VXTikTok -> TikMate)
+    if (lower.contains('tiktok.com')) {
+      final ttRes = await _extractTikTok(cleanUrl);
+      if (ttRes != null) return ttRes;
+    }
+
+    // 4. Instagram (Cascade : Embed Direct -> DDInstagram/VX -> GraphQL Mobile -> SnapInsta JS Unpacker -> IGDownloader)
+    if (lower.contains('instagram.com') || lower.contains('instagr.am')) {
+      final igRes = await _extractInstagram(cleanUrl);
+      if (igRes != null) return igRes;
+    }
+
+    // 5. X / Twitter (Cascade : API FxTwitter / VxTwitter -> Syndication API)
+    if (lower.contains('twitter.com') || lower.contains('x.com') || lower.contains('t.co/')) {
+      final xRes = await _extractTwitterX(cleanUrl);
+      if (xRes != null) return xRes;
+    }
+
+    // 6. Facebook / FB Watch / Reels
+    if (lower.contains('facebook.com') || lower.contains('fb.watch') || lower.contains('fb.gg')) {
+      final fbRes = await _extractFacebook(cleanUrl);
+      if (fbRes != null) return fbRes;
+    }
+
+    // 7. Reddit
+    if (lower.contains('reddit.com') || lower.contains('redd.it')) {
+      final rdRes = await _extractReddit(cleanUrl);
+      if (rdRes != null) return rdRes;
+    }
+
+    // 8. Cascade multi-instances Cobalt (V10 & V7) compatible toutes plateformes (SoundCloud, Threads, Vimeo, Dailymotion, Bilibili, etc.)
+    final cobaltRes = await _extractViaCobaltWaterfall(cleanUrl);
+    if (cobaltRes != null) return cobaltRes;
+
+    // 9. Extracteur universel HTML / OpenGraph / JSON-LD / Regex (style Black Hole Splitter)
+    final genericRes = await _extractGenericWebMedia(cleanUrl);
+    if (genericRes != null) return genericRes;
+
+    // 10. Dernier recours sur mobile : Sniffer WebView headless jetable (créé à la demande puis détruit immédiatement pour 0 Mo de RAM au repos)
+    if (!Platform.isWindows && !Platform.isLinux && !Platform.isMacOS) {
+      final sniffed = await _sniffMediaViaDisposableWebView(cleanUrl);
+      if (sniffed != null) return sniffed;
+    }
+
+    return null;
+  }
+
+  // --- EXTRACTEUR YOUTUBE MULTI-CLIENTS ---
+  static Future<ExtractedMedia?> _extractYouTube(String url) async {
+    YoutubeExplode? yt;
     try {
-      final res = await Dio().post(
-        "https://api.cobalt.tools/",
-        data: {"url": cleanUrl},
-        options: Options(headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json",
-        })
-      );
-      
-      if (res.data != null && res.data['url'] != null) return res.data['url'];
-    } catch (e) {
-      debugPrint("Erreur Cobalt principal: $e");
-      // Fallback sur une instance publique
-      try {
-         final resFallback = await Dio().post(
-           "https://cobalt-api.pewpew.nyc/",
-           data: {"url": cleanUrl},
-           options: Options(headers: {
-             "Accept": "application/json",
-             "Content-Type": "application/json",
-           })
-         );
-         if (resFallback.data != null && resFallback.data['url'] != null) return resFallback.data['url'];
-      } catch (_) {}
-      
-      try {
-         final resFallback2 = await Dio().post(
-           "https://cobalt.qck.ie/",
-           data: {"url": cleanUrl},
-           options: Options(headers: {
-             "Accept": "application/json",
-             "Content-Type": "application/json",
-           })
-         );
-         if (resFallback2.data != null && resFallback2.data['url'] != null) return resFallback2.data['url'];
-      } catch (_) {}
-      
-      if (cleanUrl.contains('instagram')) {
-         // Utilisation d'API publiques directes pour Instagram (sans WebView)
-         try {
-           final formData = FormData.fromMap({"url": cleanUrl, "action": "post"});
-           final res = await Dio().post(
-             "https://snapinsta.app/action.php",
-             data: formData,
-             options: Options(headers: {
-               "Origin": "https://snapinsta.app",
-               "Referer": "https://snapinsta.app/",
-               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-             })
-           );
-           
-           if (res.data != null && res.data is String) {
-             // Extraction du lien MP4 avec Regex
-             final RegExp regExp = RegExp(r'href=\\"(https:\/\/[^"]+\.mp4.*?)\\"');
-             final match = regExp.firstMatch(res.data);
-             if (match != null) {
-               final String link = match.group(1)!.replaceAll(r'\\&', '&').replaceAll(r'\/', '/');
-               return link;
-             }
-           }
-         } catch (e) {
-           debugPrint("Erreur SnapInsta HTTP: $e");
-         }
+      yt = YoutubeExplode();
+      final video = await yt.videos.get(url).timeout(const Duration(seconds: 15));
+      final String? thumbUrl = video.thumbnails.highResUrl.isNotEmpty
+          ? video.thumbnails.highResUrl
+          : video.thumbnails.standardResUrl;
+      final Duration? duration = video.duration;
 
-         try {
-           // Fallback 2: IgDownloader
-           final formData = FormData.fromMap({"q": cleanUrl, "t": "media", "lang": "en"});
-           final res = await Dio().post(
-             "https://v3.igdownloader.net/api/ajaxSearch",
-             data: formData,
-             options: Options(headers: {
-               "Origin": "https://igdownloader.net",
-               "Referer": "https://igdownloader.net/",
-               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-             })
-           );
-           
-           if (res.data != null && res.data['data'] != null) {
-             final String html = res.data['data'];
-             final RegExp regExp = RegExp(r'href="(https:\/\/[^"]+\.mp4.*?)"');
-             final match = regExp.firstMatch(html);
-             if (match != null) {
-               return match.group(1)!.replaceAll('&amp;', '&');
-             }
-           }
-         } catch (e) {
-           debugPrint("Erreur IGDownloader HTTP: $e");
-         }
+      final clientSets = <List<YoutubeApiClient>>[
+        [YoutubeApiClient.ios, YoutubeApiClient.androidVr],
+        [YoutubeApiClient.safari, YoutubeApiClient.tv],
+        [YoutubeApiClient.mweb, YoutubeApiClient.android],
+      ];
 
-         throw Exception("Le téléchargement de ce lien Instagram a échoué (Serveurs bloqués). Veuillez utiliser YouTube.");
+      for (final clients in clientSets) {
+        try {
+          final manifest = await yt.videos.streamsClient
+              .getManifest(video.id, ytClients: clients)
+              .timeout(const Duration(seconds: 15));
+
+          if (manifest.muxed.isNotEmpty) {
+            final muxed = manifest.muxed.withHighestBitrate();
+            return ExtractedMedia(
+              url: muxed.url.toString(),
+              thumbnailUrl: thumbUrl,
+              duration: duration,
+            );
+          }
+          if (manifest.audioOnly.isNotEmpty) {
+            final audio = manifest.audioOnly.withHighestBitrate();
+            return ExtractedMedia(
+              url: audio.url.toString(),
+              thumbnailUrl: thumbUrl,
+              duration: duration,
+            );
+          }
+          if (manifest.hls.isNotEmpty) {
+            final hls = manifest.hls.first;
+            return ExtractedMedia(
+              url: hls.url.toString(),
+              isHls: true,
+              thumbnailUrl: thumbUrl,
+              duration: duration,
+            );
+          }
+        } catch (_) {}
       }
+
+      // Fallback Piped API public si YouTube bloque tous les clients directs
+      final pipedInstances = [
+        'https://pipedapi.kavin.rocks',
+        'https://pipedapi.tokhmi.xyz',
+        'https://piped-api.garudalinux.org',
+      ];
+      for (final instance in pipedInstances) {
+        try {
+          final res = await _createDio(timeoutSec: 10).get('$instance/streams/${video.id.value}');
+          if (res.data is Map) {
+            final data = res.data as Map;
+            if (data['audioStreams'] is List && (data['audioStreams'] as List).isNotEmpty) {
+              final stream = (data['audioStreams'] as List).first;
+              if (stream['url'] != null) {
+                return ExtractedMedia(
+                  url: stream['url'].toString(),
+                  thumbnailUrl: thumbUrl,
+                  duration: duration,
+                );
+              }
+            }
+            if (data['hls'] != null && data['hls'].toString().startsWith('http')) {
+              return ExtractedMedia(
+                url: data['hls'].toString(),
+                isHls: true,
+                thumbnailUrl: thumbUrl,
+                duration: duration,
+              );
+            }
+          }
+        } catch (_) {}
+      }
+    } catch (e) {
+      debugPrint("Erreur _extractYouTube: $e");
+    } finally {
+      yt?.close();
     }
     return null;
+  }
+
+  // --- EXTRACTEUR TIKTOK MULTI-MOTEURS ---
+  static Future<ExtractedMedia?> _extractTikTok(String url) async {
+    final dio = _createDio();
+
+    // Moteur 1 : API TikWM (Rapide, sans filigrane, fournit durée + miniature)
+    try {
+      final res = await dio.post(
+        "https://www.tikwm.com/api/",
+        data: FormData.fromMap({"url": url, "hd": "1"}),
+      );
+      if (res.data is Map && res.data['data'] is Map) {
+        final data = res.data['data'] as Map;
+        String? playUrl = (data['hdplay'] ?? data['play'] ?? data['wmplay'])?.toString();
+        if (playUrl != null && playUrl.isNotEmpty) {
+          if (playUrl.startsWith('/')) playUrl = 'https://www.tikwm.com$playUrl';
+          final int? durSec = data['duration'] is int
+              ? data['duration'] as int
+              : int.tryParse(data['duration']?.toString() ?? '');
+          return ExtractedMedia(
+            url: playUrl,
+            thumbnailUrl: (data['cover'] ?? data['origin_cover'])?.toString(),
+            duration: durSec != null && durSec > 0 ? Duration(seconds: durSec) : null,
+          );
+        }
+      }
+    } catch (_) {}
+
+    // Moteur 2 : Extraction directe depuis la page TikTok (__UNIVERSAL_DATA_FOR_REHYDRATION__ / SIGI_STATE) avec transfert de cookies
+    try {
+      final pageRes = await _createDio(headers: {
+        "User-Agent": _desktopUA,
+        "Referer": "https://www.tiktok.com/",
+      }).get(url, options: Options(responseType: ResponseType.plain));
+
+      final cookies = pageRes.headers['set-cookie']
+          ?.map((c) => c.split(';').first)
+          .join('; ');
+      final html = pageRes.data?.toString() ?? "";
+
+      final playAddrMatch = RegExp(r'"(?:playAddr|downloadAddr)"\s*:\s*"([^"]+)"').firstMatch(html);
+      if (playAddrMatch != null) {
+        final rawVideoUrl = _unescapeJsonString(playAddrMatch.group(1)!);
+        if (rawVideoUrl.startsWith('http')) {
+          return ExtractedMedia(
+            url: rawVideoUrl,
+            headers: {
+              "User-Agent": _desktopUA,
+              "Referer": "https://www.tiktok.com/",
+              if (cookies != null && cookies.isNotEmpty) "Cookie": cookies,
+            },
+          );
+        }
+      }
+    } catch (_) {}
+
+    // Moteur 3 : API TikMate
+    try {
+      final res = await dio.post(
+        "https://api.tikmate.app/api/lookup",
+        data: {"url": url},
+        options: Options(headers: {"Content-Type": "application/x-www-form-urlencoded"}),
+      );
+      if (res.data is Map && res.data['success'] == true) {
+        return ExtractedMedia(
+          url: "https://tikmate.app/download/${res.data['token']}/${res.data['id']}.mp4",
+        );
+      }
+    } catch (_) {}
+
+    // Moteur 4 : Miroirs d'embed TikTok (tnktok / vxtiktok)
+    for (final host in ['tnktok.com', 'vxtiktok.com']) {
+      try {
+        final mirrorUrl = url.replaceFirst(RegExp(r'(?:www\.|vm\.|vt\.)?tiktok\.com'), host);
+        final res = await _createDio(headers: {"User-Agent": "TelegramBot (like TwitterBot)"}).get(
+          mirrorUrl,
+          options: Options(responseType: ResponseType.plain),
+        );
+        final html = res.data?.toString() ?? "";
+        final ogVideo = _extractMetaProperty(html, ['og:video', 'og:video:secure_url', 'twitter:player:stream']);
+        if (ogVideo != null && ogVideo.startsWith('http')) {
+          return ExtractedMedia(url: ogVideo);
+        }
+      } catch (_) {}
+    }
+
+    return null;
+  }
+
+  // --- EXTRACTEUR INSTAGRAM MULTI-MOTEURS ---
+  static Future<ExtractedMedia?> _extractInstagram(String url) async {
+    final shortcodeMatch = RegExp(r'instagram\.com\/(?:[^\/]+\/)?(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)').firstMatch(url);
+    final String? shortcode = shortcodeMatch?.group(1);
+
+    // Moteur 1 : Endpoint officiel d'intégration Instagram (/embed/captioned/)
+    if (shortcode != null) {
+      try {
+        final embedUrl = "https://www.instagram.com/p/$shortcode/embed/captioned/";
+        final res = await _createDio(headers: {
+          "User-Agent": _mobileUA,
+          "Referer": "https://www.instagram.com/",
+        }).get(embedUrl, options: Options(responseType: ResponseType.plain));
+
+        final html = res.data?.toString() ?? "";
+        final videoMatches = [
+          RegExp(r'"video_url"\s*:\s*"([^"]+)"').firstMatch(html),
+          RegExp(r'\\"video_url\\"\s*:\s*\\"([^\\"]+)\\"').firstMatch(html),
+          RegExp(r'class="EmbeddedMediaVideo"[^>]+src="([^"]+)"').firstMatch(html),
+        ];
+        for (final m in videoMatches) {
+          if (m != null) {
+            final extractedUrl = _unescapeJsonString(m.group(1)!).replaceAll('&amp;', '&');
+            if (extractedUrl.startsWith('http')) {
+              final thumbMatch = RegExp(r'"display_url"\s*:\s*"([^"]+)"').firstMatch(html);
+              return ExtractedMedia(
+                url: extractedUrl,
+                thumbnailUrl: thumbMatch != null ? _unescapeJsonString(thumbMatch.group(1)!) : null,
+                headers: {"User-Agent": _mobileUA, "Referer": "https://www.instagram.com/"},
+              );
+            }
+          }
+        }
+      } catch (_) {}
+
+      // Moteur 2 : Requête GraphQL mobile directe d'Instagram (PolarisPostActionLoadPostQueryQuery)
+      try {
+        final gqlRes = await _createDio(headers: {
+          "User-Agent": _mobileUA,
+          "X-IG-App-ID": "936619743392459",
+          "X-ASBD-ID": "198387",
+          "X-IG-WWW-Claim": "0",
+          "Origin": "https://www.instagram.com",
+          "Referer": "https://www.instagram.com/p/$shortcode/",
+          "Content-Type": "application/x-www-form-urlencoded",
+        }).post(
+          "https://www.instagram.com/graphql/query",
+          data: {
+            "av": "0",
+            "variables": jsonEncode({"shortcode": shortcode}),
+            "doc_id": "8845758582119845",
+          },
+        );
+        final rawJson = gqlRes.data is String ? gqlRes.data as String : jsonEncode(gqlRes.data);
+        final vMatch = RegExp(r'"video_url"\s*:\s*"([^"]+)"').firstMatch(rawJson);
+        if (vMatch != null) {
+          final vUrl = _unescapeJsonString(vMatch.group(1)!);
+          if (vUrl.startsWith('http')) {
+            final tMatch = RegExp(r'"display_url"\s*:\s*"([^"]+)"').firstMatch(rawJson);
+            return ExtractedMedia(
+              url: vUrl,
+              thumbnailUrl: tMatch != null ? _unescapeJsonString(tMatch.group(1)!) : null,
+            );
+          }
+        }
+      } catch (_) {}
+
+      // Moteur 3 : Passerelles OpenGraph publiques (ddinstagram / kkinstagram / vxinstagram)
+      for (final domain in ['ddinstagram.com', 'kkinstagram.com', 'vxinstagram.com']) {
+        try {
+          final proxyRes = await _createDio(headers: {
+            "User-Agent": "TelegramBot (like TwitterBot)",
+          }).get(
+            "https://www.$domain/reel/$shortcode",
+            options: Options(responseType: ResponseType.plain),
+          );
+          final html = proxyRes.data?.toString() ?? "";
+          final ogVideo = _extractMetaProperty(html, ['og:video', 'og:video:secure_url', 'twitter:player:stream']);
+          if (ogVideo != null && ogVideo.startsWith('http')) {
+            final fullUrl = ogVideo.startsWith('http') ? ogVideo : 'https://www.$domain$ogVideo';
+            final ogThumb = _extractMetaProperty(html, ['og:image']);
+            return ExtractedMedia(url: fullUrl, thumbnailUrl: ogThumb);
+          }
+        } catch (_) {}
+      }
+    }
+
+    // Moteur 4 : SnapInsta (avec décompresseur du script JS obfusqué eval(function(h,u,n,t,e,r)))
+    try {
+      final formData = FormData.fromMap({"url": url, "action": "post"});
+      final res = await _createDio(headers: {
+        "Origin": "https://snapinsta.app",
+        "Referer": "https://snapinsta.app/",
+        "User-Agent": _desktopUA,
+      }).post("https://snapinsta.app/action.php", data: formData, options: Options(responseType: ResponseType.plain));
+
+      final body = res.data?.toString() ?? "";
+      final unpacked = _decodeSnapInstaPayload(body) ?? body;
+      final mp4Match = RegExp(r'https?:\/\/[^\s"\\<>]+(?:\.mp4|cdninstagram\.com|fbcdn\.net|snapcdn\.app)[^\s"\\<>]*')
+          .firstMatch(unpacked);
+      if (mp4Match != null) {
+        final link = _unescapeJsonString(mp4Match.group(0)!).replaceAll('&amp;', '&');
+        if (link.startsWith('http')) return ExtractedMedia(url: link);
+      }
+    } catch (_) {}
+
+    // Moteur 5 : IGDownloader / FastDL API
+    for (final endpoint in [
+      "https://v3.igdownloader.net/api/ajaxSearch",
+      "https://igdownloader.app/api/ajaxSearch",
+    ]) {
+      try {
+        final formData = FormData.fromMap({"q": url, "t": "media", "lang": "fr"});
+        final res = await _createDio(headers: {
+          "User-Agent": _desktopUA,
+          "Content-Type": "application/x-www-form-urlencoded",
+        }).post(endpoint, data: formData);
+        if (res.data is Map && res.data['data'] != null) {
+          final String html = res.data['data'].toString();
+          final match = RegExp(r'href="(https:\/\/[^"]+)"[^>]*class="[^"]*abutton[^"]*"').firstMatch(html) ??
+              RegExp(r'href="(https:\/\/[^"]+\.mp4[^"]*)"').firstMatch(html);
+          if (match != null) {
+            return ExtractedMedia(url: match.group(1)!.replaceAll('&amp;', '&'));
+          }
+        }
+      } catch (_) {}
+    }
+
+    return null;
+  }
+
+  /// Décode l'obfuscation JS utilisée par SnapInsta / SaveInsta (`eval(function(h,u,n,t,e,r){...})`)
+  static String? _decodeSnapInstaPayload(String js) {
+    try {
+      final match = RegExp(
+        r'\("([A-Za-z0-9]+)",\s*(\d+),\s*"([^"]+)",\s*(\d+),\s*(\d+),\s*(\d+)\)',
+      ).firstMatch(js);
+      if (match == null) return null;
+
+      final String h = match.group(1)!;
+      final String n = match.group(3)!;
+      final int t = int.parse(match.group(4)!);
+      final int e = int.parse(match.group(5)!);
+
+      const String charset = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/";
+      int decodeBase(String d, int fromBase, int toBase) {
+        final g = charset.substring(0, fromBase);
+        int j = 0;
+        final reversed = d.split('').reversed.toList();
+        for (int idx = 0; idx < reversed.length; idx++) {
+          final pos = g.indexOf(reversed[idx]);
+          if (pos != -1) {
+            j += pos * (BigInt.from(fromBase).pow(idx)).toInt();
+          }
+        }
+        return j;
+      }
+
+      final parts = h.split(n[e]);
+      final buffer = StringBuffer();
+      for (String seg in parts) {
+        if (seg.isEmpty) continue;
+        for (int j = 0; j < n.length; j++) {
+          seg = seg.replaceAll(n[j], j.toString());
+        }
+        final charCode = decodeBase(seg, e, 10) - t;
+        if (charCode > 0 && charCode < 65535) {
+          buffer.writeCharCode(charCode);
+        }
+      }
+      return Uri.decodeFull(buffer.toString());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // --- EXTRACTEUR X / TWITTER ---
+  static Future<ExtractedMedia?> _extractTwitterX(String url) async {
+    final statusMatch = RegExp(r'(?:twitter\.com|x\.com)\/[^\/]+\/status\/(\d+)').firstMatch(url);
+    final String? tweetId = statusMatch?.group(1);
+
+    if (tweetId != null) {
+      // Moteur 1 : API publique FxTwitter / VxTwitter
+      for (final apiBase in [
+        'https://api.fxtwitter.com/status/$tweetId',
+        'https://api.vxtwitter.com/Twitter/status/$tweetId',
+      ]) {
+        try {
+          final res = await _createDio().get(apiBase);
+          if (res.data is Map) {
+            final map = res.data as Map;
+            // Format FxTwitter
+            if (map['tweet'] is Map && map['tweet']['media'] is Map) {
+              final media = map['tweet']['media'] as Map;
+              if (media['videos'] is List && (media['videos'] as List).isNotEmpty) {
+                final vid = (media['videos'] as List).first as Map;
+                if (vid['url'] != null) {
+                  return ExtractedMedia(
+                    url: vid['url'].toString(),
+                    thumbnailUrl: vid['thumbnail_url']?.toString(),
+                  );
+                }
+              }
+            }
+            // Format VxTwitter
+            if (map['media_extended'] is List && (map['media_extended'] as List).isNotEmpty) {
+              for (final item in (map['media_extended'] as List)) {
+                if (item is Map && item['url'] != null && (item['type'] == 'video' || item['type'] == 'gif')) {
+                  return ExtractedMedia(
+                    url: item['url'].toString(),
+                    thumbnailUrl: item['thumbnail_url']?.toString(),
+                  );
+                }
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      // Moteur 2 : Twitter Syndication API officielle
+      try {
+        final synRes = await _createDio().get(
+          "https://cdn.syndication.twimg.com/tweet-result?id=$tweetId&token=a",
+        );
+        final raw = synRes.data is String ? synRes.data as String : jsonEncode(synRes.data);
+        final mp4Matches = RegExp(r'https:\/\/video\.twimg\.com\/[^\s"\\]+\.mp4[^\s"\\]*')
+            .allMatches(raw)
+            .map((m) => _unescapeJsonString(m.group(0)!))
+            .toList();
+        if (mp4Matches.isNotEmpty) {
+          return ExtractedMedia(url: mp4Matches.last);
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  // --- EXTRACTEUR FACEBOOK ---
+  static Future<ExtractedMedia?> _extractFacebook(String url) async {
+    try {
+      final res = await _createDio(headers: {
+        "User-Agent": _desktopUA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      }).get(url, options: Options(responseType: ResponseType.plain));
+      final html = res.data?.toString() ?? "";
+
+      final patterns = [
+        RegExp(r'"browser_native_hd_url"\s*:\s*"([^"]+)"'),
+        RegExp(r'"playable_url_quality_hd"\s*:\s*"([^"]+)"'),
+        RegExp(r'"browser_native_sd_url"\s*:\s*"([^"]+)"'),
+        RegExp(r'"playable_url"\s*:\s*"([^"]+)"'),
+      ];
+      for (final reg in patterns) {
+        final m = reg.firstMatch(html);
+        if (m != null) {
+          final vUrl = _unescapeJsonString(m.group(1)!);
+          if (vUrl.startsWith('http')) {
+            return ExtractedMedia(url: vUrl);
+          }
+        }
+      }
+      final ogVideo = _extractMetaProperty(html, ['og:video', 'og:video:secure_url']);
+      if (ogVideo != null && ogVideo.startsWith('http')) {
+        return ExtractedMedia(url: ogVideo);
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // --- EXTRACTEUR REDDIT ---
+  static Future<ExtractedMedia?> _extractReddit(String url) async {
+    try {
+      final clean = url.split('?').first.replaceAll(RegExp(r'\/+$'), '');
+      final res = await _createDio(headers: {"User-Agent": _desktopUA}).get("$clean.json");
+      final raw = res.data is String ? res.data as String : jsonEncode(res.data);
+
+      final hlsMatch = RegExp(r'"hls_url"\s*:\s*"([^"]+)"').firstMatch(raw);
+      if (hlsMatch != null) {
+        final hlsUrl = _unescapeJsonString(hlsMatch.group(1)!).replaceAll('&amp;', '&');
+        if (hlsUrl.startsWith('http')) {
+          return ExtractedMedia(url: hlsUrl, isHls: true);
+        }
+      }
+      final fallbackMatch = RegExp(r'"fallback_url"\s*:\s*"([^"]+)"').firstMatch(raw);
+      if (fallbackMatch != null) {
+        final fbUrl = _unescapeJsonString(fallbackMatch.group(1)!).replaceAll('&amp;', '&');
+        if (fbUrl.startsWith('http')) {
+          return ExtractedMedia(url: fbUrl);
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // --- CASCADE D'INSTANCES COBALT (V10 & V7) ---
+  static Future<ExtractedMedia?> _extractViaCobaltWaterfall(String url) async {
+    final endpoints = [
+      "https://api.cobalt.tools/",
+      "https://cobalt-api.kwiatekmiki.com/",
+      "https://cobalt-backend.canine.tools/",
+      "https://cobalt.api.timelessnesses.me/",
+      "https://cobalt-api.pewpew.nyc/",
+      "https://cobalt.qck.ie/",
+    ];
+
+    for (final endpoint in endpoints) {
+      // Essai format API v10
+      try {
+        final res = await _createDio(
+          timeoutSec: 10,
+          headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+          },
+        ).post(endpoint, data: {"url": url, "downloadMode": "auto"});
+        if (res.data is Map && res.data['url'] != null) {
+          final dlUrl = res.data['url'].toString();
+          if (dlUrl.startsWith('http')) {
+            return ExtractedMedia(url: dlUrl, isHls: dlUrl.contains('.m3u8'));
+          }
+        }
+      } catch (_) {}
+
+      // Essai format API v7 (/api/json)
+      try {
+        final base = endpoint.endsWith('/') ? endpoint.substring(0, endpoint.length - 1) : endpoint;
+        final resV7 = await _createDio(
+          timeoutSec: 8,
+          headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+          },
+        ).post("$base/api/json", data: {"url": url});
+        if (resV7.data is Map && resV7.data['url'] != null) {
+          final dlUrl = resV7.data['url'].toString();
+          if (dlUrl.startsWith('http')) {
+            return ExtractedMedia(url: dlUrl, isHls: dlUrl.contains('.m3u8'));
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  // --- EXTRACTEUR UNIVERSEL HTML / OPENGRAPH / JSON-LD / REGEX (BLACK HOLE SPLITTER) ---
+  static Future<ExtractedMedia?> _extractGenericWebMedia(String url) async {
+    final userAgents = [_mobileUA, _desktopUA];
+
+    for (final ua in userAgents) {
+      try {
+        final res = await _createDio(headers: {
+          "User-Agent": ua,
+          "Referer": url,
+        }).get(url, options: Options(responseType: ResponseType.plain));
+
+        // Si la requête a été redirigée directement vers un flux média binaire
+        final contentType = (res.headers.value('content-type') ?? '').toLowerCase();
+        if (contentType.startsWith('video/') ||
+            contentType.startsWith('audio/') ||
+            contentType.contains('mpegurl')) {
+          final finalUri = res.realUri.toString();
+          return ExtractedMedia(
+            url: finalUri.isNotEmpty ? finalUri : url,
+            isHls: contentType.contains('mpegurl'),
+            headers: {"User-Agent": ua, "Referer": url},
+          );
+        }
+
+        final html = res.data?.toString() ?? "";
+        if (html.isEmpty) continue;
+
+        final String? thumb = _extractMetaProperty(html, ['og:image', 'twitter:image']);
+
+        // 1. Balises Meta OpenGraph / Twitter Player
+        final metaMedia = _extractMetaProperty(html, [
+          'og:video:secure_url',
+          'og:video:url',
+          'og:video',
+          'og:audio:secure_url',
+          'og:audio',
+          'twitter:player:stream',
+        ]);
+        if (metaMedia != null && metaMedia.startsWith('http') && !metaMedia.contains('.swf')) {
+          return ExtractedMedia(
+            url: metaMedia,
+            isHls: metaMedia.contains('.m3u8'),
+            thumbnailUrl: thumb,
+            headers: {"User-Agent": ua, "Referer": url},
+          );
+        }
+
+        // 2. JSON-LD (contentUrl / embedUrl) et clés JSON courantes (video_url, contentUrl, playable_url, stream_url)
+        final jsonUrlPatterns = [
+          RegExp(r'"(?:video_url|contentUrl|playable_url_quality_hd|playable_url|hd_src|sd_src|stream_url|audio_url)"\s*:\s*"(https?:[^"]+)"'),
+          RegExp(r'<video[^>]+src="([^"]+)"', caseSensitive: false),
+          RegExp(r'<audio[^>]+src="([^"]+)"', caseSensitive: false),
+          RegExp(r'<source[^>]+src="([^"]+)"', caseSensitive: false),
+        ];
+        for (final pattern in jsonUrlPatterns) {
+          final m = pattern.firstMatch(html);
+          if (m != null) {
+            String candidate = _unescapeJsonString(m.group(1)!).replaceAll('&amp;', '&');
+            if (candidate.startsWith('//')) candidate = 'https:$candidate';
+            if (candidate.startsWith('http')) {
+              return ExtractedMedia(
+                url: candidate,
+                isHls: candidate.contains('.m3u8'),
+                thumbnailUrl: thumb,
+                headers: {"User-Agent": ua, "Referer": url},
+              );
+            }
+          }
+        }
+
+        // 3. Recherche directe de flux .mp4 / .m4a / .mp3 / .m3u8 dans le code source de la page
+        final rawMediaRegex = RegExp(
+          r'https?:\/\/[^\s"\\<>]+?\.(?:mp4|m4a|mp3|m3u8)(?:\?[^\s"\\<>]*)?',
+          caseSensitive: false,
+        );
+        for (final match in rawMediaRegex.allMatches(html)) {
+          final candidate = _unescapeJsonString(match.group(0)!).replaceAll('&amp;', '&');
+          if (!candidate.contains('blank.mp4') && !candidate.contains('spacer')) {
+            return ExtractedMedia(
+              url: candidate,
+              isHls: candidate.toLowerCase().contains('.m3u8'),
+              thumbnailUrl: thumb,
+              headers: {"User-Agent": ua, "Referer": url},
+            );
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  /// Sniffer WebView jetable (style Black Hole Splitter) :
+  /// Lancé uniquement en dernier recours pendant quelques secondes, intercepte les flux `<video>`, `<audio>`,
+  /// `fetch`, `XMLHttpRequest` et `performance.getEntriesByType('resource')`, puis est immédiatement détruit.
+  static Future<ExtractedMedia?> _sniffMediaViaDisposableWebView(String targetUrl) async {
+    final completer = Completer<String?>();
+    Timer? pollTimer;
+    WebViewController? tempController;
+
+    try {
+      tempController = WebViewController()
+        ..setJavaScriptMode(JavaScriptMode.unrestricted)
+        ..setUserAgent(_mobileUA)
+        ..addJavaScriptChannel(
+          'MediaSnifferChannel',
+          onMessageReceived: (JavaScriptMessage msg) {
+            final found = msg.message.trim();
+            if (found.startsWith('http') && !found.startsWith('blob:') && !completer.isCompleted) {
+              completer.complete(found);
+            }
+          },
+        )
+        ..setNavigationDelegate(
+          NavigationDelegate(
+            onNavigationRequest: (req) {
+              if (_isDirectMediaUrl(req.url) && !completer.isCompleted) {
+                completer.complete(req.url);
+                return NavigationDecision.prevent;
+              }
+              return NavigationDecision.navigate;
+            },
+          ),
+        );
+
+      await tempController.loadRequest(Uri.parse(targetUrl));
+
+      pollTimer = Timer.periodic(const Duration(milliseconds: 900), (timer) async {
+        if (completer.isCompleted || tempController == null) {
+          timer.cancel();
+          return;
+        }
+        try {
+          await tempController.runJavaScript('''
+            (function() {
+              try {
+                // 1. Inspection directe des éléments <video>, <audio>, <source>
+                const mediaEls = document.querySelectorAll('video, audio, video source, audio source');
+                for (const el of mediaEls) {
+                  const src = el.currentSrc || el.src || el.getAttribute('src');
+                  if (src && src.startsWith('http') && !src.startsWith('blob:')) {
+                    MediaSnifferChannel.postMessage(src);
+                    return;
+                  }
+                }
+                // 2. Inspection des balises meta OpenGraph
+                const og = document.querySelector('meta[property="og:video"], meta[property="og:video:secure_url"], meta[property="og:audio"]');
+                if (og && og.content && og.content.startsWith('http')) {
+                  MediaSnifferChannel.postMessage(og.content);
+                  return;
+                }
+                // 3. Inspection des ressources réseau chargées (Performance API)
+                if (window.performance && window.performance.getEntriesByType) {
+                  const entries = window.performance.getEntriesByType('resource');
+                  for (const e of entries) {
+                    const name = e.name || '';
+                    if (/\\.(mp4|m4a|mp3|m3u8)(\\?|\$)/i.test(name) || name.includes('videoplayback') || name.includes('cdninstagram') || name.includes('fbcdn.net')) {
+                      if (e.initiatorType === 'video' || e.initiatorType === 'audio' || /\\.(mp4|m4a|mp3|m3u8)/i.test(name)) {
+                        MediaSnifferChannel.postMessage(name);
+                        return;
+                      }
+                    }
+                  }
+                }
+              } catch (err) {}
+            })();
+          ''');
+        } catch (_) {}
+      });
+
+      final String? mediaUrl = await completer.future.timeout(
+        const Duration(seconds: 12),
+        onTimeout: () => null,
+      );
+
+      if (mediaUrl != null && mediaUrl.startsWith('http')) {
+        return ExtractedMedia(
+          url: mediaUrl,
+          isHls: mediaUrl.toLowerCase().contains('.m3u8'),
+          headers: {"User-Agent": _mobileUA, "Referer": targetUrl},
+        );
+      }
+    } catch (e) {
+      debugPrint("Sniffer WebView jetable ignoré: $e");
+    } finally {
+      pollTimer?.cancel();
+      try {
+        await tempController?.loadRequest(Uri.parse('about:blank'));
+      } catch (_) {}
+      tempController = null;
+    }
+    return null;
+  }
+
+  static String? _extractMetaProperty(String html, List<String> properties) {
+    for (final prop in properties) {
+      final r1 = RegExp(
+        '<meta[^>]+(?:property|name)=["\']$prop["\'][^>]+content=["\']([^"\']+)["\']',
+        caseSensitive: false,
+      ).firstMatch(html);
+      if (r1 != null) return r1.group(1)!.replaceAll('&amp;', '&');
+
+      final r2 = RegExp(
+        '<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']$prop["\']',
+        caseSensitive: false,
+      ).firstMatch(html);
+      if (r2 != null) return r2.group(1)!.replaceAll('&amp;', '&');
+    }
+    return null;
+  }
+
+  static String _unescapeJsonString(String raw) {
+    return raw
+        .replaceAll(r'\/', '/')
+        .replaceAll(r'\u0026', '&')
+        .replaceAll(r'\u002F', '/')
+        .replaceAll(r'\u003D', '=')
+        .replaceAll(r'\u0025', '%')
+        .replaceAll(r'\\&', '&')
+        .replaceAll('&amp;', '&');
   }
 }

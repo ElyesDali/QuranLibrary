@@ -38,6 +38,8 @@ dependencies:
   just_audio: ^0.10.5
   just_audio_windows: ^0.2.3
   just_audio_background: ^0.0.1-beta.12
+  audio_service: ^0.18.18
+  audio_session: ^0.2.3
   file_selector: ^1.1.0
   file_picker: ^11.0.2
   sqflite: ^2.3.3

@@ -155,7 +155,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen> {
       final end = _controller.endTrim;
       final duration = end - start;
 
-      final command = "-y -ss ${start.inMilliseconds / 1000} -i '${widget.videoFile.path}' -t ${duration.inMilliseconds / 1000} -c copy '$targetPath'";
+      final command = "-y -ss ${start.inMilliseconds / 1000} -i '${widget.videoFile.path}' -t ${duration.inMilliseconds / 1000} -c copy -movflags +faststart '$targetPath'";
 
       await FFmpegKit.execute(command).then((session) async {
         final returnCode = await session.getReturnCode();
